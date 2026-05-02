@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Render `boro <subcommand> --json` output as a GitHub-style 'Files changed'
+view in the terminal: per-file diff with old/new line-number gutter, ANSI
+colors for +/-, and severity-colored inline comment boxes anchored at each
+finding's `location.file:line`.
+
+Usage:
+    boro review HEAD~3..HEAD --json | scripts/boro-json-view
+    scripts/boro-json-view review.json
+    scripts/boro-json-view review.json | less -R
+
+Stdlib only. Color is auto-detected via isatty(); override with --color or
+the standard NO_COLOR / CLICOLOR_FORCE environment variables.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+import textwrap
+from collections import defaultdict
+
+RESET = "\x1b[0m"
+DIM = "\x1b[2m"
+BOLD = "\x1b[1m"
+RED = "\x1b[31m"
+GREEN = "\x1b[32m"
+YELLOW = "\x1b[33m"
+MAGENTA = "\x1b[35m"
+CYAN = "\x1b[36m"
+WHITE = "\x1b[37m"
+BG_RED = "\x1b[41m"
+
+SEVERITY_COLOR = {
+    "Critical": BOLD + RED,
+    "High": RED,
+    "Medium": YELLOW,
+    "Low": CYAN,
+    "Info": DIM,
+}
+
+FILE_RE = re.compile(r"^diff --git a/(.+) b/(.+)$")
+PLUS_PATH_RE = re.compile(r"^\+\+\+ (.+)$")
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$")
+
+
+def make_paint(enabled):
+    if enabled:
+        return lambda s, c: f"{c}{s}{RESET}"
+    return lambda s, _c: s
+
+
+def decide_color(arg):
+    if arg == "always":
+        return True
+    if arg == "never":
+        return False
+    if "NO_COLOR" in os.environ:
+        return False
+    if os.environ.get("CLICOLOR_FORCE", "").lower() not in ("", "0", "false"):
+        return True
+    return sys.stdout.isatty()
+
+
+def parse_patch(patch):
+    """Parse a unified diff into a list of {path, hunks}. Each hunk is
+    {header, old_start, new_start, lines: [(old_no, new_no, marker, text)]}."""
+    files = []
+    current_file = None
+    current_hunk = None
+    old_lineno = 0
+    new_lineno = 0
+
+    for line in patch.splitlines():
+        m = FILE_RE.match(line)
+        if m:
+            # Default to the b-side path; +++ b/PATH below may override (renames).
+            current_file = {"path": m.group(2), "hunks": []}
+            files.append(current_file)
+            current_hunk = None
+            continue
+        if current_file is not None and current_hunk is None:
+            m = PLUS_PATH_RE.match(line)
+            if m:
+                raw = m.group(1).strip()
+                if raw != "/dev/null":
+                    path = raw[2:] if raw.startswith("b/") else raw
+                    current_file["path"] = path
+                continue
+        if line.startswith("--- "):
+            continue
+        m = HUNK_RE.match(line)
+        if m and current_file is not None:
+            old_lineno = int(m.group(1))
+            new_lineno = int(m.group(2))
+            current_hunk = {
+                "header": line,
+                "lines": [],
+            }
+            current_file["hunks"].append(current_hunk)
+            continue
+        if current_hunk is None:
+            # Index/binary/rename/similarity lines outside hunks.
+            continue
+        if line == "":
+            # Bare empty line inside a hunk is a context line (the leading space was stripped).
+            current_hunk["lines"].append((old_lineno, new_lineno, " ", ""))
+            old_lineno += 1
+            new_lineno += 1
+            continue
+        marker = line[0]
+        text = line[1:]
+        if marker == " ":
+            current_hunk["lines"].append((old_lineno, new_lineno, " ", text))
+            old_lineno += 1
+            new_lineno += 1
+        elif marker == "-":
+            current_hunk["lines"].append((old_lineno, None, "-", text))
+            old_lineno += 1
+        elif marker == "+":
+            current_hunk["lines"].append((None, new_lineno, "+", text))
+            new_lineno += 1
+        elif marker == "\\":
+            # "\ No newline at end of file" - skip; no counter update.
+            pass
+        # Any other marker is unexpected; skip silently.
+    return files
+
+
+def index_findings(findings):
+    """Split findings into:
+      anchored: {(file, line, side): [findings...]}
+      unanchored: [findings without a usable location]
+    Multi-line ranges anchor at line_end so the comment lands below the whole range."""
+    anchored = defaultdict(list)
+    unanchored = []
+    for f in findings or []:
+        loc = f.get("location") if isinstance(f, dict) else None
+        if not isinstance(loc, dict):
+            unanchored.append(f)
+            continue
+        path = loc.get("file")
+        line_end = loc.get("line_end")
+        anchor = line_end if isinstance(line_end, int) and line_end > 0 else loc.get("line")
+        side = loc.get("side", "RIGHT")
+        if path and isinstance(anchor, int):
+            anchored[(path, anchor, side)].append(f)
+        else:
+            unanchored.append(f)
+    return anchored, unanchored
+
+
+def pick_findings(commit, mode_validated):
+    """Pick which findings array to render for this commit. When the global
+    validation mode is `findings` and the commit has a `validated_findings`
+    array, prefer that (and signal it via the second return value so headers
+    can be annotated). Falls back to raw `findings` otherwise so commits the
+    validator skipped (or failures) still render something."""
+    if mode_validated and isinstance(commit.get("validated_findings"), list):
+        return commit["validated_findings"], True
+    return commit.get("findings") or [], False
+
+
+def print_finding(f, paint, indent="      ", wrap_width=80):
+    """Render one finding as a boxed inline comment block."""
+    sev = f.get("severity", "Info")
+    color = SEVERITY_COLOR.get(sev, DIM)
+    problem = f.get("problem", "")
+    why = f.get("severity_explanation", "")
+    loc = f.get("location") if isinstance(f.get("location"), dict) else None
+    voters = f.get("voters") if isinstance(f.get("voters"), list) else None
+
+    head = f"╭─ [{sev}] {problem}"
+    print(indent + paint(head, color))
+    if why:
+        for ln in textwrap.wrap(why, width=wrap_width):
+            print(indent + paint("│   ", color) + paint(ln, DIM))
+    if loc:
+        loc_str = f"@ {loc.get('file', '?')}:{loc.get('line', '?')}"
+        if loc.get("line_end"):
+            loc_str += f"-{loc['line_end']}"
+        loc_str += f" [{loc.get('side', 'RIGHT')}]"
+        print(indent + paint("│   ", color) + paint(loc_str, DIM))
+    if voters:
+        print(
+            indent
+            + paint("│   ", color)
+            + paint("voters: " + ", ".join(str(v) for v in voters), DIM)
+        )
+    print(indent + paint("╰─", color))
+
+
+def render_diff_line(old_no, new_no, marker, text, paint):
+    """Render one diff line with old/new line-number gutter."""
+    old_str = f"{old_no:>5}" if old_no is not None else "     "
+    new_str = f"{new_no:>5}" if new_no is not None else "     "
+    if marker == "+":
+        body = paint(f"+{text}", GREEN)
+    elif marker == "-":
+        body = paint(f"-{text}", RED)
+    else:
+        body = paint(f" {text}", DIM)
+    sep = paint("│", DIM)
+    print(
+        f"  {paint(old_str, DIM)} {paint(new_str, DIM)} {sep}{body}"
+    )
+
+
+def render_commit(commit, paint, wrap_width, mode_validated):
+    sha = commit.get("sha", "?")
+    short = sha[:10] if sha else "?"
+    subject = commit.get("subject", "")
+    author = commit.get("author", "")
+    date = commit.get("date", "")
+    err = commit.get("error")
+
+    print()
+    print(f"{paint('--- commit', BOLD)} "
+          f"{paint(short, BOLD + YELLOW)}  {paint(subject, BOLD)}")
+    meta_parts = []
+    if author:
+        meta_parts.append(author)
+    if date:
+        meta_parts.append(date)
+    if meta_parts:
+        print("    " + paint(" · ".join(meta_parts), DIM))
+    if err:
+        print("    " + paint("ERROR: ", BOLD + RED) + err)
+        return
+
+    findings, is_validated = pick_findings(commit, mode_validated)
+    label = "findings (validated):" if is_validated else "findings:"
+    if findings:
+        counts = defaultdict(int)
+        for f in findings:
+            counts[f.get("severity", "Info")] += 1
+        order = ["Critical", "High", "Medium", "Low", "Info"]
+        ordered = [s for s in order if s in counts] + [
+            k for k in counts if k not in order
+        ]
+        bits = []
+        for s in ordered:
+            paint_s = SEVERITY_COLOR.get(s, DIM)
+            bits.append(paint(f"{counts[s]} {s}", paint_s))
+        print("    " + paint(label, DIM) + " " + " ".join(bits))
+    else:
+        print("    " + paint(label + " none", DIM))
+
+    patch = commit.get("patch") or ""
+    if not patch.strip():
+        if findings:
+            print()
+            print("  " + paint("▾ commit-level comments", BOLD + CYAN))
+            for f in findings:
+                print_finding(f, paint, indent="    ", wrap_width=wrap_width)
+        return
+
+    anchored, unanchored = index_findings(findings)
+    rendered_keys = set()
+    files = parse_patch(patch)
+
+    for fi in files:
+        path = fi["path"]
+        print()
+        print("  " + paint("▾", CYAN) + " " + paint(path, BOLD + WHITE))
+        if not fi["hunks"]:
+            print("    " + paint("(no hunks - rename or mode change)", DIM))
+            continue
+        for hunk in fi["hunks"]:
+            print("    " + paint(hunk["header"], MAGENTA))
+            for old_no, new_no, marker, text in hunk["lines"]:
+                render_diff_line(old_no, new_no, marker, text, paint)
+                # Inline findings: anchor below the line they reference.
+                if marker in ("+", " ") and new_no is not None:
+                    key = (path, new_no, "RIGHT")
+                    if key in anchored:
+                        rendered_keys.add(key)
+                        for f in anchored[key]:
+                            print_finding(
+                                f, paint, indent="      ", wrap_width=wrap_width
+                            )
+                if marker in ("-", " ") and old_no is not None:
+                    key = (path, old_no, "LEFT")
+                    if key in anchored:
+                        rendered_keys.add(key)
+                        for f in anchored[key]:
+                            print_finding(
+                                f, paint, indent="      ", wrap_width=wrap_width
+                            )
+
+    # Findings whose anchor didn't land on a printed diff line, plus
+    # location-less findings, get rendered as commit-level comments.
+    leftovers = []
+    for key, fs in anchored.items():
+        if key not in rendered_keys:
+            leftovers.extend(fs)
+    if unanchored or leftovers:
+        print()
+        print("  " + paint("▾ commit-level comments", BOLD + CYAN))
+        for f in unanchored + leftovers:
+            print_finding(f, paint, indent="    ", wrap_width=wrap_width)
+
+
+def render_top(data, paint, mode_validated):
+    sub = data.get("subcommand", "review")
+    rng = data.get("range", "?")
+    model = data.get("model", "?")
+    schema = data.get("schema_version", "?")
+    commits = data.get("commits") or []
+    print(paint(f"boro {sub} {rng}", BOLD)
+          + paint(f"  ({len(commits)} commit{'s' if len(commits) != 1 else ''})", DIM))
+    print(paint(f"model: {model}  ·  schema_version: {schema}", DIM))
+    if mode_validated:
+        print(paint("rendering: validated_findings (post-validation filter)", DIM))
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Render boro --json as a GitHub-style Files-Changed view."
+    )
+    ap.add_argument(
+        "file",
+        nargs="?",
+        help="path to a boro --json output file (default: stdin)",
+    )
+    ap.add_argument(
+        "--color",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="color output mode (default: auto, respects NO_COLOR / CLICOLOR_FORCE)",
+    )
+    ap.add_argument(
+        "--use-validated",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="render validated_findings instead of findings: 'auto' (default) "
+        "picks based on the JSON's validation_mode (validated for 'findings' "
+        "and 'filter', raw for 'off'); 'always' forces validated when present; "
+        "'never' shows raw findings",
+    )
+    args = ap.parse_args()
+
+    use_color = decide_color(args.color)
+    paint = make_paint(use_color)
+    cols = shutil.get_terminal_size((100, 24)).columns
+    wrap_width = max(40, min(cols - 16, 120))
+
+    if args.file:
+        with open(args.file, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    else:
+        data = json.load(sys.stdin)
+
+    if args.use_validated == "always":
+        mode_validated = True
+    elif args.use_validated == "never":
+        mode_validated = False
+    else:
+        mode_validated = data.get("validation_mode") in ("findings", "filter")
+
+    render_top(data, paint, mode_validated)
+    for commit in data.get("commits") or []:
+        render_commit(commit, paint, wrap_width, mode_validated)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (BrokenPipeError, KeyboardInterrupt):
+        # Quiet exit when piped into `head` or interrupted.
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(130)

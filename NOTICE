@@ -1,0 +1,11 @@
+boro - notices
+
+Boro is licensed under the Apache License, Version 2.0; see LICENSE at the
+repository root.
+
+The files under third_party/prompts/kernel/ are bundled third-party kernel
+review prompts aligned with the layout used by the Sashiko project (see
+scripts/sync-prompts-from-sashiko.sh). Those prompts are also distributed under
+the Apache License, Version 2.0.
+
+Upstream reference: https://github.com/sashiko-dev/sashiko

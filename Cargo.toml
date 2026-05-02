@@ -1,0 +1,28 @@
+[package]
+name = "boro"
+version = "0.1.0"
+edition = "2021"
+description = "Linux kernel commit review CLI with multi-stage agentic workflow"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+# Async reqwest + default TLS + multi-thread tokio runtime.
+reqwest = { version = "0.12", features = ["json"] }
+regex = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
+indicatif = "0.17"
+owo-colors = "4"
+# "debug-embed" embeds prompts in debug builds too (same as release). Stock rust-embed only
+# embeds in release; `cargo build` / `cargo install --debug` otherwise read third_party/ via an
+# absolute compile-time path at runtime, which breaks if the tree moved or is missing.
+# (`cargo install --path .` is release by default — this mainly helps plain `cargo build`.)
+rust-embed = { version = "8", features = ["debug-embed"] }
+tempfile = "3"
+tree-sitter = "0.26"
+tree-sitter-c = "0.24"
