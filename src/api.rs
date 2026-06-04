@@ -189,7 +189,7 @@ fn is_cache_incompatibility_400(status: u16, body: &str) -> bool {
     mentions_cached_content && mentions_system_or_tools
 }
 
-pub const SYSTEM_REPO_TOOLS_SUFFIX: &str = "\n\nYou may call tools grep_repo, read_files, read_symbol, git_blame, git_diff, git_show, run_git, and rg (when advertised) only inside the kernel git tree boro is analyzing - the directory the host passes as `--source` / `-s` (default: their current directory), resolved to one repository root. \
+pub const SYSTEM_REPO_TOOLS_SUFFIX: &str = "\n\nYou may call tools grep_repo, read_files, read_symbol, git_blame, git_diff, git_show, run_git, and rg (when advertised) only inside the git tree boro is analyzing - the directory the host passes as `--source` / `-s` (default: their current directory), resolved to one repository root. \
 All tools use that root as the working directory for their subprocesses and as the base for relative paths (never absolute paths, never `..`). \
 To locate symbols, strings, or call sites, call grep_repo first; it is much cheaper than reading whole files. Use read_files only after grep_repo has identified the file and line range to inspect, and always pass tight start_line/end_line bounds. \
 If rg is advertised, use it when you specifically need ripgrep regex behavior, --glob-style filtering, or to search files git grep would not see; otherwise prefer grep_repo for tracked source lookup. \
@@ -2963,11 +2963,25 @@ The \"location\" field is optional - include it on a finding only when at least 
 }
 
 /// Phase 0: pick subsystem guides from `subsystem/subsystem.md` index.
-pub const SYSTEM_PHASE0: &str = "You are an AI assistant preparing a Linux kernel patch review.\n\
+pub const SYSTEM_PHASE0_KERNEL: &str = "You are an AI assistant preparing a Linux kernel patch review.\n\
 Review the provided patch and select all potentially relevant subsystem guides from the index below.\n\
 CRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\n\
 You MUST respond with ONLY a JSON object, no other text. Example:\n\
 {\"selected_prompts\": [\"networking.md\", \"mm.md\"]}\n";
+
+pub const SYSTEM_PHASE0_QEMU: &str = "You are an AI assistant preparing a QEMU patch review.\n\
+Review the provided patch and select all potentially relevant subsystem guides from the index below.\n\
+CRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\n\
+You MUST respond with ONLY a JSON object, no other text. Example:\n\
+{\"selected_prompts\": [\"virtio.md\", \"memory.md\"]}\n";
+
+/// Phase-0 system prompt for the active review target.
+pub fn system_phase0(target: crate::config::ReviewTarget) -> &'static str {
+    match target {
+        crate::config::ReviewTarget::Kernel => SYSTEM_PHASE0_KERNEL,
+        crate::config::ReviewTarget::Qemu => SYSTEM_PHASE0_QEMU,
+    }
+}
 
 pub fn phase0_user_payload(subsystem_index: &str, patch: &str) -> String {
     format!(
@@ -3028,9 +3042,20 @@ pub fn parse_upstream_followup_response(raw: &str) -> Result<Value> {
     }
 }
 
-/// LKML inline reply (plain text).
-pub const SYSTEM_LKML: &str = "You are an automated review bot preparing a reply for the Linux Kernel Mailing List (LKML). \
+/// Mailing-list inline reply (plain text).
+pub const SYSTEM_LKML_KERNEL: &str = "You are an automated review bot preparing a reply for the Linux Kernel Mailing List (LKML). \
 Follow the formatting rules in the user message exactly. Output plain text only: no markdown document structure around the reply, no wrapping the entire message in code fences.";
+
+pub const SYSTEM_LKML_QEMU: &str = "You are an automated review bot preparing a reply for the qemu-devel mailing list. \
+Follow the formatting rules in the user message exactly. Output plain text only: no markdown document structure around the reply, no wrapping the entire message in code fences.";
+
+/// Mailing-list report system prompt for the active review target.
+pub fn system_lkml(target: crate::config::ReviewTarget) -> &'static str {
+    match target {
+        crate::config::ReviewTarget::Kernel => SYSTEM_LKML_KERNEL,
+        crate::config::ReviewTarget::Qemu => SYSTEM_LKML_QEMU,
+    }
+}
 
 pub const SYSTEM_TEST_BUILD: &str = include_str!("../resources/test-build-review.md");
 pub const SYSTEM_TEST_BOOT: &str = include_str!("../resources/test-boot-review.md");
@@ -3078,10 +3103,26 @@ No markdown fences, no prose outside the JSON."
     )
 }
 
+/// Second-opinion system prompt for the active review target.
+pub fn system_second_opinion(target: crate::config::ReviewTarget) -> &'static str {
+    match target {
+        crate::config::ReviewTarget::Kernel => SYSTEM_SECOND_OPINION_KERNEL,
+        crate::config::ReviewTarget::Qemu => SYSTEM_SECOND_OPINION_QEMU,
+    }
+}
+
 /// System prompt for the per-commit second-opinion stage. It is an independent
 /// review by the validation model; its findings are merged with the main
 /// pipeline's findings and passed to the global findings-validation stage.
-pub const SYSTEM_SECOND_OPINION: &str = "You are an automated kernel reviewer giving an independent second opinion on a commit that was already reviewed by a multi-stage pipeline. \
+pub const SYSTEM_SECOND_OPINION_KERNEL: &str = "You are an automated kernel reviewer giving an independent second opinion on a commit that was already reviewed by a multi-stage pipeline. \
+Review the full patch with the reference context and current pipeline findings in mind. \
+Your job is to find concrete, reportable issues the main pipeline may have missed or under-specified, not to validate the existing findings. \
+Avoid re-emitting the same finding unless you can provide materially better evidence, location, or severity framing. \
+Only emit a finding if you can point to specific code in the diff or pre-fetched source context as concrete evidence. \
+Speculation, generic 'this could be racy', or 'should add bounds check' without a concrete path: do not emit. \
+If you find no additional concrete issues, return an empty findings array - that is an acceptable outcome.";
+
+pub const SYSTEM_SECOND_OPINION_QEMU: &str = "You are an automated QEMU reviewer giving an independent second opinion on a commit that was already reviewed by a multi-stage pipeline. \
 Review the full patch with the reference context and current pipeline findings in mind. \
 Your job is to find concrete, reportable issues the main pipeline may have missed or under-specified, not to validate the existing findings. \
 Avoid re-emitting the same finding unless you can provide materially better evidence, location, or severity framing. \
@@ -3134,7 +3175,21 @@ pub fn system_test_picker() -> &'static str {
 /// System prompt for the run-wide quick-summary stage. One short prose paragraph over the
 /// per-commit findings (validated when available, raw otherwise). Severity counts are computed
 /// locally and rendered alongside this text - the model only produces the prose.
-pub const SYSTEM_QUICK_SUMMARY: &str = "You are summarizing Linux kernel patch-review findings for a human reviewer. \
+/// Quick-summary system prompt for the active review target.
+pub fn system_quick_summary(target: crate::config::ReviewTarget) -> &'static str {
+    match target {
+        crate::config::ReviewTarget::Kernel => SYSTEM_QUICK_SUMMARY_KERNEL,
+        crate::config::ReviewTarget::Qemu => SYSTEM_QUICK_SUMMARY_QEMU,
+    }
+}
+
+pub const SYSTEM_QUICK_SUMMARY_QEMU: &str = "You are summarizing QEMU patch-review findings for a human reviewer. \
+Produce a VERY SHORT plain-text summary (1-3 sentences, ~280 characters max) that highlights the most important issues, preferring Critical and High severity items. \
+Mention concrete signals (e.g. a guest-triggerable OOB in device X, a missing bounds check in path Y) when present. \
+If the findings list is empty across all commits, say so plainly in a single sentence. \
+Output plain text only: no markdown, no bullet points, no headings, no JSON, no code fences, no severity counts (those are rendered separately).";
+
+pub const SYSTEM_QUICK_SUMMARY_KERNEL: &str = "You are summarizing Linux kernel patch-review findings for a human reviewer. \
 Produce a VERY SHORT plain-text summary (1-3 sentences, ~280 characters max) that highlights the most important issues, preferring Critical and High severity items. \
 Mention concrete signals (e.g. a UAF in driver X, a missing lock in path Y) when present. \
 If the findings list is empty across all commits, say so plainly in a single sentence. \
@@ -3588,8 +3643,8 @@ mod tests {
     fn system_quick_summary_constrains_output_shape() {
         // Defence against accidental drift: the model must be told not to print severity counts
         // (the human report and the JSON layer render those locally).
-        assert!(SYSTEM_QUICK_SUMMARY.contains("no severity counts"));
-        assert!(SYSTEM_QUICK_SUMMARY.contains("plain text"));
+        assert!(SYSTEM_QUICK_SUMMARY_KERNEL.contains("no severity counts"));
+        assert!(SYSTEM_QUICK_SUMMARY_KERNEL.contains("plain text"));
     }
 
     #[test]
