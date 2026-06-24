@@ -27,7 +27,7 @@ mod verbose;
 mod vng;
 mod worktree;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1839,11 +1839,12 @@ async fn main() -> Result<()> {
         ),
     );
 
-    // One MultiProgress row per commit when parallel, or a single row when reviewing one commit
-    // (so stages update on the same line instead of separate SpinnerGuard lines).
+    // One MultiProgress row per commit when work is actually parallel. Single-commit runs use the
+    // one-line SpinnerGuard path; a two-line MultiProgress footer is prone to leaving stale footer
+    // redraws in scrollback when later validation/LKML/summary rows are inserted and removed.
     let patch_ui: Option<Arc<MultiPatchSpinner>> = {
         let n = shas.len();
-        let use_patch_rows = (n == 1) || (n > 1 && workers > 1);
+        let use_patch_rows = n > 1 && workers > 1;
         if use_patch_rows {
             MultiPatchSpinner::try_new(n).map(Arc::new)
         } else {
@@ -2035,10 +2036,6 @@ async fn main() -> Result<()> {
         .await;
     }
 
-    if let Some(ui) = patch_ui.as_ref() {
-        ui.finish_footer_eprintln();
-    }
-
     // Run-wide quick summary. One AI call (validation model, falls back to main model) that
     // produces a short prose summary of the findings, plus locally-computed severity counts.
     // Always on for `review` regardless of validation mode (filter / off / findings); skipped
@@ -2056,6 +2053,22 @@ async fn main() -> Result<()> {
             patch_ui.as_deref(),
         )
         .await;
+    }
+
+    // Keep the shared footer live through every progress-using phase. In particular,
+    // run_quick_summary() adds a temporary row and records tokens into this footer.
+    if let Some(ui) = patch_ui.as_ref() {
+        ui.finish_footer_eprintln();
+    } else if std::io::stderr().is_terminal() && totals.api_calls > 0 {
+        eprintln!(
+            "{}",
+            progress::usage_footer_line(
+                totals.prompt,
+                totals.completion,
+                totals.cache_creation,
+                totals.cache_read,
+            )
+        );
     }
 
     out["usage_summary"] = totals.json();
