@@ -512,6 +512,6 @@ boro --help
 - **Boro** is licensed under the **Apache License 2.0** - see
   [`LICENSE`](LICENSE).
 
-- **`third_party/prompts/kernel/`** is **third-party material** from
+- **`resources/prompts/kernel/`** is **third-party material** from
   **[Sashiko](https://github.com/sashiko-dev/sashiko)** and is also under the
   **Apache License 2.0**.

@@ -20,6 +20,7 @@ mod progress;
 mod prompts;
 mod snapshot;
 mod stages;
+mod target;
 mod test_boot;
 mod test_build;
 mod tools;
@@ -42,23 +43,6 @@ use api::{rough_token_hint, StageUsage, TokenUsage};
 use progress::{phase_tag, MultiPatchSpinner, WorkerLineCtx};
 use snapshot::{snapshot_to_value, CommitSnapshot, SnapshotPublisher};
 use verbose::VerboseDest;
-
-const SYSTEM_REVIEWER_KERNEL: &str = "You are an expert Linux kernel maintainer. \
-Follow the reference material exactly. Be concise in JSON string fields but precise in reasoning.";
-
-const SYSTEM_REVIEWER_QEMU: &str =
-    "You are an expert QEMU maintainer reviewing a patch to the QEMU \
-machine emulator and virtualizer. Treat all guest-controlled input (device registers, DMA buffers, \
-virtqueue descriptors, migration streams) as untrusted. Follow the reference material exactly. \
-Be concise in JSON string fields but precise in reasoning.";
-
-/// Base reviewer system prompt for the active review target.
-fn system_reviewer(target: config::ReviewTarget) -> &'static str {
-    match target {
-        config::ReviewTarget::Kernel => SYSTEM_REVIEWER_KERNEL,
-        config::ReviewTarget::Qemu => SYSTEM_REVIEWER_QEMU,
-    }
-}
 
 /// CLI surface for `--backend`. Maps to [`config::Backend`] before reaching the rest of the code.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -405,7 +389,8 @@ async fn commit_review_inner(
     );
     let reference =
         prompts::build_reference_context(target, &changed, max_context_size, None, None)?;
-    let ref_hint = rough_token_hint(system_reviewer(target).len() + reference.len());
+    let ref_hint =
+        rough_token_hint(crate::target::reviewer_system_prompt(target).len() + reference.len());
     let patch_hint = rough_token_hint(patch.len());
     v(
         vd,
@@ -1169,7 +1154,7 @@ async fn run_findings_validation(
 ///     back to `findings[]` (off mode or validation failed);
 ///   - if the array is empty, set `lkml_report = "No issues found."`
 ///     without an LLM call;
-///   - else call `api::chat_completion` with `SYSTEM_LKML` to render prose
+///   - else call `api::chat_completion` with the target LKML prompt to render prose
 ///     from the chosen finding set;
 ///   - record the LKML render under validation-model usage and add the
 ///     tokens to run-wide `totals`.
@@ -1271,7 +1256,7 @@ async fn render_commit_lkml_phase(
             let (body, usage, error) = match api::chat_completion_stage_timeout(
                 &client,
                 &model,
-                api::system_lkml(target),
+                crate::target::lkml_system_prompt(target),
                 &user,
                 model.temperature,
                 Some(&label),
@@ -1458,7 +1443,7 @@ async fn run_quick_summary(
         let (text, usage, error) = match api::chat_completion_stage_timeout(
             client,
             cfg,
-            api::system_quick_summary(target),
+            crate::target::quick_summary_system_prompt(target),
             &user_msg,
             cfg.temperature,
             Some(&label),
@@ -1868,7 +1853,7 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
         &vdest,
         format!(
             "prompts: {}",
-            prompts::prompts_source_verbose(review_target)
+            crate::target::prompts_source_verbose(review_target)
         ),
     );
     v(
@@ -2209,7 +2194,7 @@ async fn run_single_pass(
     second_opinion: Option<&config::ResolvedModel>,
 ) -> Result<CommitReviewResult> {
     let user = api::single_pass_user_payload(reference, commit_headers, patch_diff);
-    let sys_len = system_reviewer(target).len();
+    let sys_len = crate::target::reviewer_system_prompt(target).len();
     let usr_len = user.len();
     v(
         vd,
@@ -2227,7 +2212,7 @@ async fn run_single_pass(
         api::chat_completion_with_retry_stage_timeout(
             client,
             model,
-            system_reviewer(target),
+            crate::target::reviewer_system_prompt(target),
             &user,
             model.temperature,
             Some(&spin),
@@ -2411,14 +2396,14 @@ async fn run_phase0_selection(
         format!(
             "API: phase 0 (identify subsystem) - user={} chars (~{} tokens rough)",
             user.len(),
-            rough_token_hint(api::system_phase0(target).len() + user.len())
+            rough_token_hint(crate::target::phase0_system_prompt(target).len() + user.len())
         ),
     );
     let t0 = Instant::now();
     let (guides_opt, raw, usage, err, _attempts) = api::chat_completion_with_retry_stage_timeout(
         client,
         model,
-        api::system_phase0(target),
+        crate::target::phase0_system_prompt(target),
         &user,
         model.temperature,
         spinner_line,
@@ -2636,7 +2621,7 @@ async fn run_second_opinion(
     let (parsed, _raw, usage, err, _attempts) = api::chat_completion_with_retry_stage_timeout(
         client,
         cfg,
-        api::system_second_opinion(target),
+        crate::target::second_opinion_system_prompt(target),
         &user,
         cfg.temperature,
         Some(&spinner),
@@ -2849,9 +2834,11 @@ async fn run_two_pass(
         vd,
         format!(
             "API: pass 1 (concerns) - system={} user={} chars (~{} tokens rough)",
-            system_reviewer(target).len(),
+            crate::target::reviewer_system_prompt(target).len(),
             pass1_user.len(),
-            rough_token_hint(system_reviewer(target).len() + pass1_user.len())
+            rough_token_hint(
+                crate::target::reviewer_system_prompt(target).len() + pass1_user.len()
+            )
         ),
     );
 
@@ -2861,7 +2848,7 @@ async fn run_two_pass(
         api::chat_completion_with_retry_stage_timeout(
             client,
             model,
-            system_reviewer(target),
+            crate::target::reviewer_system_prompt(target),
             &pass1_user,
             model.temperature,
             Some(&pass1_line),
@@ -2975,7 +2962,7 @@ async fn run_two_pass(
             format!(
                 "API: specialist stage {st} - user={} chars (~{} tokens rough)",
                 user.len(),
-                rough_token_hint(system_reviewer(target).len() + user.len())
+                rough_token_hint(crate::target::reviewer_system_prompt(target).len() + user.len())
             ),
         );
         let step_label: &'static str = stages::short_label(st);
@@ -2991,7 +2978,7 @@ async fn run_two_pass(
             api::chat_completion_with_retry_stage_timeout(
                 client,
                 model,
-                system_reviewer(target),
+                crate::target::reviewer_system_prompt(target),
                 &user,
                 model.temperature,
                 Some(&spinner),
@@ -3120,7 +3107,9 @@ async fn run_two_pass(
         format!(
             "API: pass 2 (consolidation) - user={} chars (~{} tokens rough)",
             pass2_user.len(),
-            rough_token_hint(system_reviewer(target).len() + pass2_user.len())
+            rough_token_hint(
+                crate::target::reviewer_system_prompt(target).len() + pass2_user.len()
+            )
         ),
     );
 
@@ -3131,7 +3120,7 @@ async fn run_two_pass(
         api::chat_completion_with_retry_stage_timeout(
             client,
             model,
-            system_reviewer(target),
+            crate::target::reviewer_system_prompt(target),
             &pass2_user,
             model.temperature,
             Some(&pass2_line),

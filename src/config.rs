@@ -39,7 +39,7 @@ impl Backend {
 /// operate on the kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReviewTarget {
-    /// Linux kernel (prompts synced from Sashiko under `third_party/`).
+    /// Linux kernel (prompts synced from Sashiko under `resources/prompts/kernel/`).
     #[default]
     Kernel,
     /// QEMU (boro-authored prompts under `resources/prompts/qemu/`).

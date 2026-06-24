@@ -2,165 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{Context, Result};
-use rust_embed::RustEmbed;
 
 use crate::config::ReviewTarget;
-
-#[derive(RustEmbed)]
-#[folder = "third_party/prompts/kernel/"]
-struct KernelPrompts;
-
-#[derive(RustEmbed)]
-#[folder = "resources/prompts/qemu/"]
-struct QemuPrompts;
+use crate::target;
 
 /// Fetch an embedded prompt file (relative path) from the tree for `target`.
 fn embed_get(target: ReviewTarget, rel: &str) -> Option<rust_embed::EmbeddedFile> {
-    match target {
-        ReviewTarget::Kernel => KernelPrompts::get(rel),
-        ReviewTarget::Qemu => QemuPrompts::get(rel),
-    }
-}
-
-// Generated from third_party/prompts/kernel/subsystem/subsystem.md by
-// scripts/update-subsystem-map-from-sashiko.py.
-const SUBSYSTEM_MAP_KERNEL: &[(&str, &str)] = &[
-    ("net/", "networking-core.md"),
-    ("drivers/net/", "networking-drivers.md"),
-    ("Documentation/netlink/specs/", "netlink.md"),
-    ("mm/memory.c", "mm-pagetable.md"),
-    ("mm/mprotect.c", "mm-pagetable.md"),
-    ("mm/pagewalk.c", "mm-pagetable.md"),
-    ("mm/filemap.c", "mm-folio.md"),
-    ("mm/swap.c", "mm-folio.md"),
-    ("mm/truncate.c", "mm-folio.md"),
-    ("mm/huge_memory.c", "mm-largepage.md"),
-    ("mm/hugetlb.c", "mm-largepage.md"),
-    ("mm/memory-failure.c", "mm-largepage.md"),
-    ("mm/vma.c", "mm-vma.md"),
-    ("mm/mmap.c", "mm-vma.md"),
-    ("mm/mmap_lock.c", "mm-vma.md"),
-    ("mm/page_alloc.c", "mm-alloc.md"),
-    ("mm/slub.c", "mm-alloc.md"),
-    ("mm/vmalloc.c", "mm-alloc.md"),
-    ("mm/vmscan.c", "mm-reclaim.md"),
-    ("mm/swap_state.c", "mm-reclaim.md"),
-    ("mm/migrate.c", "mm-reclaim.md"),
-    ("mm/memcontrol.c", "mm-reclaim.md"),
-    ("fs/", "vfs.md"),
-    ("kernel/sched/", "scheduler.md"),
-    ("kernel/bpf/", "bpf.md"),
-    ("tools/lib/bpf/", "bpf.md"),
-    ("tools/testing/selftests/bpf", "bpf.md"),
-    ("tools/lib/bpf/", "libbpf.md"),
-    ("kernel/workqueue.c", "workqueue.md"),
-    ("fs/btrfs/", "btrfs.md"),
-    ("drivers/gpu/drm/", "drm.md"),
-    ("fs/nfsd/", "nfsd.md"),
-    ("fs/lockd/", "nfsd.md"),
-    ("net/sunrpc/", "sunrpc.md"),
-    ("io_uring/", "io_uring.md"),
-    ("drivers/pmdomain/", "pmdomain.md"),
-    ("include/linux/pm_runtime.h", "pm.md"),
-    ("fs/sysfs/", "sysfs.md"),
-    ("drivers/cxl/", "cxl.md"),
-    ("net/bluetooth/", "bluetooth.md"),
-    ("drivers/tty/", "tty.md"),
-    ("drivers/pci/", "pci.md"),
-    ("fs/smb/server/", "smb-ksmbd.md"),
-    ("drivers/of/", "of.md"),
-    ("tools/perf/", "perf.md"),
-    ("arch/mips/", "mips.md"),
-    ("drivers/hwmon/", "hwmon.md"),
-    ("drivers/net/wireless/", "wireless.md"),
-    ("net/mac80211/", "wireless.md"),
-    ("tools/testing/selftests/", "selftests.md"),
-    ("Documentation/devicetree/bindings/", "dt-bindings.md"),
-    ("drivers/usb/storage/", "usb-storage.md"),
-    ("drivers/ata/", "ata.md"),
-    ("Kconfig", "kconfig.md"),
-    ("scripts/", "build.md"),
-    ("tools/", "build.md"),
-    ("drivers/input/", "input.md"),
-    ("include/linux/input.h", "input.md"),
-    ("include/linux/input/", "input.md"),
-    ("tools/objtool/", "objtool.md"),
-    ("lib/test_kho.c", "kho.md"),
-    ("drivers/i2c/", "i2c.md"),
-    ("virt/kvm/", "kvm.md"),
-    ("include/linux/kvm", "kvm.md"),
-    ("arch/arm64/", "arm64.md"),
-    ("arch/arm64/kvm/", "kvm-arm64.md"),
-    ("arch/arm64/kvm/hyp/", "hyp-arm64.md"),
-    ("arch/arm64/include/asm/kvm", "hyp-arm64.md"),
-    ("drivers/iommu/arm/arm-smmu-v3/pkvm/", "hyp-arm64.md"),
-];
-
-// QEMU path → subsystem-guide map (boro-authored, resources/prompts/qemu/).
-const SUBSYSTEM_MAP_QEMU: &[(&str, &str)] = &[
-    ("hw/virtio/", "virtio.md"),
-    ("hw/net/", "net.md"),
-    ("net/", "net.md"),
-    ("hw/block/", "block.md"),
-    ("block/", "block.md"),
-    ("hw/scsi/", "scsi.md"),
-    ("hw/usb/", "usb.md"),
-    ("hw/pci/", "pci.md"),
-    ("hw/vfio/", "vfio.md"),
-    ("hw/arm/smmu", "smmuv3.md"),
-    ("hw/arm/tegra241-cmdqv", "smmuv3.md"),
-    ("hw/arm/", "arm.md"),
-    ("migration/", "migration.md"),
-    ("accel/kvm/", "kvm.md"),
-    ("accel/tcg/", "tcg.md"),
-    ("tcg/", "tcg.md"),
-    ("target/", "tcg.md"),
-    ("qapi/", "qapi.md"),
-    ("ui/", "ui.md"),
-    ("chardev/", "chardev.md"),
-    ("hw/core/", "qdev.md"),
-    ("system/", "memory.md"),
-    ("softmmu/", "memory.md"),
-];
-
-fn subsystem_map(target: ReviewTarget) -> &'static [(&'static str, &'static str)] {
-    match target {
-        ReviewTarget::Kernel => SUBSYSTEM_MAP_KERNEL,
-        ReviewTarget::Qemu => SUBSYSTEM_MAP_QEMU,
-    }
-}
-
-/// Always-loaded core guides shared by both trees.
-const CORE_FILES_KERNEL: &[&str] = &[
-    "technical-patterns.md",
-    "callstack.md",
-    "subsystem/locking.md",
-];
-
-/// QEMU core guides: the shared three plus the QEMU coding-style guide, which
-/// has no kernel counterpart.
-const CORE_FILES_QEMU: &[&str] = &[
-    "technical-patterns.md",
-    "callstack.md",
-    "subsystem/locking.md",
-    "coding-style.md",
-];
-
-fn core_files(target: ReviewTarget) -> &'static [&'static str] {
-    match target {
-        ReviewTarget::Kernel => CORE_FILES_KERNEL,
-        ReviewTarget::Qemu => CORE_FILES_QEMU,
-    }
-}
-
-/// Shown with `--verbose`; reflects which embedded tree feeds this review.
-pub fn prompts_source_verbose(target: ReviewTarget) -> &'static str {
-    match target {
-        ReviewTarget::Kernel => {
-            "embedded third_party/prompts/kernel (baked into binary at build time)"
-        }
-        ReviewTarget::Qemu => "embedded resources/prompts/qemu (baked into binary at build time)",
-    }
+    target::prompt_file(target, rel)
 }
 
 /// Pick subsystem/*.md files from changed paths (best-effort). Always includes locking via CORE_FILES.
@@ -169,7 +17,7 @@ pub fn pick_subsystem_files(target: ReviewTarget, changed: &[String]) -> Vec<Str
     let mut out = HashSet::new();
     for p in changed {
         let pl = p.replace('\\', "/");
-        for (prefix, md) in subsystem_map(target) {
+        for (prefix, md) in target::subsystem_map(target) {
             if pl.contains(prefix) {
                 out.insert(format!("subsystem/{md}"));
             }
@@ -226,7 +74,7 @@ pub fn build_reference_context(
     parts.push(format!("# boro instructions\n{one_shot}\n"));
     used += parts.last().map(|s| s.len()).unwrap_or(0);
 
-    for rel in core_files(target) {
+    for rel in target::core_files(target) {
         let chunk = read_prompt_rel(target, rel, max_total / 4).context("core prompt read")?;
         if let Some(text) = chunk {
             let header = format!("\n\n# --- {} ---\n\n", rel);
@@ -378,7 +226,7 @@ mod tests {
             read_prompt_rel(ReviewTarget::Kernel, "technical-patterns.md", 50_000).expect("read");
         assert!(
             t.map(|s| s.len() > 500).unwrap_or(false),
-            "technical-patterns.md must be embedded and non-trivial; if this fails in debug, enable rust-embed \"debug-embed\" (see Cargo.toml)"
+            "kernel technical-patterns.md must be embedded from resources/prompts/kernel/"
         );
     }
 
@@ -398,6 +246,30 @@ mod tests {
             assert!(
                 t.map(|s| s.len() > 200).unwrap_or(false),
                 "QEMU prompt {rel} must be embedded and non-trivial (resources/prompts/qemu/)"
+            );
+        }
+    }
+
+    #[test]
+    fn kernel_subsystem_mapping_selects_expected_guides() {
+        let picked = pick_subsystem_files(
+            ReviewTarget::Kernel,
+            &[
+                "mm/page_alloc.c".to_string(),
+                "drivers/net/ethernet/example.c".to_string(),
+                "kernel/sched/core.c".to_string(),
+            ],
+        );
+        for want in [
+            "subsystem/mm-alloc.md",
+            "subsystem/networking-drivers.md",
+            "subsystem/networking-core.md",
+            "subsystem/scheduler.md",
+        ] {
+            assert!(picked.contains(&want.to_string()), "missing {want}");
+            assert!(
+                prompt_exists(ReviewTarget::Kernel, want),
+                "{want} not embedded"
             );
         }
     }
