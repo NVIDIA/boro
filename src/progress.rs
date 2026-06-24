@@ -11,7 +11,7 @@
 //! prompt and completion counts are shown only on the footer bar (updated from every HTTP completion
 //! across workers).
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use std::io::{stderr, IsTerminal};
+use std::io::{self, stderr, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,6 +19,49 @@ use owo_colors::OwoColorize;
 
 /// Drop clears the spinner line (no print).
 pub struct SpinnerGuard(Option<ProgressBar>);
+
+pub struct ProgressStreamGuard {
+    kind: ProgressStreamGuardKind,
+}
+
+enum ProgressStreamGuardKind {
+    None,
+    Spinner(ProgressBar),
+    Multi {
+        multi: MultiProgress,
+        stream_pause_count: Arc<Mutex<u32>>,
+    },
+}
+
+impl ProgressStreamGuard {
+    pub fn none() -> Self {
+        Self {
+            kind: ProgressStreamGuardKind::None,
+        }
+    }
+}
+
+impl Drop for ProgressStreamGuard {
+    fn drop(&mut self) {
+        match &self.kind {
+            ProgressStreamGuardKind::None => {}
+            ProgressStreamGuardKind::Spinner(pb) => {
+                pb.set_draw_target(ProgressDrawTarget::stderr());
+                pb.enable_steady_tick(Duration::from_millis(80));
+            }
+            ProgressStreamGuardKind::Multi {
+                multi,
+                stream_pause_count,
+            } => {
+                let mut count = stream_pause_count.lock().unwrap();
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    multi.set_draw_target(ProgressDrawTarget::stderr());
+                }
+            }
+        }
+    }
+}
 
 impl SpinnerGuard {
     /// Shows a spinner on stderr if it is a TTY; no-op when piped (CI, scripts).
@@ -50,6 +93,19 @@ impl SpinnerGuard {
         match &self.0 {
             Some(pb) => pb.println(m),
             None => eprintln!("{m}"),
+        }
+    }
+
+    /// Hide the spinner while model text streams directly to stderr.
+    pub fn pause_for_streaming(&self) -> ProgressStreamGuard {
+        let Some(pb) = &self.0 else {
+            return ProgressStreamGuard::none();
+        };
+        pb.disable_steady_tick();
+        let _ = write_stderr_chunk("\r\x1b[K");
+        pb.set_draw_target(ProgressDrawTarget::hidden());
+        ProgressStreamGuard {
+            kind: ProgressStreamGuardKind::Spinner(pb.clone()),
         }
     }
 }
@@ -146,10 +202,12 @@ pub fn usage_footer_line(
 /// Shared footer + one progress line for a concurrent patch worker (see [`MultiPatchSpinner`]).
 #[derive(Clone)]
 pub struct WorkerLineCtx {
+    multi: MultiProgress,
     bar: ProgressBar,
     footer: ProgressBar,
     // (prompt, completion, cache_creation, cache_read) — single writer across workers.
     prompt_completion_sums: Arc<Mutex<(u64, u64, u64, u64)>>,
+    stream_pause_count: Arc<Mutex<u32>>,
 }
 
 impl WorkerLineCtx {
@@ -199,6 +257,22 @@ impl WorkerLineCtx {
     pub fn println(&self, message: impl AsRef<str>) {
         self.bar.println(message);
     }
+
+    /// Hide the multi-row progress UI while model text streams directly to stderr.
+    pub fn pause_for_streaming(&self) -> ProgressStreamGuard {
+        let mut count = self.stream_pause_count.lock().unwrap();
+        if *count == 0 {
+            let _ = self.multi.clear();
+            self.multi.set_draw_target(ProgressDrawTarget::hidden());
+        }
+        *count = count.saturating_add(1);
+        ProgressStreamGuard {
+            kind: ProgressStreamGuardKind::Multi {
+                multi: self.multi.clone(),
+                stream_pause_count: Arc::clone(&self.stream_pause_count),
+            },
+        }
+    }
 }
 
 /// Multi-line stderr UI: one spinner row per commit + prompt/token footer (no tokens on patch rows).
@@ -207,6 +281,7 @@ pub struct MultiPatchSpinner {
     worker_bars: Vec<ProgressBar>,
     footer_bar: ProgressBar,
     prompt_completion_sums: Arc<Mutex<(u64, u64, u64, u64)>>,
+    stream_pause_count: Arc<Mutex<u32>>,
 }
 
 impl MultiPatchSpinner {
@@ -239,14 +314,17 @@ impl MultiPatchSpinner {
             worker_bars,
             footer_bar,
             prompt_completion_sums: Arc::new(Mutex::new((0, 0, 0, 0))),
+            stream_pause_count: Arc::new(Mutex::new(0)),
         })
     }
 
     pub fn worker_ctx(&self, idx: usize) -> WorkerLineCtx {
         WorkerLineCtx {
+            multi: self.multi.clone(),
             bar: self.worker_bars[idx].clone(),
             footer: self.footer_bar.clone(),
             prompt_completion_sums: Arc::clone(&self.prompt_completion_sums),
+            stream_pause_count: Arc::clone(&self.stream_pause_count),
         }
     }
 
@@ -259,9 +337,11 @@ impl MultiPatchSpinner {
         pb.enable_steady_tick(Duration::from_millis(80));
         let pb = self.multi.insert_before(&self.footer_bar, pb);
         WorkerLineCtx {
+            multi: self.multi.clone(),
             bar: pb,
             footer: self.footer_bar.clone(),
             prompt_completion_sums: Arc::clone(&self.prompt_completion_sums),
+            stream_pause_count: Arc::clone(&self.stream_pause_count),
         }
     }
 
@@ -307,6 +387,12 @@ fn fmt_scaled_unit(value: f64, suffix: &str) -> String {
     } else {
         format!("{:.1}{}", t, suffix)
     }
+}
+
+fn write_stderr_chunk(text: &str) -> io::Result<()> {
+    let mut stderr = stderr().lock();
+    stderr.write_all(text.as_bytes())?;
+    stderr.flush()
 }
 
 #[cfg(test)]

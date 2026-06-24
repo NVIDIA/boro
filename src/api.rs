@@ -4,9 +4,10 @@
 use anyhow::{anyhow, Context, Result};
 use owo_colors::OwoColorize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::future::Future;
-use std::io::{stderr, IsTerminal};
+use std::io::{stderr, IsTerminal, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -17,7 +18,9 @@ use crate::codex_cli;
 use crate::config::{Backend, ResolvedModel};
 use crate::model_timeout;
 use crate::opencode;
-use crate::progress::{phase_tag, SpinnerGuard, WorkerLineCtx};
+use crate::progress::{
+    phase_tag, usage_footer_line, ProgressStreamGuard, SpinnerGuard, WorkerLineCtx,
+};
 use crate::tools;
 use crate::verbose::VerboseDest;
 
@@ -341,6 +344,74 @@ struct ParsedCompletion {
     finish_reason: Option<String>,
 }
 
+#[derive(Default)]
+struct PendingToolCall {
+    id: String,
+    ty: String,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Default)]
+struct StreamedCompletion {
+    content: String,
+    tool_calls: BTreeMap<usize, PendingToolCall>,
+    usage: Option<TokenUsage>,
+    finish_reason: Option<String>,
+    raw_events: String,
+    fallback_message: Option<Value>,
+}
+
+impl StreamedCompletion {
+    fn into_parsed_completion(mut self) -> ParsedCompletion {
+        let usage = self.usage.take().unwrap_or_default();
+        let finish_reason = self.finish_reason.take();
+        let message = if let Some(message) = self.fallback_message.take() {
+            message
+        } else {
+            self.into_message()
+        };
+        ParsedCompletion {
+            message,
+            usage,
+            finish_reason,
+        }
+    }
+
+    fn into_message(self) -> Value {
+        let content = if self.content.is_empty() {
+            Value::Null
+        } else {
+            Value::String(self.content)
+        };
+        let mut message = json!({
+            "role": "assistant",
+            "content": content,
+        });
+        if !self.tool_calls.is_empty() {
+            let calls: Vec<Value> = self
+                .tool_calls
+                .into_iter()
+                .map(|(idx, call)| {
+                    json!({
+                        "id": if call.id.is_empty() { format!("stream_call_{idx}") } else { call.id },
+                        "type": if call.ty.is_empty() { "function".to_string() } else { call.ty },
+                        "function": {
+                            "name": call.name,
+                            "arguments": if call.arguments.is_empty() { "{}".to_string() } else { call.arguments },
+                        },
+                    })
+                })
+                .collect();
+            message
+                .as_object_mut()
+                .expect("assistant message is an object")
+                .insert("tool_calls".to_string(), Value::Array(calls));
+        }
+        message
+    }
+}
+
 fn parse_completion_choice(text: &str) -> Result<ParsedCompletion> {
     let v: Value = serde_json::from_str(text).context("parse chat response as JSON")?;
 
@@ -373,6 +444,306 @@ fn parse_completion_choice(text: &str) -> Result<ParsedCompletion> {
         usage,
         finish_reason,
     })
+}
+
+fn append_json_text(dst: &mut String, v: &Value) {
+    match v {
+        Value::String(s) => dst.push_str(s),
+        Value::Null => {}
+        other => dst.push_str(&other.to_string()),
+    }
+}
+
+fn delta_content_to_string(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => {
+            let mut out = String::new();
+            for part in parts {
+                match part {
+                    Value::String(s) => out.push_str(s),
+                    Value::Object(o) => {
+                        if let Some(s) = o
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| o.get("content").and_then(|v| v.as_str()))
+                        {
+                            out.push_str(s);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out
+        }
+        Value::Object(o) => {
+            if let Some(s) = o
+                .get("text")
+                .and_then(|v| v.as_str())
+                .or_else(|| o.get("content").and_then(|v| v.as_str()))
+            {
+                s.to_string()
+            } else {
+                String::new()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn apply_stream_delta(delta: &Value, streamed: &mut StreamedCompletion) -> String {
+    let mut visible = String::new();
+    if let Some(content) = delta.get("content") {
+        visible = delta_content_to_string(content);
+        streamed.content.push_str(&visible);
+    }
+
+    if let Some(calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+        for (fallback_idx, tc) in calls.iter().enumerate() {
+            let idx = tc
+                .get("index")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| usize::try_from(n).ok())
+                .unwrap_or(fallback_idx);
+            let entry = streamed.tool_calls.entry(idx).or_default();
+            if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                if entry.id.is_empty() {
+                    entry.id = id.to_string();
+                } else if entry.id != id {
+                    entry.id.push_str(id);
+                }
+            }
+            if let Some(ty) = tc.get("type").and_then(|v| v.as_str()) {
+                if entry.ty.is_empty() {
+                    entry.ty = ty.to_string();
+                } else if entry.ty != ty {
+                    entry.ty.push_str(ty);
+                }
+            }
+            if let Some(func) = tc.get("function") {
+                if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                    entry.name.push_str(name);
+                }
+                if let Some(args) = func.get("arguments") {
+                    append_json_text(&mut entry.arguments, args);
+                }
+            }
+        }
+    }
+
+    if let Some(func) = delta.get("function_call") {
+        let entry = streamed.tool_calls.entry(0).or_default();
+        if entry.id.is_empty() {
+            entry.id = "stream_call_0".to_string();
+        }
+        if entry.ty.is_empty() {
+            entry.ty = "function".to_string();
+        }
+        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+            entry.name.push_str(name);
+        }
+        if let Some(args) = func.get("arguments") {
+            append_json_text(&mut entry.arguments, args);
+        }
+    }
+
+    visible
+}
+
+fn find_sse_delimiter(buf: &[u8]) -> Option<(usize, usize)> {
+    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2));
+    let crlf = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| (p, 4));
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn sse_data(event: &[u8]) -> Result<Option<String>> {
+    let text = std::str::from_utf8(event).context("parse streaming SSE as UTF-8")?;
+    let data = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+        .collect::<Vec<_>>();
+    if data.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(data.join("\n")))
+    }
+}
+
+enum StreamDestination<'a> {
+    Spinner(&'a SpinnerGuard),
+    Worker(&'a WorkerLineCtx),
+    Stderr,
+    Hidden,
+}
+
+impl StreamDestination<'_> {
+    fn pause_for_streaming(&self) -> ProgressStreamGuard {
+        match self {
+            StreamDestination::Spinner(spinner) => spinner.pause_for_streaming(),
+            StreamDestination::Worker(worker) => worker.pause_for_streaming(),
+            StreamDestination::Stderr => ProgressStreamGuard::none(),
+            StreamDestination::Hidden => ProgressStreamGuard::none(),
+        }
+    }
+
+    fn eprint(&self, text: &str) -> Result<()> {
+        if matches!(self, StreamDestination::Hidden) {
+            return Ok(());
+        }
+        let mut stderr = stderr().lock();
+        stderr
+            .write_all(text.as_bytes())
+            .context("write streamed assistant text to stderr")?;
+        stderr
+            .flush()
+            .context("flush streamed assistant text to stderr")
+    }
+}
+
+struct StreamStageHeader<'a> {
+    label: &'a str,
+    usage_line: Option<&'a str>,
+}
+
+struct StreamTextPrinter<'a> {
+    dest: StreamDestination<'a>,
+    started: bool,
+    last_was_newline: bool,
+}
+
+impl<'a> StreamTextPrinter<'a> {
+    fn new(dest: StreamDestination<'a>) -> Self {
+        Self {
+            dest,
+            started: false,
+            last_was_newline: true,
+        }
+    }
+
+    fn header(&mut self, header: Option<StreamStageHeader<'_>>) -> Result<()> {
+        let Some(header) = header else {
+            return Ok(());
+        };
+        if header.label.is_empty() {
+            return Ok(());
+        }
+        self.dest.eprint(header.label)?;
+        self.dest.eprint("\n")?;
+        if let Some(usage_line) = header.usage_line.filter(|line| !line.is_empty()) {
+            self.dest.eprint(usage_line)?;
+            self.dest.eprint("\n")?;
+        }
+        self.last_was_newline = true;
+        Ok(())
+    }
+
+    fn push(&mut self, text: &str) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.dest.eprint(text)?;
+        self.started = true;
+        self.last_was_newline = text.ends_with('\n');
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if self.started && !self.last_was_newline {
+            self.dest.eprint("\n")?;
+            self.last_was_newline = true;
+        }
+        Ok(())
+    }
+}
+
+async fn read_streamed_completion(
+    mut resp: reqwest::Response,
+    stream_dest: StreamDestination<'_>,
+    stage_header: Option<StreamStageHeader<'_>>,
+) -> Result<StreamedCompletion> {
+    let mut streamed = StreamedCompletion::default();
+    let _progress_pause = stream_dest.pause_for_streaming();
+    let mut printer = StreamTextPrinter::new(stream_dest);
+    printer.header(stage_header)?;
+    let mut buf = Vec::<u8>::new();
+    let mut saw_sse_event = false;
+
+    while let Some(chunk) = resp.chunk().await.context("read streaming chat chunk")? {
+        buf.extend_from_slice(&chunk);
+        while let Some((pos, delim_len)) = find_sse_delimiter(&buf) {
+            saw_sse_event = true;
+            let event = buf.drain(..pos).collect::<Vec<_>>();
+            buf.drain(..delim_len);
+            let Some(data) = sse_data(&event)? else {
+                continue;
+            };
+            let trimmed = data.trim();
+            if trimmed == "[DONE]" {
+                printer.finish()?;
+                return Ok(streamed);
+            }
+            streamed.raw_events.push_str(&data);
+            streamed.raw_events.push('\n');
+            let parsed: Value = serde_json::from_str(&data)
+                .with_context(|| format!("parse streaming chat JSON event: {data}"))?;
+            if let Some(err) = parsed.get("error") {
+                let msg = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .or_else(|| err.as_str())
+                    .unwrap_or(trimmed);
+                anyhow::bail!("API error object: {msg}");
+            }
+            if parsed.get("usage").filter(|u| !u.is_null()).is_some() {
+                streamed.usage = Some(usage_from_completion_json(&parsed));
+            }
+            let Some(choice) = parsed
+                .get("choices")
+                .and_then(|c| c.as_array())
+                .and_then(|a| a.first())
+            else {
+                continue;
+            };
+            if streamed.finish_reason.is_none() {
+                streamed.finish_reason = choice
+                    .get("finish_reason")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string);
+            }
+            if let Some(delta) = choice.get("delta") {
+                let visible = apply_stream_delta(delta, &mut streamed);
+                printer.push(&visible)?;
+            }
+        }
+    }
+
+    if !saw_sse_event && !buf.is_empty() {
+        let raw = std::str::from_utf8(&buf)
+            .context("parse non-streaming chat body as UTF-8")?
+            .to_string();
+        let parsed = parse_completion_choice(&raw)?;
+        let visible = message_content_to_string(&parsed.message);
+        printer.push(&visible)?;
+        printer.finish()?;
+        return Ok(StreamedCompletion {
+            usage: Some(parsed.usage),
+            finish_reason: parsed.finish_reason,
+            raw_events: raw,
+            fallback_message: Some(parsed.message),
+            ..Default::default()
+        });
+    }
+
+    printer.finish()?;
+    Ok(streamed)
 }
 
 fn message_thinking_for_log(message: &Value) -> Option<String> {
@@ -541,6 +912,16 @@ fn build_spinner_message(label: &str, cumulative: Option<&CumulativeTokenUsage>)
         return label.to_string();
     };
     format!("{} {}", label, c.tokens_suffix())
+}
+
+fn stream_stage_usage_line(cumulative: Option<&CumulativeTokenUsage>) -> Option<String> {
+    let c = cumulative?;
+    Some(usage_footer_line(
+        c.prompt,
+        c.completion,
+        c.cache_creation,
+        c.cache_read,
+    ))
 }
 
 /// Compact token counts (e.g. `890`, `15.2k`, `2.1M`, `3.5G`) for stderr and human report tables.
@@ -985,9 +1366,11 @@ fn lower_context_retry_budget(current: Option<u32>, provider_max: u32) -> u32 {
 }
 
 /// OpenAI-compatible chat completion:
-/// - Request body uses `model`, `messages`, `stream: false`, plus optional `temperature` when set.
+/// - Request body uses `model`, `messages`, `stream: true`, plus optional `temperature` when set.
 /// - Response is parsed as raw JSON so providers can return `message.content` as a string **or**
 ///   as an array of parts (e.g. Gemini via NVIDIA), which breaks strict `Option<String>` decoding.
+/// - Assistant text is streamed to stderr only when `--verbose` is set; stdout stays reserved for
+///   the final report / JSON.
 ///
 /// `spinner_label`: status line on stderr (TTY only) while the request runs; `None` uses a default.
 ///
@@ -1265,9 +1648,11 @@ async fn chat_completion_inner(
     let mut tool_iterations = 0u32;
     let mut effective_max_input_tokens = model.max_input_tokens;
     let mut context_budget_retries = 0u32;
+    let mut use_stream_options = true;
     // After the tool-round cap, keep `tools` but force `tool_choice: none` so providers that
     // require an explicit `tools=` parameter (e.g. some Bedrock adapters) don't reject requests.
     let mut disable_tools = false;
+    let mut stream_stage_header_printed = false;
 
     loop {
         // Drop consumed tool-result payloads from prior iterations. Each tool result whose content
@@ -1285,11 +1670,8 @@ async fn chat_completion_inner(
         }
 
         // Phase label before each POST so the row says what the model is doing during the wait.
-        // The OpenAI chat/completions endpoint is non-streaming, so the entire request → generate →
-        // receive cycle is one synchronous block; "thinking" is the honest summary of where the
-        // wall time goes (transmission is sub-millisecond on any reasonable link). The round
-        // counter lives inside the tool tag below - between rounds it's just `[thinking]` and the
-        // ticking elapsed timer carries the "still going" signal.
+        // Once streaming starts, the progress UI is hidden so assistant text can print directly.
+        // The row is restored after the full response has been received.
         if use_worker_row {
             if let Some(w) = worker_line {
                 w.set_line_message(format!("{label} {}", phase_tag("thinking")));
@@ -1299,7 +1681,15 @@ async fn chat_completion_inner(
         let mut body = serde_json::Map::new();
         body.insert("model".into(), json!(model.model_id));
         body.insert("messages".into(), json!(&messages));
-        body.insert("stream".into(), json!(false));
+        body.insert("stream".into(), json!(true));
+        if use_stream_options {
+            body.insert(
+                "stream_options".into(),
+                json!({
+                    "include_usage": true,
+                }),
+            );
+        }
         if let Some(t) = temperature {
             body.insert("temperature".into(), json!(t));
         }
@@ -1351,11 +1741,12 @@ async fn chat_completion_inner(
         .await??;
 
         let status = resp.status();
-        let text = await_with_stage_deadline(resp.text(), stage_deadline, &label)
-            .await?
-            .context("read chat/completions body")?;
 
         if !status.is_success() {
+            let text = await_with_stage_deadline(resp.text(), stage_deadline, &label)
+                .await?
+                .context("read chat/completions body")?;
+
             // One-shot fallback: if the provider rejected our cache markers
             // (e.g. Vertex/Gemini, whose caching API is incompatible with
             // inline `cache_control` when system / tools are also set on the
@@ -1388,6 +1779,16 @@ async fn chat_completion_inner(
                 messages[1] = json!({"role": "user", "content": user.to_string()});
                 continue;
             }
+            if use_stream_options
+                && (text.contains("stream_options") || text.contains("include_usage"))
+            {
+                use_stream_options = false;
+                v_chat(
+                    dest,
+                    "stream usage option rejected by provider; retrying without include_usage",
+                );
+                continue;
+            }
             if let Some(provider_max) = context_length_error_max_tokens(&text) {
                 if context_budget_retries < CONTEXT_BUDGET_RETRY_MAX {
                     context_budget_retries += 1;
@@ -1416,11 +1817,45 @@ async fn chat_completion_inner(
             anyhow::bail!("API error {status}: {text}");
         }
 
+        let print_stage_header = dest.stream_model_responses() && !stream_stage_header_printed;
+        let stage_usage_line = if print_stage_header {
+            stream_stage_header_printed = true;
+            stream_stage_usage_line(cumulative.as_deref())
+        } else {
+            None
+        };
+        let stage_header = if print_stage_header {
+            Some(StreamStageHeader {
+                label: &label,
+                usage_line: stage_usage_line.as_deref(),
+            })
+        } else {
+            None
+        };
+        let stream_dest = if dest.stream_model_responses() {
+            if let Some(w) = worker_line {
+                StreamDestination::Worker(w)
+            } else if let Some(s) = spinner.as_ref() {
+                StreamDestination::Spinner(s)
+            } else {
+                StreamDestination::Stderr
+            }
+        } else {
+            StreamDestination::Hidden
+        };
+        let streamed = await_with_stage_deadline(
+            read_streamed_completion(resp, stream_dest, stage_header),
+            stage_deadline,
+            &label,
+        )
+        .await?
+        .context("read streamed chat/completions body")?;
+        let raw_response = streamed.raw_events.clone();
         let ParsedCompletion {
             message,
             usage,
             finish_reason,
-        } = parse_completion_choice(&text)?;
+        } = streamed.into_parsed_completion();
         usages_acc.push(usage);
         if let Some(c) = cumulative.as_mut() {
             c.add(&usage);
@@ -1443,7 +1878,13 @@ async fn chat_completion_inner(
         }
 
         v_chat(dest, "chat <- response:");
-        log_assistant_message_verbose(dest, &message, &text, &usage, finish_reason.as_deref());
+        log_assistant_message_verbose(
+            dest,
+            &message,
+            &raw_response,
+            &usage,
+            finish_reason.as_deref(),
+        );
 
         let tool_calls: Option<Vec<Value>> = message
             .get("tool_calls")
@@ -3244,6 +3685,55 @@ mod tests {
         assert_eq!(u.prompt, Some(2013));
         assert_eq!(u.cache_read, Some(2009));
         assert_eq!(u.cache_creation, None);
+    }
+
+    #[test]
+    fn assembles_streamed_tool_call_deltas() {
+        let mut streamed = StreamedCompletion::default();
+
+        apply_stream_delta(
+            &json!({
+                "content": "{\"findings\":",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_", "arguments": "{\"files\":[{\"path\":\"src"}
+                }]
+            }),
+            &mut streamed,
+        );
+
+        apply_stream_delta(
+            &json!({
+                "content": "[]}",
+                "tool_calls": [{
+                    "index": 0,
+                    "function": {"name": "files", "arguments": "/api.rs\"}]}"}
+                }]
+            }),
+            &mut streamed,
+        );
+
+        let message = streamed.into_message();
+        assert_eq!(message["content"], "{\"findings\":[]}");
+        assert_eq!(message["tool_calls"][0]["id"], "call_1");
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "read_files");
+        let args: Value = serde_json::from_str(
+            message["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(args["files"][0]["path"], "src/api.rs");
+    }
+
+    #[test]
+    fn parses_sse_data_events() {
+        let event = b"event: ignored\ndata: {\"a\":1}\n\n";
+        assert_eq!(sse_data(event).unwrap().as_deref(), Some("{\"a\":1}"));
+        let (pos, len) = find_sse_delimiter(event).unwrap();
+        assert_eq!(&event[pos..pos + len], b"\n\n");
     }
 
     #[test]

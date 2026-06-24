@@ -1,26 +1,25 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-/// Where detailed diagnostics go: stderr (when `--verbose`) or nowhere.
-///
-/// Users who want a log file just redirect `2>file.log` from the shell.
+/// Runtime display preferences.
 #[derive(Clone)]
 pub struct VerboseDest {
-    /// Print detailed lines to stderr (with optional colors when stderr is a TTY).
+    /// Legacy diagnostic logging sink. Kept as a field because some callers use
+    /// it to decide whether to print fallback dry-run summaries, but CLI
+    /// `--verbose` no longer enables these logs.
     pub stderr: bool,
-    /// Prepended to every verbose line (e.g. `[boro]` or `[PATCH 2/10] deadbeef]`).
+    /// Stream model response text to stderr as it arrives.
+    stream_model_responses: bool,
+    /// Prepended to legacy verbose lines when diagnostics are explicitly enabled.
     line_prefix: String,
 }
 
 impl VerboseDest {
-    pub fn new(stderr: bool) -> Self {
-        Self::with_line_prefix(stderr, "[boro]")
-    }
-
-    pub fn with_line_prefix(stderr: bool, line_prefix: impl Into<String>) -> Self {
+    pub fn new(stream_model_responses: bool) -> Self {
         Self {
-            stderr,
-            line_prefix: line_prefix.into(),
+            stderr: false,
+            stream_model_responses,
+            line_prefix: "[boro]".to_string(),
         }
     }
 
@@ -28,6 +27,7 @@ impl VerboseDest {
     pub fn with_prefix(&self, line_prefix: impl Into<String>) -> Self {
         Self {
             stderr: self.stderr,
+            stream_model_responses: self.stream_model_responses,
             line_prefix: line_prefix.into(),
         }
     }
@@ -42,7 +42,12 @@ impl VerboseDest {
         self.stderr
     }
 
-    /// Plain prefixed line to stderr (when `--verbose`).
+    #[inline]
+    pub fn stream_model_responses(&self) -> bool {
+        self.stream_model_responses
+    }
+
+    /// Plain prefixed diagnostic line to stderr.
     pub fn line(&self, msg: impl std::fmt::Display) {
         if !self.stderr {
             return;

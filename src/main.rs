@@ -130,7 +130,7 @@ struct GlobalOpts {
     #[arg(short = 'd', long, global = true)]
     dry_run: bool,
 
-    /// Log steps and token usage to stderr.
+    /// Stream model responses to stderr while they are generated.
     #[arg(short = 'v', long, global = true)]
     verbose: bool,
 
