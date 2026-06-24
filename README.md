@@ -38,6 +38,10 @@ cd /path/to/linux
 boro review origin/master..HEAD
 ```
 
+## Demo
+
+https://github.com/user-attachments/assets/d4dc2533-9928-48b0-aca4-dbd9197398cb
+
 ## Design and workflow
 
 ### Synchronous execution
