@@ -20,6 +20,7 @@ mod progress;
 mod prompts;
 mod snapshot;
 mod stages;
+mod target;
 mod test_boot;
 mod test_build;
 mod tools;
@@ -43,9 +44,6 @@ use progress::{phase_tag, MultiPatchSpinner, WorkerLineCtx};
 use snapshot::{snapshot_to_value, CommitSnapshot, SnapshotPublisher};
 use verbose::VerboseDest;
 
-const SYSTEM_REVIEWER: &str = "You are an expert Linux kernel maintainer. \
-Follow the reference material exactly. Be concise in JSON string fields but precise in reasoning.";
-
 /// CLI surface for `--backend`. Maps to [`config::Backend`] before reaching the rest of the code.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum BackendArg {
@@ -66,6 +64,25 @@ impl BackendArg {
             BackendArg::Claude => config::Backend::Claude,
             BackendArg::Opencode => config::Backend::Opencode,
             BackendArg::Codex => config::Backend::Codex,
+        }
+    }
+}
+
+/// CLI surface for `--target` (review only). Maps to [`config::ReviewTarget`].
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum TargetArg {
+    /// Linux kernel (default).
+    #[default]
+    Kernel,
+    /// QEMU.
+    Qemu,
+}
+
+impl TargetArg {
+    fn to_config(self) -> config::ReviewTarget {
+        match self {
+            TargetArg::Kernel => config::ReviewTarget::Kernel,
+            TargetArg::Qemu => config::ReviewTarget::Qemu,
         }
     }
 }
@@ -170,6 +187,10 @@ struct ReviewArgs {
     #[arg(short = 't', long)]
     no_tools: bool,
 
+    /// Codebase being reviewed: selects the prompt corpus and reviewer persona.
+    #[arg(short = 'T', long, value_enum, default_value_t = TargetArg::Kernel)]
+    target: TargetArg,
+
     /// Max characters for bundled reference markdown (patch excluded).
     #[arg(short = 'm', long, default_value_t = 200_000)]
     max_context_size: usize,
@@ -212,6 +233,7 @@ struct TestArgs {
 #[derive(Clone)]
 enum CommitAction {
     Review {
+        target: config::ReviewTarget,
         fast: bool,
         no_tools: bool,
         max_context_size: usize,
@@ -336,6 +358,7 @@ async fn commit_review_inner(
     effective_repo: &Path,
     client: &reqwest::Client,
     model: &config::ResolvedModel,
+    target: config::ReviewTarget,
     fast: bool,
     no_tools: bool,
     max_context_size: usize,
@@ -364,8 +387,10 @@ async fn commit_review_inner(
             max_context_size
         ),
     );
-    let reference = prompts::build_reference_context(&changed, max_context_size, None, None)?;
-    let ref_hint = rough_token_hint(SYSTEM_REVIEWER.len() + reference.len());
+    let reference =
+        prompts::build_reference_context(target, &changed, max_context_size, None, None)?;
+    let ref_hint =
+        rough_token_hint(crate::target::reviewer_system_prompt(target).len() + reference.len());
     let patch_hint = rough_token_hint(patch.len());
     v(
         vd,
@@ -427,6 +452,7 @@ async fn commit_review_inner(
         run_single_pass(
             client,
             model,
+            target,
             &reference_with_prefetch,
             &commit_headers,
             &patch_diff,
@@ -445,6 +471,7 @@ async fn commit_review_inner(
         run_two_pass(
             client,
             model,
+            target,
             repo,
             sha,
             &patch_tag,
@@ -604,6 +631,7 @@ async fn execute_commit_task(
 
     let commit_obj_result = match &action {
         CommitAction::Review {
+            target,
             fast,
             no_tools,
             max_context_size,
@@ -618,6 +646,7 @@ async fn execute_commit_task(
                 effective_repo.as_path(),
                 &client,
                 &model,
+                *target,
                 *fast,
                 *no_tools,
                 *max_context_size,
@@ -1125,7 +1154,7 @@ async fn run_findings_validation(
 ///     back to `findings[]` (off mode or validation failed);
 ///   - if the array is empty, set `lkml_report = "No issues found."`
 ///     without an LLM call;
-///   - else call `api::chat_completion` with `SYSTEM_LKML` to render prose
+///   - else call `api::chat_completion` with the target LKML prompt to render prose
 ///     from the chosen finding set;
 ///   - record the LKML render under validation-model usage and add the
 ///     tokens to run-wide `totals`.
@@ -1146,6 +1175,7 @@ async fn run_findings_validation(
 async fn render_commit_lkml_phase(
     client: &reqwest::Client,
     model: &config::ResolvedModel,
+    target: config::ReviewTarget,
     out: &mut Value,
     totals: &mut RunTotals,
     vdest: &VerboseDest,
@@ -1155,7 +1185,7 @@ async fn render_commit_lkml_phase(
     no_tools: bool,
     progress_ui: Option<Arc<MultiPatchSpinner>>,
 ) {
-    let template = match prompts::load_inline_template(max_extras.saturating_mul(4)) {
+    let template = match prompts::load_inline_template(target, max_extras.saturating_mul(4)) {
         Ok(Some(t)) => t,
         _ => api::LKML_FALLBACK_TEMPLATE.to_string(),
     };
@@ -1226,7 +1256,7 @@ async fn render_commit_lkml_phase(
             let (body, usage, error) = match api::chat_completion_stage_timeout(
                 &client,
                 &model,
-                api::SYSTEM_LKML,
+                crate::target::lkml_system_prompt(target),
                 &user,
                 model.temperature,
                 Some(&label),
@@ -1317,6 +1347,7 @@ async fn run_quick_summary(
     client: &reqwest::Client,
     cfg: &config::ResolvedModel,
     main_model: &config::ResolvedModel,
+    target: config::ReviewTarget,
     out: &mut Value,
     totals: &mut RunTotals,
     vdest: &VerboseDest,
@@ -1412,7 +1443,7 @@ async fn run_quick_summary(
         let (text, usage, error) = match api::chat_completion_stage_timeout(
             client,
             cfg,
-            api::SYSTEM_QUICK_SUMMARY,
+            crate::target::quick_summary_system_prompt(target),
             &user_msg,
             cfg.temperature,
             Some(&label),
@@ -1636,6 +1667,7 @@ async fn main() -> Result<()> {
     let (mut action, range, default_workers) = match &cli.command {
         Command::Review(args) => (
             CommitAction::Review {
+                target: args.target.to_config(),
                 fast: args.fast,
                 no_tools: args.no_tools,
                 max_context_size: args.max_context_size,
@@ -1661,6 +1693,14 @@ async fn main() -> Result<()> {
         _ => ValidationMode::Off,
     };
     let validation_disabled = validation_mode == ValidationMode::Off;
+
+    // Review target (kernel default). Only meaningful for `review`; used for the
+    // verbose prompt-source line, the global LKML/summary phases, and the
+    // source-tree mismatch warning.
+    let review_target = match &action {
+        CommitAction::Review { target, .. } => *target,
+        _ => config::ReviewTarget::default(),
+    };
 
     let vdest = VerboseDest::new(cli.global.verbose);
 
@@ -1699,6 +1739,36 @@ async fn main() -> Result<()> {
         &vdest,
         format!("process working directory: {}", repo.display()),
     );
+
+    // Warn (don't fail) if the source tree looks like a different codebase than
+    // --target selects — a quietly-wrong review is the easy mistake to make.
+    // Heuristic: only warn when the tree is confidently classified.
+    if action.is_review() {
+        match config::detect_tree_kind(&repo) {
+            Some(detected) if detected != review_target => {
+                eprintln!(
+                    "[boro] warning: --target {} was given, but {} looks like a {} tree. \
+The review will use {} prompts and persona and may be inaccurate — did you mean --target {}?",
+                    review_target.as_str(),
+                    repo.display(),
+                    detected.as_str(),
+                    review_target.as_str(),
+                    detected.as_str(),
+                );
+            }
+            Some(detected) => v(
+                &vdest,
+                format!(
+                    "tree-kind check: source matches --target {}",
+                    detected.as_str()
+                ),
+            ),
+            None => v(
+                &vdest,
+                "tree-kind check: source tree not confidently classified (no warning)",
+            ),
+        }
+    }
 
     let backend = cli.global.backend.to_config();
     let model = {
@@ -1781,7 +1851,10 @@ async fn main() -> Result<()> {
 
     v(
         &vdest,
-        format!("prompts: {}", prompts::PROMPTS_SOURCE_VERBOSE),
+        format!(
+            "prompts: {}",
+            crate::target::prompts_source_verbose(review_target)
+        ),
     );
     v(
         &vdest,
@@ -2024,6 +2097,7 @@ async fn main() -> Result<()> {
         render_commit_lkml_phase(
             &client,
             lkml_model,
+            review_target,
             &mut out,
             &mut totals,
             &vdest,
@@ -2046,6 +2120,7 @@ async fn main() -> Result<()> {
             &client,
             summary_model,
             &model,
+            review_target,
             &mut out,
             &mut totals,
             &vdest,
@@ -2104,6 +2179,7 @@ async fn main() -> Result<()> {
 async fn run_single_pass(
     client: &reqwest::Client,
     model: &config::ResolvedModel,
+    target: config::ReviewTarget,
     reference: &str,
     commit_headers: &str,
     patch_diff: &str,
@@ -2118,7 +2194,7 @@ async fn run_single_pass(
     second_opinion: Option<&config::ResolvedModel>,
 ) -> Result<CommitReviewResult> {
     let user = api::single_pass_user_payload(reference, commit_headers, patch_diff);
-    let sys_len = SYSTEM_REVIEWER.len();
+    let sys_len = crate::target::reviewer_system_prompt(target).len();
     let usr_len = user.len();
     v(
         vd,
@@ -2136,7 +2212,7 @@ async fn run_single_pass(
         api::chat_completion_with_retry_stage_timeout(
             client,
             model,
-            SYSTEM_REVIEWER,
+            crate::target::reviewer_system_prompt(target),
             &user,
             model.temperature,
             Some(&spin),
@@ -2189,6 +2265,7 @@ async fn run_single_pass(
         let so_findings = run_second_opinion(
             client,
             cfg,
+            target,
             reference,
             &findings_val,
             commit_headers,
@@ -2298,6 +2375,7 @@ fn series_context_for_consolidation(
 async fn run_phase0_selection(
     client: &reqwest::Client,
     model: &config::ResolvedModel,
+    target: config::ReviewTarget,
     subsystem_index_md: Option<&str>,
     patch: &str,
     vd: &VerboseDest,
@@ -2316,16 +2394,16 @@ async fn run_phase0_selection(
     v(
         vd,
         format!(
-            "API: phase 0 (identify kernel subsystem) - user={} chars (~{} tokens rough)",
+            "API: phase 0 (identify subsystem) - user={} chars (~{} tokens rough)",
             user.len(),
-            rough_token_hint(api::SYSTEM_PHASE0.len() + user.len())
+            rough_token_hint(crate::target::phase0_system_prompt(target).len() + user.len())
         ),
     );
     let t0 = Instant::now();
     let (guides_opt, raw, usage, err, _attempts) = api::chat_completion_with_retry_stage_timeout(
         client,
         model,
-        api::SYSTEM_PHASE0,
+        crate::target::phase0_system_prompt(target),
         &user,
         model.temperature,
         spinner_line,
@@ -2504,6 +2582,7 @@ async fn run_upstream_followup_stage(
 async fn run_second_opinion(
     client: &reqwest::Client,
     cfg: &config::ResolvedModel,
+    target: config::ReviewTarget,
     reference: &str,
     current_findings: &Value,
     commit_headers: &str,
@@ -2542,7 +2621,7 @@ async fn run_second_opinion(
     let (parsed, _raw, usage, err, _attempts) = api::chat_completion_with_retry_stage_timeout(
         client,
         cfg,
-        api::SYSTEM_SECOND_OPINION,
+        crate::target::second_opinion_system_prompt(target),
         &user,
         cfg.temperature,
         Some(&spinner),
@@ -2609,6 +2688,7 @@ fn append_findings(base: &mut Value, extra: &Value) -> usize {
 async fn run_two_pass(
     client: &reqwest::Client,
     model: &config::ResolvedModel,
+    target: config::ReviewTarget,
     repo: &Path,
     sha: &str,
     patch_tag: &str,
@@ -2631,7 +2711,7 @@ async fn run_two_pass(
     let mut usage_step: Vec<StageUsage> = Vec::new();
     let mut stage_tot = api::CumulativeTokenUsage::default();
 
-    let subsystem_index = prompts::load_subsystem_index(120_000)?;
+    let subsystem_index = prompts::load_subsystem_index(target, 120_000)?;
     let lore_cfg = lore::LoreConfig::from_env();
     let lore_active = lore_cfg.enabled && lore::lei_available();
     if lore_cfg.enabled && !lore_active {
@@ -2653,7 +2733,7 @@ async fn run_two_pass(
             sha_short,
             0,
             display_total,
-            "Identify kernel subsystem",
+            "Identify subsystem",
         ))
     } else {
         None
@@ -2662,6 +2742,7 @@ async fn run_two_pass(
     let phase0_selected_prompts = match run_phase0_selection(
         client,
         model,
+        target,
         subsystem_index.as_deref(),
         patch,
         vd,
@@ -2734,6 +2815,7 @@ async fn run_two_pass(
         ),
     );
     let reference = prompts::build_reference_context(
+        target,
         changed_paths,
         max_context_size,
         phase0_selected_prompts.as_deref(),
@@ -2752,9 +2834,11 @@ async fn run_two_pass(
         vd,
         format!(
             "API: pass 1 (concerns) - system={} user={} chars (~{} tokens rough)",
-            SYSTEM_REVIEWER.len(),
+            crate::target::reviewer_system_prompt(target).len(),
             pass1_user.len(),
-            rough_token_hint(SYSTEM_REVIEWER.len() + pass1_user.len())
+            rough_token_hint(
+                crate::target::reviewer_system_prompt(target).len() + pass1_user.len()
+            )
         ),
     );
 
@@ -2764,7 +2848,7 @@ async fn run_two_pass(
         api::chat_completion_with_retry_stage_timeout(
             client,
             model,
-            SYSTEM_REVIEWER,
+            crate::target::reviewer_system_prompt(target),
             &pass1_user,
             model.temperature,
             Some(&pass1_line),
@@ -2858,7 +2942,7 @@ async fn run_two_pass(
             );
             continue;
         }
-        let addon = prompts::load_stage_prompt_files(st, max_extras)?;
+        let addon = prompts::load_stage_prompt_files(target, st, max_extras)?;
         let (prior_for_stage, fp_for_stage) = if st == 8 {
             ("", "")
         } else {
@@ -2878,7 +2962,7 @@ async fn run_two_pass(
             format!(
                 "API: specialist stage {st} - user={} chars (~{} tokens rough)",
                 user.len(),
-                rough_token_hint(SYSTEM_REVIEWER.len() + user.len())
+                rough_token_hint(crate::target::reviewer_system_prompt(target).len() + user.len())
             ),
         );
         let step_label: &'static str = stages::short_label(st);
@@ -2894,7 +2978,7 @@ async fn run_two_pass(
             api::chat_completion_with_retry_stage_timeout(
                 client,
                 model,
-                SYSTEM_REVIEWER,
+                crate::target::reviewer_system_prompt(target),
                 &user,
                 model.temperature,
                 Some(&spinner),
@@ -2945,6 +3029,7 @@ async fn run_two_pass(
             let so_findings = run_second_opinion(
                 client,
                 cfg,
+                target,
                 &reference_with_prefetch,
                 &findings_val,
                 commit_headers,
@@ -2988,7 +3073,7 @@ async fn run_two_pass(
         vd,
         "loading consolidation extras (false-positive-guide, severity) ...",
     );
-    let extras = prompts::load_consolidation_extras(max_extras)?;
+    let extras = prompts::load_consolidation_extras(target, max_extras)?;
     v(
         vd,
         format!("consolidation extras: {} characters", extras.len()),
@@ -3022,7 +3107,9 @@ async fn run_two_pass(
         format!(
             "API: pass 2 (consolidation) - user={} chars (~{} tokens rough)",
             pass2_user.len(),
-            rough_token_hint(SYSTEM_REVIEWER.len() + pass2_user.len())
+            rough_token_hint(
+                crate::target::reviewer_system_prompt(target).len() + pass2_user.len()
+            )
         ),
     );
 
@@ -3033,7 +3120,7 @@ async fn run_two_pass(
         api::chat_completion_with_retry_stage_timeout(
             client,
             model,
-            SYSTEM_REVIEWER,
+            crate::target::reviewer_system_prompt(target),
             &pass2_user,
             model.temperature,
             Some(&pass2_line),
@@ -3109,6 +3196,7 @@ async fn run_two_pass(
         let so_findings = run_second_opinion(
             client,
             cfg,
+            target,
             &reference_with_prefetch,
             &consolidated_findings,
             commit_headers,

@@ -3,15 +3,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Copy (or refresh) the kernel prompt bundle from sashiko's upstream repo so this project
-# stays aligned with third_party/prompts/kernel layout.
+# stays aligned with Sashiko's third_party/prompts/kernel layout.
 #
 # Default: shallow-clone https://github.com/sashiko-dev/sashiko.git into a cache under
-# ./.cache/sashiko-prompts-src (override with SASHIKO_CACHE), then rsync into third_party/prompts/kernel.
+# ./.cache/sashiko-prompts-src (override with SASHIKO_CACHE), then rsync into
+# resources/prompts/kernel.
 #
 # Override: set SASHIKO=/path/to/local/checkout to skip git and copy from that tree instead.
 set -eu
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-DST="$ROOT/third_party/prompts/kernel"
+DST="$ROOT/resources/prompts/kernel"
 
 if [ -n "${SASHIKO:-}" ]; then
   SRC="$SASHIKO/third_party/prompts/kernel"
@@ -45,7 +46,7 @@ mkdir -p "$DST"
 rsync -a --delete "$SRC/" "$DST/"
 echo "Synced prompts: $SRC -> $DST"
 
-# third_party/prompts/kernel/ is Apache-2.0 (Sashiko). rsync --delete drops extra files; restore pointer each sync.
+# resources/prompts/kernel/ is Apache-2.0 (Sashiko-derived). rsync --delete drops extra files; restore pointer each sync.
 cat > "$DST/LICENSE.boro-notice" <<'EOF'
 These Markdown and companion files are synced from the Sashiko project's kernel prompt tree.
 They are licensed under the Apache License, Version 2.0.
@@ -55,4 +56,4 @@ EOF
 
 python3 "$ROOT/scripts/update-subsystem-map-from-sashiko.py" \
   "$DST" \
-  "$ROOT/src/prompts.rs"
+  "$ROOT/src/target/kernel.rs"

@@ -19,8 +19,8 @@ tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-t
 indicatif = "0.17"
 owo-colors = "4"
 # "debug-embed" embeds prompts in debug builds too (same as release). Stock rust-embed only
-# embeds in release; `cargo build` / `cargo install --debug` otherwise read third_party/ via an
-# absolute compile-time path at runtime, which breaks if the tree moved or is missing.
+# embeds in release; `cargo build` / `cargo install --debug` otherwise read prompt resources via
+# an absolute compile-time path at runtime, which breaks if the tree moved or is missing.
 # (`cargo install --path .` is release by default — this mainly helps plain `cargo build`.)
 rust-embed = { version = "8", features = ["debug-embed"] }
 tempfile = "3"

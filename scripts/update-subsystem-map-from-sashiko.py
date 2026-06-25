@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import List, Optional, Set, Tuple
 
 
-HEADER = """// Generated from third_party/prompts/kernel/subsystem/subsystem.md by
+HEADER = """// Generated from resources/prompts/kernel/subsystem/subsystem.md by
 // scripts/update-subsystem-map-from-sashiko.py.
 """
 
@@ -114,29 +114,29 @@ def render_map(entries: List[Tuple[str, str]]) -> str:
     return "".join(out)
 
 
-def replace_map(prompts_rs: Path, rendered: str) -> bool:
-    text = prompts_rs.read_text(encoding="utf-8")
+def replace_map(target_rs: Path, rendered: str) -> bool:
+    text = target_rs.read_text(encoding="utf-8")
     pattern = re.compile(
         r"(?ms)(?:// Generated from .*?\n// scripts/update-subsystem-map-from-sashiko\.py\.\n)?"
         r"const SUBSYSTEM_MAP: &\[\(&str, &str\)\] = &\[\n.*?\n\];"
     )
     new_text, count = pattern.subn(rendered, text, count=1)
     if count != 1:
-        raise SystemExit(f"failed to find SUBSYSTEM_MAP in {prompts_rs}")
+        raise SystemExit(f"failed to find SUBSYSTEM_MAP in {target_rs}")
     if new_text == text:
         return False
-    prompts_rs.write_text(new_text, encoding="utf-8")
+    target_rs.write_text(new_text, encoding="utf-8")
     return True
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("prompt_dir", type=Path)
-    parser.add_argument("prompts_rs", type=Path)
+    parser.add_argument("target_rs", type=Path)
     args = parser.parse_args()
 
     entries, warnings = parse_subsystem_map(args.prompt_dir)
-    changed = replace_map(args.prompts_rs, render_map(entries))
+    changed = replace_map(args.target_rs, render_map(entries))
     for warning in warnings:
         print(f"update-subsystem-map: {warning}", file=sys.stderr)
     state = "updated" if changed else "already current"

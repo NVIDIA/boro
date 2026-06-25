@@ -33,6 +33,43 @@ impl Backend {
     }
 }
 
+/// Which codebase the `review` pipeline targets. Selects the embedded prompt
+/// corpus (subsystem guides, core patterns, report template) and the reviewer
+/// personas. Defaults to [`ReviewTarget::Kernel`]; `build` / `test` only ever
+/// operate on the kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReviewTarget {
+    /// Linux kernel (prompts synced from Sashiko under `resources/prompts/kernel/`).
+    #[default]
+    Kernel,
+    /// QEMU (boro-authored prompts under `resources/prompts/qemu/`).
+    Qemu,
+}
+
+impl ReviewTarget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewTarget::Kernel => "kernel",
+            ReviewTarget::Qemu => "qemu",
+        }
+    }
+}
+
+/// Best-effort classification of a source tree as a Linux kernel or QEMU
+/// checkout from unambiguous signature files. Returns `None` when the tree
+/// matches neither (or, defensively, both) — callers should stay silent in that
+/// case rather than guess. Used only to warn on a likely `--target` mismatch.
+pub fn detect_tree_kind(repo: &std::path::Path) -> Option<ReviewTarget> {
+    let has = |rel: &str| repo.join(rel).exists();
+    let qemu = has("qapi") && has("qemu-options.hx") && has("include/qemu/osdep.h");
+    let kernel = has("Kbuild") && has("mm") && has("kernel/sched") && has("include/linux/kernel.h");
+    match (kernel, qemu) {
+        (true, false) => Some(ReviewTarget::Kernel),
+        (false, true) => Some(ReviewTarget::Qemu),
+        _ => None,
+    }
+}
+
 /// Resolved model description used by every backend.
 ///
 /// For `OpenAi`, `base_url` and `api_key` come from `BORO_URL` / `BORO_KEY` and `model_id` from
@@ -256,6 +293,7 @@ pub fn validation_differs(main: &ResolvedModel, validation: &ResolvedModel) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn normalize_boro_base_url_accepts_host_root_or_v1_base() {
@@ -271,5 +309,64 @@ mod tests {
         ] {
             assert_eq!(normalize_boro_base_url(raw), expected);
         }
+    }
+
+    fn touch_all(root: &Path, rels: &[&str]) {
+        for rel in rels {
+            let p = root.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            if matches!(*rel, "mm" | "kernel/sched" | "qapi") {
+                std::fs::create_dir_all(&p).unwrap();
+            } else {
+                std::fs::write(&p, b"x").unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn detects_kernel_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch_all(
+            tmp.path(),
+            &["Kbuild", "mm", "kernel/sched", "include/linux/kernel.h"],
+        );
+        assert_eq!(detect_tree_kind(tmp.path()), Some(ReviewTarget::Kernel));
+    }
+
+    #[test]
+    fn detects_qemu_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch_all(
+            tmp.path(),
+            &["qapi", "qemu-options.hx", "include/qemu/osdep.h"],
+        );
+        assert_eq!(detect_tree_kind(tmp.path()), Some(ReviewTarget::Qemu));
+    }
+
+    #[test]
+    fn unclassifiable_tree_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch_all(tmp.path(), &["README.md", "src/main.rs"]);
+        assert_eq!(detect_tree_kind(tmp.path()), None);
+    }
+
+    #[test]
+    fn ambiguous_tree_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch_all(
+            tmp.path(),
+            &[
+                "Kbuild",
+                "mm",
+                "kernel/sched",
+                "include/linux/kernel.h",
+                "qapi",
+                "qemu-options.hx",
+                "include/qemu/osdep.h",
+            ],
+        );
+        assert_eq!(detect_tree_kind(tmp.path()), None);
     }
 }
