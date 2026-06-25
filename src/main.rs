@@ -224,6 +224,10 @@ struct TestArgs {
     #[arg(short = 't', long, value_name = "SECONDS", default_value_t = 300)]
     timeout: u64,
 
+    /// Generate a detailed test plan without building or booting.
+    #[arg(long)]
+    plan: bool,
+
     /// Git revision range, e.g. HEAD~4..HEAD. A single commit means COMMIT^..COMMIT.
     #[arg(value_name = "COMMIT_RANGE")]
     range: String,
@@ -246,6 +250,8 @@ enum CommitAction {
     TestBoot {
         /// Wall-clock cap for the in-VM run (seconds). The build itself is unbounded.
         timeout_secs: u64,
+        /// Ask the picker what would run, then stop before `vng -b` / `vng -r`.
+        plan_only: bool,
     },
 }
 
@@ -672,7 +678,10 @@ async fn execute_commit_task(
             )
             .await
         }
-        CommitAction::TestBoot { timeout_secs } => {
+        CommitAction::TestBoot {
+            timeout_secs,
+            plan_only,
+        } => {
             test_boot::commit_test_boot(
                 sha_ref,
                 effective_repo.as_path(),
@@ -680,6 +689,7 @@ async fn execute_commit_task(
                 &model,
                 &vd,
                 dry_run,
+                *plan_only,
                 Duration::from_secs(*timeout_secs),
                 worker_line.as_ref(),
                 &publisher,
@@ -1681,6 +1691,7 @@ async fn main() -> Result<()> {
         Command::TestBoot(args) => (
             CommitAction::TestBoot {
                 timeout_secs: args.timeout,
+                plan_only: args.plan,
             },
             args.range.clone(),
             1usize,
@@ -1717,7 +1728,11 @@ async fn main() -> Result<()> {
     // Fail fast if the user asked for a vng-driven mode but vng isn't installed.
     if matches!(
         action,
-        CommitAction::TestBuild | CommitAction::TestBoot { .. }
+        CommitAction::TestBuild
+            | CommitAction::TestBoot {
+                plan_only: false,
+                ..
+            }
     ) {
         vng::ensure_vng_available().context("build/test require `vng` (virtme-ng)")?;
     }
@@ -1789,7 +1804,8 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
     //     --dry-run since we don't actually invoke vng.
     let use_worktree = match &action {
         CommitAction::Review { .. } => !cli.global.dry_run,
-        CommitAction::TestBuild | CommitAction::TestBoot { .. } => !cli.global.dry_run,
+        CommitAction::TestBuild => !cli.global.dry_run,
+        CommitAction::TestBoot { plan_only, .. } => !cli.global.dry_run && !plan_only,
     };
     if use_worktree {
         if let Err(e) = worktree::sweep_stale(&repo, action.label(), &vdest) {

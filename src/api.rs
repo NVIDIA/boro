@@ -3109,6 +3109,12 @@ pub fn system_test_picker() -> &'static str {
     })
 }
 
+/// System prompt for `boro test --plan`. Unlike the runtime picker, this prompt is not constrained
+/// to one quick command that can execute inside the current virtme-ng VM.
+pub fn system_test_plan_picker() -> &'static str {
+    include_str!("../resources/test-plan-picker.md")
+}
+
 /// Per-commit input to the quick-summary payload. The builder serializes a list of these as the
 /// model's user message.
 pub struct QuickSummaryCommit<'a> {

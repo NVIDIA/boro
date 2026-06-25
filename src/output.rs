@@ -422,15 +422,21 @@ fn print_quick_summary_block(out: &Value) {
 }
 
 fn print_findings_block(commits: &[&Value], use_validated: bool) {
-    if !commits
+    let has_reportable_commits = commits
         .iter()
-        .any(|c| c.get("dry_run").and_then(|v| v.as_bool()) != Some(true))
-    {
+        .any(|c| c.get("dry_run").and_then(|v| v.as_bool()) != Some(true));
+    if !has_reportable_commits {
         return;
     }
+    let all_plan_only = commits
+        .iter()
+        .filter(|c| c.get("dry_run").and_then(|v| v.as_bool()) != Some(true))
+        .all(|c| c.get("plan").and_then(|v| v.as_bool()) == Some(true));
 
     let co = use_color();
-    let title = if use_validated {
+    let title = if all_plan_only {
+        "Test Plan"
+    } else if use_validated {
         "Findings (validated)"
     } else {
         "Findings"
@@ -456,21 +462,25 @@ fn print_findings_block(commits: &[&Value], use_validated: bool) {
         let sha = short_sha(commit);
         let findings = commit_effective_findings(commit, use_validated);
         let n = findings.map(|a| a.len()).unwrap_or(0);
+        let plan_only = commit.get("plan").and_then(|v| v.as_bool()) == Some(true);
+        let status = if plan_only {
+            "(plan only)".to_string()
+        } else {
+            format!("({n} finding{})", if n == 1 { "" } else { "s" })
+        };
         println!(
             "  {}  {}",
             paint!(&sha, co, |s| s.bold().yellow()),
-            paint!(
-                &format!("({n} finding{})", if n == 1 { "" } else { "s" }),
-                co,
-                |s| s.dimmed()
-            )
+            paint!(&status, co, |s| s.dimmed())
         );
 
         print_test_summary(commit, co);
 
         if let Some(arr) = findings {
             if arr.is_empty() {
-                println!("    {}", paint!("(none)", co, |s| s.dimmed()));
+                if !plan_only {
+                    println!("    {}", paint!("(none)", co, |s| s.dimmed()));
+                }
             } else {
                 for (i, f) in arr.iter().enumerate() {
                     print_finding(i + 1, f, co);
@@ -516,7 +526,8 @@ fn print_test_summary(commit: &Value, color: bool) {
     }
     let cmd = commit.get("test_command").and_then(|v| v.as_str());
     let summary = commit.get("test_summary").and_then(|v| v.as_str());
-    if cmd.is_none() && summary.is_none() {
+    let plan_only = commit.get("plan").and_then(|v| v.as_bool()) == Some(true);
+    if cmd.is_none() && summary.is_none() && !plan_only {
         return;
     }
     if let Some(c) = cmd {
@@ -525,6 +536,14 @@ fn print_test_summary(commit: &Value, color: bool) {
             paint!("test:", color, |s| s.dimmed()),
             paint!(c, color, |s| s.cyan()),
         );
+    }
+    if plan_only {
+        print_test_plan_details(commit, color);
+        println!(
+            "    {}",
+            paint!("(plan only; test not run)", color, |s| s.dimmed())
+        );
+        return;
     }
     if let Some(s) = summary {
         let trimmed = s.trim();
@@ -536,6 +555,126 @@ fn print_test_summary(commit: &Value, color: bool) {
                 println!("    {}", paint!(line, color, |s| s));
             }
         }
+    }
+}
+
+fn print_test_plan_details(commit: &Value, color: bool) {
+    let description = test_plan_string(commit, "description", "test_description");
+    if let Some(text) = description.as_deref() {
+        print_wrapped_label("plan", text, color);
+    }
+    if let Some(script) = test_plan_string(commit, "script", "test_script") {
+        print_plan_script(&script, color);
+    }
+
+    print_plan_list(
+        "requirements",
+        &test_plan_array(commit, "requirements"),
+        false,
+        color,
+    );
+    print_plan_list("steps", &test_plan_array(commit, "steps"), true, color);
+    print_plan_list(
+        "expected",
+        &test_plan_array(commit, "expected_results"),
+        false,
+        color,
+    );
+
+    if let Some(rationale) = test_plan_string(commit, "rationale", "test_rationale") {
+        let is_duplicate = description
+            .as_deref()
+            .map(|d| d.trim() == rationale.trim())
+            .unwrap_or(false);
+        if !is_duplicate {
+            print_wrapped_label("why", &rationale, color);
+        }
+    }
+}
+
+fn test_plan_string(commit: &Value, key: &str, fallback_key: &str) -> Option<String> {
+    commit
+        .get("test_plan")
+        .and_then(|p| p.get(key))
+        .and_then(|v| v.as_str())
+        .or_else(|| commit.get(fallback_key).and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn test_plan_array(commit: &Value, key: &str) -> Vec<String> {
+    commit
+        .get("test_plan")
+        .and_then(|p| p.get(key))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn print_wrapped_label(label: &str, text: &str, color: bool) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let lines = wrap_words(trimmed, 70, 76);
+    for (idx, line) in lines.iter().enumerate() {
+        if idx == 0 {
+            println!(
+                "    {} {}",
+                paint!(&format!("{label}:"), color, |s| s.dimmed()),
+                paint!(line, color, |s| s)
+            );
+        } else {
+            println!("    {}", paint!(line, color, |s| s));
+        }
+    }
+}
+
+fn print_plan_list(label: &str, items: &[String], numbered: bool, color: bool) {
+    if items.is_empty() {
+        return;
+    }
+    println!(
+        "    {}",
+        paint!(&format!("{label}:"), color, |s| s.dimmed())
+    );
+    for (idx, item) in items.iter().enumerate() {
+        let marker = if numbered {
+            format!("{}.", idx + 1)
+        } else {
+            "-".to_string()
+        };
+        let first_width = 76usize.saturating_sub(marker.chars().count() + 1);
+        let lines = wrap_words(item.trim(), first_width, first_width);
+        for (line_idx, line) in lines.iter().enumerate() {
+            if line_idx == 0 {
+                println!("      {} {}", marker, paint!(line, color, |s| s));
+            } else {
+                println!(
+                    "      {} {}",
+                    " ".repeat(marker.chars().count()),
+                    paint!(line, color, |s| s)
+                );
+            }
+        }
+    }
+}
+
+fn print_plan_script(script: &str, color: bool) {
+    if script.trim().is_empty() {
+        return;
+    }
+    println!("    {}", paint!("script:", color, |s| s.dimmed()));
+    for line in script.lines() {
+        println!("      {}", paint!(line, color, |s| s));
     }
 }
 

@@ -27,6 +27,7 @@ use crate::vng;
 const KCONFIG_STEP: &str = "kconfig fragment";
 const VNG_BUILD_STEP: &str = "vng -b";
 const TEST_PICKER_STEP: &str = "test picker";
+const TEST_PLAN_STEP: &str = "test plan";
 const VNG_RUN_STEP: &str = "vng run";
 const TEST_REVIEW_STEP: &str = "test review";
 
@@ -45,6 +46,7 @@ pub async fn commit_test_boot(
     model: &ResolvedModel,
     vd: &VerboseDest,
     dry_run: bool,
+    plan_only: bool,
     run_timeout: Duration,
     worker_ctx: Option<&WorkerLineCtx>,
     publisher: &SnapshotPublisher,
@@ -55,6 +57,56 @@ pub async fn commit_test_boot(
             "sha": sha,
             "dry_run": true,
             "findings": [],
+        }));
+    }
+
+    if plan_only {
+        let picker = pick_test_plan(sha, effective_repo, client, model, vd, worker_ctx).await;
+        publisher.add_stage(StageUsage {
+            step: TEST_PLAN_STEP,
+            usage: picker.usage,
+            wall: picker.wall,
+            error: picker.error.clone(),
+        });
+        vd.line(format!(
+            "test plan: chose `{}` (rationale: {})",
+            picker.plan.command, picker.plan.rationale
+        ));
+
+        let api_calls = if picker.usage.prompt.is_some() || picker.usage.completion.is_some() {
+            1
+        } else {
+            0
+        };
+        let total_usage = json!({
+            "prompt_tokens": picker.usage.prompt.unwrap_or(0),
+            "completion_tokens": picker.usage.completion.unwrap_or(0),
+            "api_calls": api_calls,
+        });
+        let usage_steps = json!([
+            {
+                "step": TEST_PLAN_STEP,
+                "prompt_tokens": picker.usage.prompt,
+                "completion_tokens": picker.usage.completion,
+                "wall_ms": picker.wall.as_millis() as u64,
+                "error": picker.error,
+            }
+        ]);
+        let findings = json!([]);
+        publisher.set_findings(json!({ "findings": findings.clone() }));
+
+        return Ok(json!({
+            "sha": sha,
+            "plan": true,
+            "findings": findings,
+            "usage": total_usage,
+            "usage_steps": usage_steps,
+            "build_status": "skipped",
+            "boot_status": "planned",
+            "test_command": picker.plan.command,
+            "test_description": picker.plan.description,
+            "test_rationale": picker.plan.rationale,
+            "test_plan": picker.plan.to_json(),
         }));
     }
 
@@ -355,6 +407,87 @@ struct PickerStage {
     error: Option<String>,
 }
 
+struct PlanStage {
+    plan: TestPlan,
+    usage: TokenUsage,
+    wall: Duration,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct TestPlan {
+    command: String,
+    description: String,
+    script: Option<String>,
+    requirements: Vec<String>,
+    steps: Vec<String>,
+    expected_results: Vec<String>,
+    rationale: String,
+}
+
+impl TestPlan {
+    fn from_picker(command: Option<String>, rationale: String) -> Self {
+        let command = command
+            .and_then(|c| normalize_picker_command(&c))
+            .unwrap_or_else(|| FALLBACK_COMMAND.to_string());
+        let description = if rationale.trim().is_empty() {
+            format!("Run `{command}` and inspect the output for regressions related to this patch.")
+        } else {
+            rationale.trim().to_string()
+        };
+        Self {
+            command,
+            description,
+            script: None,
+            requirements: Vec::new(),
+            steps: Vec::new(),
+            expected_results: Vec::new(),
+            rationale,
+        }
+    }
+
+    fn fallback(reason: impl AsRef<str>) -> Self {
+        let reason = reason.as_ref().trim();
+        let description = if reason.is_empty() {
+            "Plan generation failed. As a fallback, boot the patched kernel and inspect the full dmesg for warnings, splats, or subsystem-specific regressions.".to_string()
+        } else {
+            format!(
+                "Plan generation failed ({reason}). As a fallback, boot the patched kernel and inspect the full dmesg for warnings, splats, or subsystem-specific regressions."
+            )
+        };
+        Self {
+            command: FALLBACK_COMMAND.to_string(),
+            description,
+            script: None,
+            requirements: vec!["A bootable kernel built from the patched tree".to_string()],
+            steps: vec![
+                "Build and boot the patched kernel".to_string(),
+                "Run `dmesg` after boot".to_string(),
+                "Inspect the log for warnings, crashes, lockdep reports, or subsystem-specific errors"
+                    .to_string(),
+            ],
+            expected_results: vec![
+                "The kernel boots cleanly".to_string(),
+                "dmesg contains no new warnings, oopses, BUG splats, or regressions tied to the changed code"
+                    .to_string(),
+            ],
+            rationale: "The model did not produce a usable detailed plan, so the safest generic smoke test is to boot the kernel and inspect the full log.".to_string(),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "command": &self.command,
+            "description": &self.description,
+            "script": &self.script,
+            "requirements": &self.requirements,
+            "steps": &self.steps,
+            "expected_results": &self.expected_results,
+            "rationale": &self.rationale,
+        })
+    }
+}
+
 /// Single-shot model call that proposes a quick test command for this commit. Falls back to
 /// `command: None` (→ `dmesg` at the call site) on API or parse failure; never aborts the run.
 async fn pick_test_command(
@@ -413,6 +546,65 @@ async fn pick_test_command(
     }
 }
 
+/// Single-shot model call for `boro test --plan`. This intentionally uses a different prompt from
+/// the executable picker: plan mode is allowed to describe complex, long-running, or hardware-backed
+/// tests because boro will not run the result.
+async fn pick_test_plan(
+    sha: &str,
+    effective_repo: &Path,
+    client: &reqwest::Client,
+    model: &ResolvedModel,
+    vd: &VerboseDest,
+    worker_ctx: Option<&WorkerLineCtx>,
+) -> PlanStage {
+    let user_msg = build_picker_user_message(sha, effective_repo, vd);
+    let (raw, usage, wall, err) = call_model(
+        client,
+        model,
+        api::system_test_plan_picker(),
+        &user_msg,
+        TEST_PLAN_STEP,
+        vd,
+        worker_ctx,
+    )
+    .await;
+    let Some(text) = raw else {
+        return PlanStage {
+            plan: TestPlan::fallback(format!(
+                "plan call failed: {}",
+                err.as_deref().unwrap_or("unknown error")
+            )),
+            usage,
+            wall,
+            error: err,
+        };
+    };
+
+    match parse_test_plan_json(&text) {
+        Ok(plan) => PlanStage {
+            plan,
+            usage,
+            wall,
+            error: err,
+        },
+        Err(parse_err) => {
+            vd.line(format!(
+                "test plan: parse failed ({parse_err}); trying command/rationale fallback"
+            ));
+            let plan = match parse_picker_json(&text) {
+                Ok((cmd, rationale)) => TestPlan::from_picker(cmd, rationale),
+                Err(_) => TestPlan::fallback(format!("plan output unparseable: {parse_err}")),
+            };
+            PlanStage {
+                plan,
+                usage,
+                wall,
+                error: err.or_else(|| Some(format!("parse: {parse_err}"))),
+            }
+        }
+    }
+}
+
 fn build_picker_user_message(sha: &str, effective_repo: &Path, vd: &VerboseDest) -> String {
     let patch = git::show_patch(effective_repo, sha).unwrap_or_else(|e| {
         vd.line(format!(
@@ -450,6 +642,88 @@ fn parse_picker_json(raw: &str) -> Result<(Option<String>, String)> {
         .trim()
         .to_string();
     Ok((command, rationale))
+}
+
+fn parse_test_plan_json(raw: &str) -> Result<TestPlan> {
+    let trimmed = api::strip_json_fences(raw);
+    let v: Value = serde_json::from_str(trimmed.trim()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !v.is_object() {
+        anyhow::bail!("test plan must be a JSON object");
+    }
+
+    let command = json_string(&v, "command")
+        .and_then(|s| normalize_picker_command(&s))
+        .or_else(|| json_string_array(&v, "commands").into_iter().next())
+        .unwrap_or_else(|| "see steps below".to_string());
+    let rationale = json_string(&v, "rationale").unwrap_or_default();
+    let mut description = json_string(&v, "description").unwrap_or_default();
+    let script = json_string(&v, "script").or_else(|| json_string(&v, "test_script"));
+    let requirements = json_string_array(&v, "requirements");
+    let steps = json_string_array(&v, "steps");
+    let mut expected_results = json_string_array(&v, "expected_results");
+    if expected_results.is_empty() {
+        expected_results = json_string_array(&v, "expected");
+    }
+    if expected_results.is_empty() {
+        expected_results = json_string_array(&v, "expected_signal");
+    }
+
+    if description.is_empty() {
+        description = if rationale.is_empty() {
+            format!("Run `{command}` as the primary test for this patch.")
+        } else {
+            rationale.clone()
+        };
+    }
+    let rationale = if rationale.is_empty() {
+        description.clone()
+    } else {
+        rationale
+    };
+
+    Ok(TestPlan {
+        command,
+        description,
+        script,
+        requirements,
+        steps,
+        expected_results,
+        rationale,
+    })
+}
+
+fn json_string(v: &Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn json_string_array(v: &Value, key: &str) -> Vec<String> {
+    match v.get(key) {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+        Some(Value::String(s)) => s
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.trim_start_matches(|c: char| {
+                    c == '-' || c == '*' || c == '+' || c == '.' || c.is_ascii_digit()
+                })
+                .trim()
+                .to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn normalize_picker_command(raw: &str) -> Option<String> {
@@ -569,6 +843,57 @@ mod tests {
         let raw = "```json\n{\"command\":\"uname -r\",\"rationale\":\"ok\"}\n```";
         let (cmd, _) = parse_picker_json(raw).unwrap();
         assert_eq!(cmd.as_deref(), Some("uname -r"));
+    }
+
+    #[test]
+    fn plan_json_parses_detailed_shape() {
+        let raw = r##"{
+            "command": "make -C tools/testing/selftests run_tests TARGETS=\"net\"",
+            "description": "Exercise the affected networking path with the matching selftests.",
+            "script": "#!/bin/sh\nmake -C tools/testing/selftests run_tests TARGETS=\"net\" && echo OK || { echo FAIL: net selftests failed; exit 1; }",
+            "requirements": ["CONFIG_NET=y", "two network namespaces"],
+            "steps": ["build the patched kernel", "run the net selftests"],
+            "expected_results": ["all selected tests pass", "dmesg has no WARN splats"],
+            "rationale": "The patch touches net core behavior."
+        }"##;
+        let plan = parse_test_plan_json(raw).unwrap();
+        assert!(plan.command.contains("selftests"));
+        assert!(plan.script.as_deref().unwrap().contains("echo OK"));
+        assert_eq!(plan.requirements.len(), 2);
+        assert_eq!(plan.steps[1], "run the net selftests");
+        assert!(plan.expected_results[1].contains("dmesg"));
+    }
+
+    #[test]
+    fn plan_json_never_returns_null_command() {
+        let raw = r#"{
+            "command": null,
+            "description": "Use lab hardware to exercise the changed path.",
+            "steps": ["attach the device", "run the vendor stress suite"],
+            "expected_signal": "no device reset or kernel warning"
+        }"#;
+        let plan = parse_test_plan_json(raw).unwrap();
+        assert_eq!(plan.command, "see steps below");
+        assert_eq!(
+            plan.expected_results,
+            vec!["no device reset or kernel warning"]
+        );
+    }
+
+    #[test]
+    fn plan_json_accepts_multiline_string_lists() {
+        let raw = r#"{
+            "command": "see steps below",
+            "description": "Manual plan.",
+            "requirements": "- target board\n- serial console",
+            "steps": "1. boot patched kernel\n2. trigger suspend/resume"
+        }"#;
+        let plan = parse_test_plan_json(raw).unwrap();
+        assert_eq!(plan.requirements, vec!["target board", "serial console"]);
+        assert_eq!(
+            plan.steps,
+            vec!["boot patched kernel", "trigger suspend/resume"]
+        );
     }
 
     #[test]

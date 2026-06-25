@@ -83,6 +83,9 @@ Subcommands:
   kselftest, a userspace probe of the touched code path, or `dmesg` as
   fallback). The model triages the captured output and produces a summary plus
   any findings.
+  Add `--plan` to generate a detailed, non-executed test plan. Plan mode can
+  describe multi-step, long-running, or hardware-dependent tests because boro
+  does not build or boot the kernel in that mode.
 
 The `build` and `test` modes feed real compiler output and real kernel runtime
 output back to the model, not just the diff text. That's what justifies running
@@ -350,6 +353,12 @@ boro review HEAD~3..HEAD --json | scripts/boro-json-view | less -R
 
 For `boro test`, the `--timeout SECONDS` flag bounds the in-VM command
 (default 300s). Bump it when running long kselftests.
+
+Use `boro test --plan COMMIT_RANGE` to ask for a detailed test plan without
+invoking `vng -b` or booting the kernel. Unlike the normal `test` picker, plan
+mode is not limited to one quick command inside a minimal virtme-ng VM: it may
+name required hardware, kernel config, setup steps, commands, and expected
+success or failure signals.
 
 Prompt caching is **on by default**: boro sends Anthropic-style
 `cache_control` markers on the system and initial user blocks so the
