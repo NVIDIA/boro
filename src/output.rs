@@ -208,12 +208,12 @@ fn print_stats_block(out: &Value, commits: &[&Value]) {
         if c.get("dry_run").and_then(|v| v.as_bool()) == Some(true) {
             any_commit_stats = true;
             let co = use_color();
-            let sha = short_sha(c);
+            let commit = commit_title(c);
             pln!(
                 TO_ERR,
                 "  {} {}",
                 paint!("Commit", co, |s| s.bold().dimmed()),
-                paint!(&sha, co, |s| s.yellow())
+                paint!(&commit, co, |s| s.yellow())
             );
             // Review commits stamp `reference_chars`/`patch_chars` on dry-run; build /
             // test don't (they have nothing of that shape). Show the appropriate line.
@@ -244,12 +244,12 @@ fn print_stats_block(out: &Value, commits: &[&Value]) {
         if c.get("error").and_then(|v| v.as_str()).is_some() {
             any_commit_stats = true;
             let co = use_color();
-            let sha = short_sha(c);
+            let commit = commit_title(c);
             pln!(
                 TO_ERR,
                 "  {} {}",
                 paint!("Commit", co, |s| s.bold().dimmed()),
-                paint!(&sha, co, |s| s.yellow())
+                paint!(&commit, co, |s| s.yellow())
             );
             pln!(
                 TO_ERR,
@@ -266,12 +266,12 @@ fn print_stats_block(out: &Value, commits: &[&Value]) {
         }
         any_commit_stats = true;
         let co = use_color();
-        let sha = short_sha(c);
+        let commit = commit_title(c);
         pln!(
             TO_ERR,
             "  {} {}",
             paint!("Commit", co, |s| s.bold().dimmed()),
-            paint!(&sha, co, |s| s.yellow())
+            paint!(&commit, co, |s| s.yellow())
         );
         if let Some(u) = c.get("usage") {
             print_usage_card(u, "    ", co, TO_ERR);
@@ -448,10 +448,14 @@ fn print_findings_block(commits: &[&Value], use_validated: bool) {
             continue;
         }
         if let Some(err) = commit.get("error").and_then(|v| v.as_str()) {
+            let sha = short_sha(commit);
             println!(
-                "  {}  {}",
-                paint!(&short_sha(commit), co, |s| s.bold().yellow()),
-                paint!("(review failed)", co, |s| s.bold().red())
+                "  {}  {}{}",
+                paint!(&sha, co, |s| s.bold().yellow()),
+                paint!("(review failed)", co, |s| s.bold().red()),
+                commit_subject(commit)
+                    .map(|s| format!("  {s}"))
+                    .unwrap_or_default()
             );
             for line in err.lines() {
                 println!("    {}", paint!(line, co, |s| s.red()));
@@ -468,11 +472,20 @@ fn print_findings_block(commits: &[&Value], use_validated: bool) {
         } else {
             format!("({n} finding{})", if n == 1 { "" } else { "s" })
         };
-        println!(
-            "  {}  {}",
-            paint!(&sha, co, |s| s.bold().yellow()),
-            paint!(&status, co, |s| s.dimmed())
-        );
+        if let Some(subject) = commit_subject(commit) {
+            println!(
+                "  {}  {}  {}",
+                paint!(&sha, co, |s| s.bold().yellow()),
+                paint!(&status, co, |s| s.dimmed()),
+                paint!(&subject, co, |s| s.bright_white())
+            );
+        } else {
+            println!(
+                "  {}  {}",
+                paint!(&sha, co, |s| s.bold().yellow()),
+                paint!(&status, co, |s| s.dimmed())
+            );
+        }
 
         print_test_summary(commit, co);
 
@@ -875,12 +888,8 @@ fn print_lkml_block(commits: &[&Value]) {
             continue;
         }
         let sha = short_sha(commit);
-        let subject = commit
-            .get("subject")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty());
-        let header = match subject {
+        let subject = commit_subject(commit);
+        let header = match subject.as_deref() {
             Some(s) => format!("Commit {sha} - {s}"),
             None => format!("Commit {sha}"),
         };
@@ -926,6 +935,22 @@ fn short_sha(c: &Value) -> String {
         full[..12].to_string()
     } else {
         full.to_string()
+    }
+}
+
+fn commit_subject(c: &Value) -> Option<String> {
+    c.get("subject")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn commit_title(c: &Value) -> String {
+    let sha = short_sha(c);
+    match commit_subject(c) {
+        Some(subject) => format!("{sha}  {subject}"),
+        None => sha,
     }
 }
 

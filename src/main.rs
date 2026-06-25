@@ -1597,6 +1597,11 @@ async fn run_apply_command(
         );
     }
 
+    let apply_subject = git::commit_subject(&repo, &args.commit_id)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     // Build a single-row progress UI so each chat call in the 3-stage apply workflow updates one
     // live line and a shared `prompt:N tokens:M` footer. The dry-run path skips the UI entirely.
     let apply_ui = if global.dry_run {
@@ -1630,6 +1635,9 @@ async fn run_apply_command(
     }
 
     let mut outcome = outcome_result?;
+    if outcome.commit_subject.is_none() {
+        outcome.commit_subject = apply_subject;
+    }
     if matches!(outcome.status, apply::ApplyStatus::DryRun) {
         outcome.wall_ms = run_start.elapsed().as_millis() as u64;
     }

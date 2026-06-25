@@ -364,6 +364,7 @@ fn record_usage_step(
 #[derive(Clone, Debug)]
 pub struct ApplyOutcome {
     pub commit_id: String,
+    pub commit_subject: Option<String>,
     pub status: ApplyStatus,
     pub accepted: Vec<AcceptedSuggestion>,
     pub rejected: Vec<RejectedSuggestion>,
@@ -409,6 +410,7 @@ impl ApplyOutcome {
             "schema_version": 1,
             "subcommand": "apply",
             "commit": self.commit_id,
+            "subject": self.commit_subject,
             "status": self.status.as_str(),
             "model": model.model_id,
             "validation_model": validation.model_id,
@@ -467,7 +469,7 @@ impl ApplyOutcome {
         match self.status {
             ApplyStatus::DryRun => {
                 println!("boro apply: dry run");
-                println!("commit: {}", self.commit_id);
+                self.print_commit_line();
                 println!(
                     "would run: git -c merge.conflictStyle=diff3 cherry-pick -x -s {}",
                     self.commit_id
@@ -478,7 +480,7 @@ impl ApplyOutcome {
             }
             ApplyStatus::CleanApplied => {
                 println!("boro apply: cherry-pick applied cleanly");
-                println!("commit: {}", self.commit_id);
+                self.print_commit_line();
                 print_applied_dependencies(&self.applied_dependencies);
                 if let Some(review) = &self.post_apply_review {
                     print_post_apply_review(review);
@@ -489,7 +491,7 @@ impl ApplyOutcome {
             }
             ApplyStatus::AlreadyApplied => {
                 println!("boro apply: commit already applied; skipped cherry-pick");
-                println!("commit: {}", self.commit_id);
+                self.print_commit_line();
                 print_applied_dependencies(&self.applied_dependencies);
                 if let Some(m) = &self.already_applied {
                     println!("matched: {} {}", m.commit, m.subject);
@@ -498,7 +500,7 @@ impl ApplyOutcome {
             }
             ApplyStatus::AutoApplied => {
                 println!("boro apply: conflicts resolved automatically");
-                println!("commit: {}", self.commit_id);
+                self.print_commit_line();
                 print_applied_dependencies(&self.applied_dependencies);
                 print_apply_section_title("Agent actions");
                 let color = use_color_stdout();
@@ -539,7 +541,7 @@ impl ApplyOutcome {
                 println!(
                     "boro apply: validation failed; the Git tree was left in its conflicted state"
                 );
-                println!("commit: {}", self.commit_id);
+                self.print_commit_line();
                 println!();
                 if !self.rejected.is_empty() {
                     println!("Rejected suggestions");
@@ -553,6 +555,18 @@ impl ApplyOutcome {
                     }
                 }
             }
+        }
+    }
+
+    fn print_commit_line(&self) {
+        match self
+            .commit_subject
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(subject) => println!("commit: {}  {}", self.commit_id, subject),
+            None => println!("commit: {}", self.commit_id),
         }
     }
 }
@@ -580,6 +594,7 @@ struct GitCommandOutput {
 pub fn dry_run(commit_id: &str) -> ApplyOutcome {
     ApplyOutcome {
         commit_id: commit_id.to_string(),
+        commit_subject: None,
         status: ApplyStatus::DryRun,
         accepted: Vec::new(),
         rejected: Vec::new(),
@@ -600,6 +615,10 @@ pub fn dry_run(commit_id: &str) -> ApplyOutcome {
 pub async fn run(req: ApplyRequest<'_>) -> Result<ApplyOutcome> {
     let started = Instant::now();
     ensure_no_unmerged_files(req.repo)?;
+    let commit_subject = git::commit_subject(req.repo, req.commit_id)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     req.verbose.line(format!(
         "apply: running git cherry-pick -x -s {} with diff3 conflict style",
@@ -628,6 +647,7 @@ pub async fn run(req: ApplyRequest<'_>) -> Result<ApplyOutcome> {
         .await;
         return Ok(ApplyOutcome {
             commit_id: req.commit_id.to_string(),
+            commit_subject,
             status: ApplyStatus::CleanApplied,
             accepted: Vec::new(),
             rejected: Vec::new(),
@@ -666,6 +686,7 @@ pub async fn run(req: ApplyRequest<'_>) -> Result<ApplyOutcome> {
         }
         return Ok(ApplyOutcome {
             commit_id: req.commit_id.to_string(),
+            commit_subject,
             status: ApplyStatus::AlreadyApplied,
             accepted: Vec::new(),
             rejected: Vec::new(),
@@ -703,6 +724,7 @@ pub async fn run(req: ApplyRequest<'_>) -> Result<ApplyOutcome> {
             .await;
             return Ok(ApplyOutcome {
                 commit_id: req.commit_id.to_string(),
+                commit_subject,
                 status: ApplyStatus::CleanApplied,
                 accepted: Vec::new(),
                 rejected: Vec::new(),
@@ -734,6 +756,7 @@ pub async fn run(req: ApplyRequest<'_>) -> Result<ApplyOutcome> {
             }
             return Ok(ApplyOutcome {
                 commit_id: req.commit_id.to_string(),
+                commit_subject,
                 status: ApplyStatus::AlreadyApplied,
                 accepted: Vec::new(),
                 rejected: Vec::new(),
@@ -1039,6 +1062,7 @@ pub async fn run(req: ApplyRequest<'_>) -> Result<ApplyOutcome> {
     };
     Ok(ApplyOutcome {
         commit_id: req.commit_id.to_string(),
+        commit_subject,
         status,
         accepted,
         rejected,
