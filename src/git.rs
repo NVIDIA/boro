@@ -53,6 +53,22 @@ pub fn rev_list(repo: &Path, range: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+pub fn rev_parse_commit(repo: &Path, rev: &str) -> Result<String> {
+    let out = Command::new("git")
+        .current_dir(repo)
+        .args(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])
+        .output()
+        .with_context(|| format!("git rev-parse --verify {rev}^{{commit}}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git rev-parse failed for {}: {}",
+            rev,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// Diff only (no commit log), for specialist stages (slim dynamic context).
 pub fn show_patch_diff_only(repo: &Path, sha: &str) -> Result<String> {
     let out = Command::new("git")

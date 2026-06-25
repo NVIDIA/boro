@@ -10,6 +10,7 @@
 //! emitted.
 
 use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -18,6 +19,7 @@ use serde_json::{json, Value};
 use crate::api::{self, StageUsage, TokenUsage};
 use crate::config::ResolvedModel;
 use crate::git;
+use crate::kconfig;
 use crate::progress::WorkerLineCtx;
 use crate::snapshot::SnapshotPublisher;
 use crate::test_build::{build_kconfig_stage, call_model, parse_findings_or_fallback};
@@ -33,6 +35,101 @@ const TEST_REVIEW_STEP: &str = "test review";
 
 /// What we run inside the VM when the picker can't think of anything useful.
 const FALLBACK_COMMAND: &str = "dmesg";
+const MAX_CONFIG_CONTEXT_LINES: usize = 200;
+const MAX_CONFIG_CONTEXT_CHARS: usize = 60_000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TestTarget {
+    Commit,
+    Config(ConfigTestTarget),
+}
+
+impl TestTarget {
+    pub fn from_config_arg(raw: &str) -> Result<Self> {
+        Ok(Self::Config(parse_config_test_target(raw)?))
+    }
+
+    pub fn is_config(&self) -> bool {
+        matches!(self, Self::Config(_))
+    }
+
+    pub fn display_name(&self, commit_arg: &str) -> String {
+        match self {
+            Self::Commit => git::normalize_commit_range_arg(commit_arg),
+            Self::Config(cfg) => cfg.config_line.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigTestTarget {
+    symbol: String,
+    config_line: String,
+}
+
+impl ConfigTestTarget {
+    fn kconfig_name(&self) -> &str {
+        self.symbol.trim_start_matches("CONFIG_")
+    }
+}
+
+fn parse_config_test_target(raw: &str) -> Result<ConfigTestTarget> {
+    let s = raw.trim();
+    if s.is_empty() {
+        anyhow::bail!("empty CONFIG_ option");
+    }
+
+    if let Some(rest) = s.strip_prefix("# CONFIG_") {
+        let Some(name) = rest.strip_suffix(" is not set") else {
+            anyhow::bail!(
+                "invalid disabled CONFIG_ form {s:?}; expected `# CONFIG_FOO is not set`"
+            );
+        };
+        validate_config_name(name)?;
+        let symbol = format!("CONFIG_{name}");
+        return Ok(ConfigTestTarget {
+            symbol,
+            config_line: s.to_string(),
+        });
+    }
+
+    let Some(rest) = s.strip_prefix("CONFIG_") else {
+        anyhow::bail!("expected CONFIG_ option, got {s:?}");
+    };
+    let (name, value) = match rest.split_once('=') {
+        Some((name, value)) => (name, Some(value.trim())),
+        None => (rest, None),
+    };
+    validate_config_name(name)?;
+
+    let value = match value {
+        Some(v) => validate_config_value(name, v)?,
+        None => "y",
+    };
+
+    let symbol = format!("CONFIG_{name}");
+    Ok(ConfigTestTarget {
+        config_line: format!("{symbol}={value}"),
+        symbol,
+    })
+}
+
+fn validate_config_name(name: &str) -> Result<()> {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        anyhow::bail!("invalid CONFIG_ option name {name:?}");
+    }
+    Ok(())
+}
+
+fn validate_config_value<'a>(name: &str, value: &'a str) -> Result<&'a str> {
+    if value.is_empty() {
+        anyhow::bail!("invalid value for CONFIG_{name}: value must not be empty");
+    }
+    if value.contains('\n') || value.contains('\r') {
+        anyhow::bail!("invalid value for CONFIG_{name}: value must be a single line");
+    }
+    Ok(value)
+}
 
 /// Per-commit driver for `boro test`. `run_timeout` caps the in-VM run; sourced from the
 /// `--timeout` CLI flag (default 5 minutes). When the kernel hangs (init never returns, panic
@@ -44,6 +141,7 @@ pub async fn commit_test_boot(
     effective_repo: &Path,
     client: &reqwest::Client,
     model: &ResolvedModel,
+    target: &TestTarget,
     vd: &VerboseDest,
     dry_run: bool,
     plan_only: bool,
@@ -53,15 +151,19 @@ pub async fn commit_test_boot(
 ) -> Result<Value> {
     if dry_run {
         vd.line("test dry run: skipping `vng -b` / `vng -r` and model call");
-        return Ok(json!({
-            "sha": sha,
-            "dry_run": true,
-            "findings": [],
-        }));
+        return Ok(with_test_target_fields(
+            json!({
+                "sha": sha,
+                "dry_run": true,
+                "findings": [],
+            }),
+            target,
+        ));
     }
 
     if plan_only {
-        let picker = pick_test_plan(sha, effective_repo, client, model, vd, worker_ctx).await;
+        let picker =
+            pick_test_plan(sha, effective_repo, target, client, model, vd, worker_ctx).await;
         publisher.add_stage(StageUsage {
             step: TEST_PLAN_STEP,
             usage: picker.usage,
@@ -95,31 +197,52 @@ pub async fn commit_test_boot(
         let findings = json!([]);
         publisher.set_findings(json!({ "findings": findings.clone() }));
 
-        return Ok(json!({
-            "sha": sha,
-            "plan": true,
-            "findings": findings,
-            "usage": total_usage,
-            "usage_steps": usage_steps,
-            "build_status": "skipped",
-            "boot_status": "planned",
-            "test_command": picker.plan.command,
-            "test_description": picker.plan.description,
-            "test_rationale": picker.plan.rationale,
-            "test_plan": picker.plan.to_json(),
-        }));
+        return Ok(with_test_target_fields(
+            json!({
+                "sha": sha,
+                "plan": true,
+                "findings": findings,
+                "usage": total_usage,
+                "usage_steps": usage_steps,
+                "build_status": "skipped",
+                "boot_status": "planned",
+                "test_command": picker.plan.command,
+                "test_description": picker.plan.description,
+                "test_rationale": picker.plan.rationale,
+                "test_plan": picker.plan.to_json(),
+            }),
+            target,
+        ));
     }
 
-    let kconfig_stage = build_kconfig_stage(
-        sha,
-        effective_repo,
-        client,
-        model,
-        vd,
-        worker_ctx,
-        publisher,
-    )
-    .await;
+    let kconfig_stage = match target {
+        TestTarget::Commit => {
+            build_kconfig_stage(
+                sha,
+                effective_repo,
+                client,
+                model,
+                vd,
+                worker_ctx,
+                publisher,
+            )
+            .await
+        }
+        TestTarget::Config(cfg) => {
+            if let Some(w) = worker_ctx {
+                w.set_line_message(KCONFIG_STEP);
+            }
+            let stage =
+                kconfig::fragment_from_lines(vec![cfg.config_line.clone()], KCONFIG_STEP, vd);
+            publisher.add_stage(StageUsage {
+                step: KCONFIG_STEP,
+                usage: stage.usage,
+                wall: stage.wall,
+                error: stage.error.clone(),
+            });
+            stage
+        }
+    };
 
     // The kconfig stage above sets the row to its own phase labels — refresh AFTER it returns so
     // the row reflects the actual `vng -b` work, not whatever the kconfig model call left behind.
@@ -169,38 +292,42 @@ pub async fn commit_test_boot(
         });
         let findings = json!([finding]);
         publisher.set_findings(json!({ "findings": findings.clone() }));
-        return Ok(json!({
-            "sha": sha,
-            "findings": findings,
-            "usage": json!({
-                "prompt_tokens": kconfig_stage.usage.prompt.unwrap_or(0),
-                "completion_tokens": kconfig_stage.usage.completion.unwrap_or(0),
-                "api_calls": if kconfig_stage.usage.prompt.is_some() || kconfig_stage.usage.completion.is_some() { 1 } else { 0 },
+        return Ok(with_test_target_fields(
+            json!({
+                "sha": sha,
+                "findings": findings,
+                "usage": json!({
+                    "prompt_tokens": kconfig_stage.usage.prompt.unwrap_or(0),
+                    "completion_tokens": kconfig_stage.usage.completion.unwrap_or(0),
+                    "api_calls": if kconfig_stage.usage.prompt.is_some() || kconfig_stage.usage.completion.is_some() { 1 } else { 0 },
+                }),
+                "usage_steps": json!([
+                    {
+                        "step": KCONFIG_STEP,
+                        "prompt_tokens": kconfig_stage.usage.prompt,
+                        "completion_tokens": kconfig_stage.usage.completion,
+                        "wall_ms": kconfig_stage.wall.as_millis() as u64,
+                        "error": kconfig_stage.error,
+                    },
+                    {
+                        "step": VNG_BUILD_STEP,
+                        "prompt_tokens": null,
+                        "completion_tokens": null,
+                        "wall_ms": build_wall.as_millis() as u64,
+                        "error": format!("build failed: exit={build_exit}"),
+                    }
+                ]),
+                "build_status": "failed",
+                "boot_status": "skipped",
+                "kconfig_options": kconfig_stage.lines,
             }),
-            "usage_steps": json!([
-                {
-                    "step": KCONFIG_STEP,
-                    "prompt_tokens": kconfig_stage.usage.prompt,
-                    "completion_tokens": kconfig_stage.usage.completion,
-                    "wall_ms": kconfig_stage.wall.as_millis() as u64,
-                    "error": kconfig_stage.error,
-                },
-                {
-                    "step": VNG_BUILD_STEP,
-                    "prompt_tokens": null,
-                    "completion_tokens": null,
-                    "wall_ms": build_wall.as_millis() as u64,
-                    "error": format!("build failed: exit={build_exit}"),
-                }
-            ]),
-            "build_status": "failed",
-            "boot_status": "skipped",
-            "kconfig_options": kconfig_stage.lines,
-        }));
+            target,
+        ));
     }
 
     // Build succeeded — pick a quick test command.
-    let picker = pick_test_command(sha, effective_repo, client, model, vd, worker_ctx).await;
+    let picker =
+        pick_test_command(sha, effective_repo, target, client, model, vd, worker_ctx).await;
     publisher.add_stage(StageUsage {
         step: TEST_PICKER_STEP,
         usage: picker.usage,
@@ -260,6 +387,7 @@ pub async fn commit_test_boot(
         &chosen_command,
         &picker.rationale,
         run_timeout,
+        target,
     );
     let (raw, usage, llm_wall, llm_err) = call_model(
         client,
@@ -386,17 +514,30 @@ pub async fn commit_test_boot(
         "failed"
     };
 
-    Ok(json!({
-        "sha": sha,
-        "findings": findings,
-        "usage": total_usage,
-        "usage_steps": usage_steps,
-        "build_status": "ok",
-        "boot_status": boot_status,
-        "test_command": chosen_command,
-        "test_summary": model_summary,
-        "kconfig_options": kconfig_stage.lines,
-    }))
+    Ok(with_test_target_fields(
+        json!({
+            "sha": sha,
+            "findings": findings,
+            "usage": total_usage,
+            "usage_steps": usage_steps,
+            "build_status": "ok",
+            "boot_status": boot_status,
+            "test_command": chosen_command,
+            "test_summary": model_summary,
+            "kconfig_options": kconfig_stage.lines,
+        }),
+        target,
+    ))
+}
+
+fn with_test_target_fields(mut obj: Value, target: &TestTarget) -> Value {
+    if let TestTarget::Config(cfg) = target {
+        obj["test_target"] = json!("config");
+        obj["config_option"] = json!(cfg.symbol);
+        obj["config_fragment"] = json!(cfg.config_line);
+        obj["subject"] = json!(cfg.config_line);
+    }
+    obj
 }
 
 struct PickerStage {
@@ -493,12 +634,13 @@ impl TestPlan {
 async fn pick_test_command(
     sha: &str,
     effective_repo: &Path,
+    target: &TestTarget,
     client: &reqwest::Client,
     model: &ResolvedModel,
     vd: &VerboseDest,
     worker_ctx: Option<&WorkerLineCtx>,
 ) -> PickerStage {
-    let user_msg = build_picker_user_message(sha, effective_repo, vd);
+    let user_msg = build_picker_user_message(sha, effective_repo, target, vd);
     let (raw, usage, wall, err) = call_model(
         client,
         model,
@@ -552,12 +694,13 @@ async fn pick_test_command(
 async fn pick_test_plan(
     sha: &str,
     effective_repo: &Path,
+    target: &TestTarget,
     client: &reqwest::Client,
     model: &ResolvedModel,
     vd: &VerboseDest,
     worker_ctx: Option<&WorkerLineCtx>,
 ) -> PlanStage {
-    let user_msg = build_picker_user_message(sha, effective_repo, vd);
+    let user_msg = build_picker_user_message(sha, effective_repo, target, vd);
     let (raw, usage, wall, err) = call_model(
         client,
         model,
@@ -605,7 +748,19 @@ async fn pick_test_plan(
     }
 }
 
-fn build_picker_user_message(sha: &str, effective_repo: &Path, vd: &VerboseDest) -> String {
+fn build_picker_user_message(
+    sha: &str,
+    effective_repo: &Path,
+    target: &TestTarget,
+    vd: &VerboseDest,
+) -> String {
+    match target {
+        TestTarget::Commit => build_commit_picker_user_message(sha, effective_repo, vd),
+        TestTarget::Config(cfg) => build_config_picker_user_message(cfg, effective_repo, vd),
+    }
+}
+
+fn build_commit_picker_user_message(sha: &str, effective_repo: &Path, vd: &VerboseDest) -> String {
     let patch = git::show_patch(effective_repo, sha).unwrap_or_else(|e| {
         vd.line(format!(
             "test picker: git show failed ({e}); proceeding with empty patch"
@@ -626,6 +781,149 @@ fn build_picker_user_message(sha: &str, effective_repo: &Path, vd: &VerboseDest)
     format!(
         "COMMIT_SHA={sha}\nCHANGED_FILES:\n{path_list}\n\n--- PATCH (git show {sha}) ---\n{patch}"
     )
+}
+
+fn build_config_picker_user_message(
+    cfg: &ConfigTestTarget,
+    effective_repo: &Path,
+    vd: &VerboseDest,
+) -> String {
+    let definitions = kconfig_definition_context(effective_repo, cfg.kconfig_name(), vd);
+    let references = config_reference_context(effective_repo, &cfg.symbol, vd);
+    format!(
+        "TEST_TARGET=CONFIG\nCONFIG_OPTION={symbol}\nCONFIG_FRAGMENT_LINE={line}\nKCONFIG_SYMBOL={kconfig}\n\n\
+The kernel will be built from HEAD with CONFIG_FRAGMENT_LINE merged into virtme-ng's default config. Pick a quick test command that best exercises this config option, or return null for plain dmesg when no focused quick test exists.\n\n\
+--- KCONFIG DEFINITIONS ---\n{definitions}\n\n\
+--- REFERENCES TO {symbol} ---\n{references}",
+        symbol = cfg.symbol,
+        line = cfg.config_line,
+        kconfig = cfg.kconfig_name(),
+        definitions = definitions,
+        references = references,
+    )
+}
+
+fn kconfig_definition_context(repo: &Path, kconfig_name: &str, vd: &VerboseDest) -> String {
+    let pattern =
+        format!("^[[:space:]]*(config|menuconfig)[[:space:]]+{kconfig_name}([[:space:]]|$)");
+    let lines = git_grep_lines(
+        repo,
+        &["grep", "-n", "-E", &pattern],
+        "kconfig definition",
+        vd,
+    );
+    let mut blocks = Vec::new();
+    let mut seen_paths = std::collections::HashSet::new();
+    for line in lines {
+        let Some((path, line_no, _text)) = parse_git_grep_line(&line) else {
+            continue;
+        };
+        if !path.contains("Kconfig") || !seen_paths.insert((path.to_string(), line_no)) {
+            continue;
+        }
+        if let Some(block) = read_context_block(repo, path, line_no, 80) {
+            blocks.push(format!("{path}:{line_no}\n{block}"));
+        }
+        if blocks.len() >= 6 {
+            break;
+        }
+    }
+    if blocks.is_empty() {
+        "(none found)".to_string()
+    } else {
+        join_capped_lines(blocks.join("\n\n").lines().map(ToOwned::to_owned))
+    }
+}
+
+fn config_reference_context(repo: &Path, symbol: &str, vd: &VerboseDest) -> String {
+    let lines = git_grep_lines(repo, &["grep", "-n", "-I", symbol], "config references", vd);
+    join_capped_lines(lines.into_iter())
+}
+
+fn git_grep_lines(repo: &Path, args: &[&str], label: &str, vd: &VerboseDest) -> Vec<String> {
+    let out = Command::new("git").current_dir(repo).args(args).output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if !stderr.trim().is_empty() {
+                vd.line(format!(
+                    "test picker: git grep {label} failed: {}",
+                    stderr.trim()
+                ));
+            }
+            Vec::new()
+        }
+        Err(e) => {
+            vd.line(format!("test picker: git grep {label} failed: {e:#}"));
+            Vec::new()
+        }
+    }
+}
+
+fn parse_git_grep_line(line: &str) -> Option<(&str, usize, &str)> {
+    let mut parts = line.splitn(3, ':');
+    let path = parts.next()?;
+    let line_no = parts.next()?.parse().ok()?;
+    let text = parts.next().unwrap_or("");
+    Some((path, line_no, text))
+}
+
+fn read_context_block(
+    repo: &Path,
+    path: &str,
+    start_line: usize,
+    max_lines: usize,
+) -> Option<String> {
+    let text = std::fs::read_to_string(repo.join(path)).ok()?;
+    let start = start_line.saturating_sub(1);
+    let mut out = Vec::new();
+    for (idx, line) in text.lines().enumerate().skip(start) {
+        if idx > start && is_kconfig_entry_start(line) {
+            break;
+        }
+        out.push(line.to_string());
+        if out.len() >= max_lines {
+            out.push("[... truncated ...]".to_string());
+            break;
+        }
+    }
+    Some(out.join("\n"))
+}
+
+fn is_kconfig_entry_start(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("config ") || trimmed.starts_with("menuconfig ")
+}
+
+fn join_capped_lines(lines: impl IntoIterator<Item = String>) -> String {
+    let mut out = String::new();
+    let mut count = 0usize;
+    let mut truncated = false;
+    for line in lines {
+        let extra = line.len() + usize::from(!out.is_empty());
+        if count >= MAX_CONFIG_CONTEXT_LINES || out.len() + extra > MAX_CONFIG_CONTEXT_CHARS {
+            truncated = true;
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&line);
+        count += 1;
+    }
+    if out.is_empty() {
+        return "(none found)".to_string();
+    }
+    if truncated {
+        out.push_str("\n[... truncated ...]");
+    }
+    out
 }
 
 fn parse_picker_json(raw: &str) -> Result<(Option<String>, String)> {
@@ -761,7 +1059,15 @@ fn format_run_user_message(
     command: &str,
     rationale: &str,
     run_timeout: Duration,
+    target: &TestTarget,
 ) -> String {
+    let target_header = match target {
+        TestTarget::Commit => String::new(),
+        TestTarget::Config(cfg) => format!(
+            "TEST_TARGET=config\nCONFIG_OPTION={}\nCONFIG_FRAGMENT_LINE={}\n",
+            cfg.symbol, cfg.config_line
+        ),
+    };
     let timeout_header = if out.timed_out {
         format!(
             "VNG_TIMED_OUT=true\nVNG_TIMEOUT_SECONDS={}\nNOTE=The system did not complete the chosen command within the budget; vng was killed and the captured output below is whatever the guest produced before the kill (it may be empty or end mid-line). Treat this as a Critical hang and report any panic / lockup / deadlock evidence visible in the partial output.\n",
@@ -771,9 +1077,10 @@ fn format_run_user_message(
         String::new()
     };
     format!(
-        "RAN_COMMAND={cmd}\nPICKER_RATIONALE={rationale}\n{timeout_header}VNG_EXIT_STATUS={exit}\nORIGINAL_LOG_CHARS={orig}\nKEPT_LOG_CHARS={kept}\n--- CAPTURED OUTPUT (trailing slice of vng combined stdout/stderr) ---\n{log}",
+        "{target_header}RAN_COMMAND={cmd}\nPICKER_RATIONALE={rationale}\n{timeout_header}VNG_EXIT_STATUS={exit}\nORIGINAL_LOG_CHARS={orig}\nKEPT_LOG_CHARS={kept}\n--- CAPTURED OUTPUT (trailing slice of vng combined stdout/stderr) ---\n{log}",
         cmd = command,
         rationale = rationale,
+        target_header = target_header,
         exit = exit_status_str,
         orig = out.original_chars,
         kept = out.log_tail.chars().count(),
@@ -791,6 +1098,79 @@ mod tests {
         let (cmd, rat) = parse_picker_json(raw).unwrap();
         assert_eq!(cmd.as_deref(), Some("dmesg | head"));
         assert_eq!(rat, "smoke check");
+    }
+
+    #[test]
+    fn config_target_defaults_to_enabled() {
+        let target = TestTarget::from_config_arg("CONFIG_SCHED_CLASS_EXT").unwrap();
+        assert_eq!(
+            target,
+            TestTarget::Config(ConfigTestTarget {
+                symbol: "CONFIG_SCHED_CLASS_EXT".to_string(),
+                config_line: "CONFIG_SCHED_CLASS_EXT=y".to_string(),
+            })
+        );
+        assert_eq!(target.display_name("HEAD"), "CONFIG_SCHED_CLASS_EXT=y");
+    }
+
+    #[test]
+    fn config_target_accepts_explicit_tristate_values() {
+        let target = TestTarget::from_config_arg("CONFIG_BPF=m").unwrap();
+        assert_eq!(
+            target,
+            TestTarget::Config(ConfigTestTarget {
+                symbol: "CONFIG_BPF".to_string(),
+                config_line: "CONFIG_BPF=m".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn config_target_accepts_numeric_values() {
+        let target = TestTarget::from_config_arg("CONFIG_NR_CPUS=512").unwrap();
+        assert_eq!(
+            target,
+            TestTarget::Config(ConfigTestTarget {
+                symbol: "CONFIG_NR_CPUS".to_string(),
+                config_line: "CONFIG_NR_CPUS=512".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn config_target_accepts_quoted_string_values() {
+        let target =
+            TestTarget::from_config_arg("CONFIG_CMDLINE=\"console=ttyS0 root=/dev/vda\"").unwrap();
+        assert_eq!(
+            target,
+            TestTarget::Config(ConfigTestTarget {
+                symbol: "CONFIG_CMDLINE".to_string(),
+                config_line: "CONFIG_CMDLINE=\"console=ttyS0 root=/dev/vda\"".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn config_target_accepts_disabled_form() {
+        let target = TestTarget::from_config_arg("# CONFIG_DEBUG_INFO is not set").unwrap();
+        assert_eq!(
+            target,
+            TestTarget::Config(ConfigTestTarget {
+                symbol: "CONFIG_DEBUG_INFO".to_string(),
+                config_line: "# CONFIG_DEBUG_INFO is not set".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn config_target_rejects_empty_value() {
+        assert!(TestTarget::from_config_arg("CONFIG_FOO=").is_err());
+    }
+
+    #[test]
+    fn config_target_rejects_commit_refs() {
+        assert!(TestTarget::from_config_arg("HEAD").is_err());
+        assert!(TestTarget::from_config_arg("origin/master..HEAD").is_err());
     }
 
     #[test]

@@ -228,9 +228,13 @@ struct TestArgs {
     #[arg(long)]
     plan: bool,
 
+    /// Kconfig option to test at HEAD, e.g. CONFIG_FOO or CONFIG_NR_CPUS=512.
+    #[arg(long, value_name = "CONFIG", conflicts_with = "range")]
+    config: Option<String>,
+
     /// Git revision range, e.g. HEAD~4..HEAD. A single commit means COMMIT^..COMMIT.
-    #[arg(value_name = "COMMIT_RANGE")]
-    range: String,
+    #[arg(value_name = "COMMIT_RANGE", required_unless_present = "config")]
+    range: Option<String>,
 }
 
 /// Per-commit dispatch carrying the action-specific knobs.
@@ -252,6 +256,8 @@ enum CommitAction {
         timeout_secs: u64,
         /// Ask the picker what would run, then stop before `vng -b` / `vng -r`.
         plan_only: bool,
+        /// What the test picker should target: a commit patch or a CONFIG_ option.
+        target: test_boot::TestTarget,
     },
 }
 
@@ -271,6 +277,16 @@ impl CommitAction {
 
     fn is_review(&self) -> bool {
         matches!(self, CommitAction::Review { .. })
+    }
+
+    fn uses_commit_metadata(&self) -> bool {
+        !matches!(
+            self,
+            CommitAction::TestBoot {
+                target,
+                ..
+            } if target.is_config()
+        )
     }
 }
 
@@ -567,32 +583,41 @@ async fn execute_commit_task(
     // and any partial-run Ctrl-C dump carries them too. Best-effort: a failure here
     // is recorded into the snapshot but does not abort the commit task — the inner
     // subcommand handler may still produce useful output.
-    let commit_meta = match git::commit_metadata(repo.as_path(), sha_ref) {
-        Ok(m) => Some(m),
-        Err(e) => {
-            v(
-                &vd,
-                format!("commit {sha_ref}: git metadata lookup failed: {e:#}"),
-            );
-            None
-        }
-    };
-    let patch_diff_full = match git::show_patch_diff_only(repo.as_path(), sha_ref) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            v(&vd, format!("commit {sha_ref}: patch fetch failed: {e:#}"));
-            None
-        }
-    };
-    let changed_paths_full = match git::changed_paths(repo.as_path(), sha_ref) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            v(
-                &vd,
-                format!("commit {sha_ref}: changed_paths failed: {e:#}"),
-            );
-            None
-        }
+    let (commit_meta, patch_diff_full, changed_paths_full) = if action.uses_commit_metadata() {
+        let commit_meta = match git::commit_metadata(repo.as_path(), sha_ref) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                v(
+                    &vd,
+                    format!("commit {sha_ref}: git metadata lookup failed: {e:#}"),
+                );
+                None
+            }
+        };
+        let patch_diff_full = match git::show_patch_diff_only(repo.as_path(), sha_ref) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                v(&vd, format!("commit {sha_ref}: patch fetch failed: {e:#}"));
+                None
+            }
+        };
+        let changed_paths_full = match git::changed_paths(repo.as_path(), sha_ref) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                v(
+                    &vd,
+                    format!("commit {sha_ref}: changed_paths failed: {e:#}"),
+                );
+                None
+            }
+        };
+        (commit_meta, patch_diff_full, changed_paths_full)
+    } else {
+        v(
+            &vd,
+            "config test target: skipping commit patch metadata injection",
+        );
+        (None, None, None)
     };
     if let (Some(m), Some(p), Some(c)) = (
         commit_meta.as_ref(),
@@ -681,12 +706,14 @@ async fn execute_commit_task(
         CommitAction::TestBoot {
             timeout_secs,
             plan_only,
+            target,
         } => {
             test_boot::commit_test_boot(
                 sha_ref,
                 effective_repo.as_path(),
                 &client,
                 &model,
+                target,
                 &vd,
                 dry_run,
                 *plan_only,
@@ -1696,16 +1723,35 @@ async fn main() -> Result<()> {
         ),
         Command::Apply(_) => unreachable!("apply handled before range pipeline"),
         Command::TestBuild(args) => (CommitAction::TestBuild, args.range.clone(), 1usize),
-        Command::TestBoot(args) => (
-            CommitAction::TestBoot {
-                timeout_secs: args.timeout,
-                plan_only: args.plan,
-            },
-            args.range.clone(),
-            1usize,
-        ),
+        Command::TestBoot(args) => {
+            let (target, selector) = if let Some(config) = &args.config {
+                (
+                    test_boot::TestTarget::from_config_arg(config)?,
+                    config.clone(),
+                )
+            } else {
+                (
+                    test_boot::TestTarget::Commit,
+                    args.range
+                        .clone()
+                        .expect("clap requires COMMIT_RANGE unless --config is present"),
+                )
+            };
+            (
+                CommitAction::TestBoot {
+                    timeout_secs: args.timeout,
+                    plan_only: args.plan,
+                    target,
+                },
+                selector,
+                1usize,
+            )
+        }
     };
-    let range = git::normalize_commit_range_arg(&range);
+    let range = match &action {
+        CommitAction::TestBoot { target, .. } => target.display_name(&range),
+        _ => git::normalize_commit_range_arg(&range),
+    };
 
     // Validation is review-only and on by default; capture the opt-out flag.
     let validation_mode = match &cli.command {
@@ -1908,8 +1954,12 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
         "HTTP: reqwest (HTTP/1.1 only, connect_timeout=300s, timeout=3600s, tcp_keepalive=60s, pool_idle=45s, POST retries up to 5 on transient errors)",
     );
 
-    let shas =
-        git::rev_list(&repo, &range).with_context(|| format!("invalid range {:?}", range))?;
+    let shas = match &action {
+        CommitAction::TestBoot { target, .. } if target.is_config() => {
+            vec![git::rev_parse_commit(&repo, "HEAD").context("resolve HEAD for CONFIG_ test")?]
+        }
+        _ => git::rev_list(&repo, &range).with_context(|| format!("invalid range {:?}", range))?,
+    };
     if shas.is_empty() {
         anyhow::bail!("no commits in range {:?}", range);
     }

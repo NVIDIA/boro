@@ -60,6 +60,29 @@ fn line_is_kconfig_entry(s: &str) -> bool {
     matches!(val, "y" | "m" | "n")
 }
 
+/// Broader validator for explicit user-supplied config fragments.
+///
+/// Model output stays on [`line_is_kconfig_entry`] so it cannot smuggle arbitrary values. The CLI
+/// path (`boro test --config CONFIG_FOO=...`) needs real Kconfig scalar/string values such as
+/// `CONFIG_NR_CPUS=512`, `CONFIG_PHYSICAL_START=0x1000000`, or
+/// `CONFIG_CMDLINE="console=ttyS0 root=/dev/vda"`.
+fn line_is_user_kconfig_entry(s: &str) -> bool {
+    let s = s.trim();
+    if line_is_kconfig_entry(s) {
+        return true;
+    }
+    let Some(rest) = s.strip_prefix("CONFIG_") else {
+        return false;
+    };
+    let Some((name, val)) = rest.split_once('=') else {
+        return false;
+    };
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    !val.is_empty() && !val.contains('\n') && !val.contains('\r')
+}
+
 fn parse_lines(raw: &str) -> Result<ParsedFragment> {
     let v = api::parse_model_json_with_key(raw, "config")?;
     let arr = v
@@ -144,6 +167,66 @@ fn write_fragment(lines: &[String]) -> Result<NamedTempFile> {
     }
     f.flush()?;
     Ok(f)
+}
+
+/// Build a [`KconfigStage`] from caller-supplied config lines instead of asking the model.
+///
+/// This is used by `boro test --config CONFIG_FOO`: the user already supplied the primary option under
+/// test, so the build should merge that fragment directly. Lines still pass through validation
+/// before being written to disk, but this path accepts Kconfig scalar/string values in addition
+/// to tristates.
+pub fn fragment_from_lines(lines: Vec<String>, step_label: &str, vd: &VerboseDest) -> KconfigStage {
+    let mut merged = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if line_is_user_kconfig_entry(trimmed) && seen.insert(trimmed.to_string()) {
+            merged.push(trimmed.to_string());
+        }
+    }
+
+    if merged.is_empty() {
+        let reason = "no usable config lines supplied".to_string();
+        vd.line(format!("{step_label}: {reason}; using default config"));
+        return KconfigStage {
+            file: None,
+            lines: Vec::new(),
+            usage: TokenUsage::default(),
+            wall: Duration::from_millis(0),
+            error: Some(reason),
+        };
+    }
+
+    match write_fragment(&merged) {
+        Ok(file) => {
+            vd.line(format!(
+                "{step_label}: wrote {} user-supplied option(s) to {} ({})",
+                merged.len(),
+                file.path().display(),
+                merged.join(", "),
+            ));
+            KconfigStage {
+                file: Some(file),
+                lines: merged,
+                usage: TokenUsage::default(),
+                wall: Duration::from_millis(0),
+                error: None,
+            }
+        }
+        Err(e) => {
+            let reason = format!("write tempfile: {e:#}");
+            vd.line(format!(
+                "{step_label}: {reason}; falling back to default config"
+            ));
+            KconfigStage {
+                file: None,
+                lines: merged,
+                usage: TokenUsage::default(),
+                wall: Duration::from_millis(0),
+                error: Some(reason),
+            }
+        }
+    }
 }
 
 /// Find kselftest config files relevant to the changed paths and return their `CONFIG_*` lines
@@ -509,6 +592,33 @@ mod tests {
         assert!(!validate_kselftest_area("a b")); // space is not allowed
         assert!(!validate_kselftest_area("a;b")); // shell metacharacter
         assert!(!validate_kselftest_area("a.b")); // `.` is not in the allowed char set
+    }
+
+    #[test]
+    fn fragment_from_lines_filters_and_dedups_user_lines() {
+        let stage = fragment_from_lines(
+            vec![
+                " CONFIG_FOO=y ".to_string(),
+                "CONFIG_FOO=y".to_string(),
+                "CONFIG_NR_CPUS=512".to_string(),
+                "CONFIG_CMDLINE=\"console=ttyS0 root=/dev/vda\"".to_string(),
+                "CONFIG_EMPTY=".to_string(),
+                "# CONFIG_BAR is not set".to_string(),
+            ],
+            "test",
+            &VerboseDest::new(false),
+        );
+        assert_eq!(
+            stage.lines,
+            vec![
+                "CONFIG_FOO=y".to_string(),
+                "CONFIG_NR_CPUS=512".to_string(),
+                "CONFIG_CMDLINE=\"console=ttyS0 root=/dev/vda\"".to_string(),
+                "# CONFIG_BAR is not set".to_string()
+            ]
+        );
+        assert!(stage.file.is_some());
+        assert!(stage.error.is_none());
     }
 
     /// Lay out a fake `tools/testing/selftests/<area>/...` tree under `root` and write `text`
