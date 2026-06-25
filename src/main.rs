@@ -199,7 +199,7 @@ struct ReviewArgs {
     #[arg(long = "validation-mode", value_enum, default_value_t = ValidationMode::Filter)]
     validation_mode: ValidationMode,
 
-    /// Git revision range, e.g. HEAD~4..HEAD
+    /// Git revision range, e.g. HEAD~4..HEAD. A single commit means COMMIT^..COMMIT.
     #[arg(value_name = "COMMIT_RANGE")]
     range: String,
 }
@@ -213,7 +213,7 @@ struct ApplyArgs {
 
 #[derive(Args, Debug, Clone)]
 struct RangeArgs {
-    /// Git revision range, e.g. HEAD~4..HEAD
+    /// Git revision range, e.g. HEAD~4..HEAD. A single commit means COMMIT^..COMMIT.
     #[arg(value_name = "COMMIT_RANGE")]
     range: String,
 }
@@ -224,7 +224,7 @@ struct TestArgs {
     #[arg(short = 't', long, value_name = "SECONDS", default_value_t = 300)]
     timeout: u64,
 
-    /// Git revision range, e.g. HEAD~4..HEAD
+    /// Git revision range, e.g. HEAD~4..HEAD. A single commit means COMMIT^..COMMIT.
     #[arg(value_name = "COMMIT_RANGE")]
     range: String,
 }
@@ -1686,6 +1686,7 @@ async fn main() -> Result<()> {
             1usize,
         ),
     };
+    let range = git::normalize_commit_range_arg(&range);
 
     // Validation is review-only and on by default; capture the opt-out flag.
     let validation_mode = match &cli.command {

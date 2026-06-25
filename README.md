@@ -38,6 +38,8 @@ cd /path/to/linux
 boro review origin/master..HEAD
 ```
 
+Passing a single commit ID is interpreted as `abc123^..abc123`.
+
 ## Demo
 
 https://github.com/user-attachments/assets/d4dc2533-9928-48b0-aca4-dbd9197398cb

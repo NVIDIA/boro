@@ -5,6 +5,22 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
 
+pub fn normalize_commit_range_arg(range: &str) -> String {
+    if is_explicit_commit_range(range) {
+        range.to_string()
+    } else {
+        format!("{range}^..{range}")
+    }
+}
+
+fn is_explicit_commit_range(range: &str) -> bool {
+    range.contains("..")
+        || range.starts_with('^')
+        || range.ends_with("^!")
+        || range.ends_with("^@")
+        || range.contains("^-")
+}
+
 pub fn repo_root(repo: &Path) -> Result<std::path::PathBuf> {
     let out = Command::new("git")
         .current_dir(repo)
@@ -174,4 +190,27 @@ pub fn changed_paths(repo: &Path, sha: &str) -> Result<Vec<String>> {
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_commit_range_arg;
+
+    #[test]
+    fn normalizes_single_revision_to_one_commit_range() {
+        assert_eq!(normalize_commit_range_arg("abc123"), "abc123^..abc123");
+        assert_eq!(normalize_commit_range_arg("HEAD~2"), "HEAD~2^..HEAD~2");
+        assert_eq!(normalize_commit_range_arg("HEAD^"), "HEAD^^..HEAD^");
+    }
+
+    #[test]
+    fn leaves_explicit_ranges_unchanged() {
+        assert_eq!(normalize_commit_range_arg("base..HEAD"), "base..HEAD");
+        assert_eq!(normalize_commit_range_arg("base...HEAD"), "base...HEAD");
+        assert_eq!(normalize_commit_range_arg("base.."), "base..");
+        assert_eq!(normalize_commit_range_arg("..HEAD"), "..HEAD");
+        assert_eq!(normalize_commit_range_arg("abc123^!"), "abc123^!");
+        assert_eq!(normalize_commit_range_arg("abc123^-"), "abc123^-");
+        assert_eq!(normalize_commit_range_arg("^abc123"), "^abc123");
+    }
 }
