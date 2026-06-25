@@ -280,13 +280,10 @@ impl CommitAction {
     }
 
     fn uses_commit_metadata(&self) -> bool {
-        !matches!(
-            self,
-            CommitAction::TestBoot {
-                target,
-                ..
-            } if target.is_config()
-        )
+        match self {
+            CommitAction::TestBoot { target, .. } => target.uses_commit_metadata(),
+            _ => true,
+        }
     }
 }
 
@@ -1954,7 +1951,7 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
         "HTTP: reqwest (HTTP/1.1 only, connect_timeout=300s, timeout=3600s, tcp_keepalive=60s, pool_idle=45s, POST retries up to 5 on transient errors)",
     );
 
-    let shas = match &action {
+    let mut shas = match &action {
         CommitAction::TestBoot { target, .. } if target.is_config() => {
             vec![git::rev_parse_commit(&repo, "HEAD").context("resolve HEAD for CONFIG_ test")?]
         }
@@ -1962,6 +1959,29 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
     };
     if shas.is_empty() {
         anyhow::bail!("no commits in range {:?}", range);
+    }
+
+    if let CommitAction::TestBoot {
+        plan_only: true,
+        target,
+        ..
+    } = &mut action
+    {
+        if matches!(target, test_boot::TestTarget::Commit) && shas.len() > 1 {
+            let commits = shas.clone();
+            v(
+                &vdest,
+                format!(
+                    "test plan: collapsing {} commits into one range-wide plan",
+                    commits.len()
+                ),
+            );
+            *target = test_boot::TestTarget::CommitRange {
+                range: range.clone(),
+                commits,
+            };
+            shas = vec!["range".to_string()];
+        }
     }
 
     v(

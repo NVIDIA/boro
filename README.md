@@ -90,7 +90,9 @@ Subcommands:
   `CONFIG_CMDLINE="console=ttyS0 root=/dev/vda"`.
   Add `--plan` to generate a detailed, non-executed test plan. Plan mode can
   describe multi-step, long-running, or hardware-dependent tests because boro
-  does not build or boot the kernel in that mode.
+  does not build or boot the kernel in that mode. When `--plan` is used with a
+  multi-commit range, boro generates one integrated test plan for the whole
+  range instead of one plan per commit.
 
 The `build` and `test` modes feed real compiler output and real kernel runtime
 output back to the model, not just the diff text. That's what justifies running
@@ -361,7 +363,8 @@ For `boro test`, the `--timeout SECONDS` flag bounds the in-VM command
 
 Use `boro test --plan COMMIT_RANGE` or `boro test --plan --config CONFIG_FOO`
 to ask for a detailed test plan without invoking `vng -b` or booting the
-kernel. Unlike the normal `test` picker, plan mode is not limited to one quick
+kernel. For a multi-commit range, boro asks for one plan that covers the whole
+series. Unlike the normal `test` picker, plan mode is not limited to one quick
 command inside a minimal virtme-ng VM: it may name required hardware, kernel
 config, setup steps, commands, and expected success or failure signals.
 

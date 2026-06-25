@@ -37,10 +37,12 @@ const TEST_REVIEW_STEP: &str = "test review";
 const FALLBACK_COMMAND: &str = "dmesg";
 const MAX_CONFIG_CONTEXT_LINES: usize = 200;
 const MAX_CONFIG_CONTEXT_CHARS: usize = 60_000;
+const MAX_RANGE_PLAN_PATCH_CHARS: usize = 300_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TestTarget {
     Commit,
+    CommitRange { range: String, commits: Vec<String> },
     Config(ConfigTestTarget),
 }
 
@@ -53,9 +55,14 @@ impl TestTarget {
         matches!(self, Self::Config(_))
     }
 
+    pub fn uses_commit_metadata(&self) -> bool {
+        matches!(self, Self::Commit)
+    }
+
     pub fn display_name(&self, commit_arg: &str) -> String {
         match self {
             Self::Commit => git::normalize_commit_range_arg(commit_arg),
+            Self::CommitRange { range, .. } => range.clone(),
             Self::Config(cfg) => cfg.config_line.clone(),
         }
     }
@@ -215,6 +222,10 @@ pub async fn commit_test_boot(
         ));
     }
 
+    if matches!(target, TestTarget::CommitRange { .. }) {
+        anyhow::bail!("commit range test targets are only supported with --plan");
+    }
+
     let kconfig_stage = match target {
         TestTarget::Commit => {
             build_kconfig_stage(
@@ -242,6 +253,7 @@ pub async fn commit_test_boot(
             });
             stage
         }
+        TestTarget::CommitRange { .. } => unreachable!("guarded above"),
     };
 
     // The kconfig stage above sets the row to its own phase labels — refresh AFTER it returns so
@@ -531,11 +543,22 @@ pub async fn commit_test_boot(
 }
 
 fn with_test_target_fields(mut obj: Value, target: &TestTarget) -> Value {
-    if let TestTarget::Config(cfg) = target {
-        obj["test_target"] = json!("config");
-        obj["config_option"] = json!(cfg.symbol);
-        obj["config_fragment"] = json!(cfg.config_line);
-        obj["subject"] = json!(cfg.config_line);
+    match target {
+        TestTarget::Commit => {}
+        TestTarget::CommitRange { range, commits } => {
+            obj["sha"] = json!("range");
+            obj["test_target"] = json!("range");
+            obj["range"] = json!(range);
+            obj["range_commit_count"] = json!(commits.len());
+            obj["range_commits"] = json!(commits);
+            obj["subject"] = json!(range);
+        }
+        TestTarget::Config(cfg) => {
+            obj["test_target"] = json!("config");
+            obj["config_option"] = json!(cfg.symbol);
+            obj["config_fragment"] = json!(cfg.config_line);
+            obj["subject"] = json!(cfg.config_line);
+        }
     }
     obj
 }
@@ -756,6 +779,9 @@ fn build_picker_user_message(
 ) -> String {
     match target {
         TestTarget::Commit => build_commit_picker_user_message(sha, effective_repo, vd),
+        TestTarget::CommitRange { range, commits } => {
+            build_range_picker_user_message(range, commits, effective_repo, vd)
+        }
         TestTarget::Config(cfg) => build_config_picker_user_message(cfg, effective_repo, vd),
     }
 }
@@ -781,6 +807,77 @@ fn build_commit_picker_user_message(sha: &str, effective_repo: &Path, vd: &Verbo
     format!(
         "COMMIT_SHA={sha}\nCHANGED_FILES:\n{path_list}\n\n--- PATCH (git show {sha}) ---\n{patch}"
     )
+}
+
+fn build_range_picker_user_message(
+    range: &str,
+    commits: &[String],
+    effective_repo: &Path,
+    vd: &VerboseDest,
+) -> String {
+    let mut commit_lines = Vec::new();
+    let mut all_paths = std::collections::BTreeSet::new();
+    let mut patch_blocks = Vec::new();
+
+    for sha in commits {
+        let short = short_sha_for_context(sha);
+        let subject = git::commit_subject(effective_repo, sha).unwrap_or_else(|e| {
+            vd.line(format!(
+                "test plan: subject lookup failed for {short} ({e:#})"
+            ));
+            "(subject unavailable)".to_string()
+        });
+        let paths = git::changed_paths(effective_repo, sha).unwrap_or_else(|e| {
+            vd.line(format!(
+                "test plan: changed_paths failed for {short} ({e:#})"
+            ));
+            Vec::new()
+        });
+        for path in &paths {
+            all_paths.insert(path.clone());
+        }
+        let path_summary = if paths.is_empty() {
+            "(no changed paths)".to_string()
+        } else {
+            paths.join(", ")
+        };
+        commit_lines.push(format!("{short} {subject}\n  files: {path_summary}"));
+
+        let patch = git::show_patch(effective_repo, sha).unwrap_or_else(|e| {
+            vd.line(format!(
+                "test plan: git show failed for {short} ({e:#}); continuing without that patch"
+            ));
+            String::new()
+        });
+        if !patch.trim().is_empty() {
+            patch_blocks.push(format!("--- COMMIT {short}: {subject} ---\n{patch}"));
+        }
+    }
+
+    let commit_list = if commit_lines.is_empty() {
+        "(none)".to_string()
+    } else {
+        commit_lines.join("\n")
+    };
+    let path_list = if all_paths.is_empty() {
+        "(none)".to_string()
+    } else {
+        all_paths.into_iter().collect::<Vec<_>>().join("\n")
+    };
+    let patches = if patch_blocks.is_empty() {
+        "(none)".to_string()
+    } else {
+        api::cap_utf8(&patch_blocks.join("\n\n"), MAX_RANGE_PLAN_PATCH_CHARS)
+    };
+
+    format!(
+        "TEST_TARGET=COMMIT_RANGE\nCOMMIT_RANGE={range}\nCOMMIT_COUNT={count}\n\nCOMMITS:\n{commit_list}\n\nCHANGED_FILES_ACROSS_RANGE:\n{path_list}\n\n--- PATCH SERIES ({range}) ---\n{patches}",
+        count = commits.len(),
+    )
+}
+
+fn short_sha_for_context(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
 }
 
 fn build_config_picker_user_message(
@@ -1063,6 +1160,10 @@ fn format_run_user_message(
 ) -> String {
     let target_header = match target {
         TestTarget::Commit => String::new(),
+        TestTarget::CommitRange { range, commits } => format!(
+            "TEST_TARGET=range\nCOMMIT_RANGE={range}\nCOMMIT_COUNT={}\n",
+            commits.len()
+        ),
         TestTarget::Config(cfg) => format!(
             "TEST_TARGET=config\nCONFIG_OPTION={}\nCONFIG_FRAGMENT_LINE={}\n",
             cfg.symbol, cfg.config_line
@@ -1171,6 +1272,27 @@ mod tests {
     fn config_target_rejects_commit_refs() {
         assert!(TestTarget::from_config_arg("HEAD").is_err());
         assert!(TestTarget::from_config_arg("origin/master..HEAD").is_err());
+    }
+
+    #[test]
+    fn range_target_fields_mark_synthetic_plan_entry() {
+        let target = TestTarget::CommitRange {
+            range: "HEAD~2..HEAD".to_string(),
+            commits: vec!["a".repeat(40), "b".repeat(40)],
+        };
+        let obj = with_test_target_fields(
+            json!({
+                "sha": "placeholder",
+                "plan": true,
+                "findings": [],
+            }),
+            &target,
+        );
+        assert_eq!(obj["sha"], "range");
+        assert_eq!(obj["test_target"], "range");
+        assert_eq!(obj["range"], "HEAD~2..HEAD");
+        assert_eq!(obj["range_commit_count"], 2);
+        assert_eq!(obj["subject"], "HEAD~2..HEAD");
     }
 
     #[test]

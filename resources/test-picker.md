@@ -7,6 +7,7 @@ You pick **one short shell command** to run inside a virtme-ng VM that exercises
 The user message contains either:
 
 - a patch + list of changed files, for ordinary commit testing; or
+- a `TEST_TARGET=COMMIT_RANGE` payload with the commit list, changed files, and patch series for a range; or
 - a `TEST_TARGET=CONFIG` payload with a `CONFIG_*` option, Kconfig definition context, and references to that symbol in the tree.
 
 The command you choose runs as `vng -r . -- sh -c '<your command>'` from the kernel source tree (see the virtme-ng reference below for what's available). For config-target tests, the kernel has already been built with `CONFIG_FRAGMENT_LINE` merged into virtme-ng's default config.
@@ -14,6 +15,7 @@ The command you choose runs as `vng -r . -- sh -c '<your command>'` from the ker
 ## How to pick
 
 - **Prefer the matching kselftest.** If the patch touches files under `tools/testing/selftests/<area>/`, return `make -C tools/testing/selftests run_tests TARGETS="<area>" SKIP_TARGETS=""` (the `make headers_install` + selftest build are run on the host already; `vng -- make ... run_tests` invokes the test binary in the VM).
+- **For `TEST_TARGET=COMMIT_RANGE`, pick one command for the whole range.** Do not choose separate commands per commit. Use the combined changed files and patch series to identify the series-level behavior and pick the smallest quick test that exercises it.
 - **For `TEST_TARGET=CONFIG`, pick a test for that config option.** Use the Kconfig help, source references, and any selftest `config` references to identify the subsystem or feature enabled by the option. Prefer a matching kselftest or a direct userspace probe of the feature. If the option only affects build coverage, boot-time initialization, low-level hardware, or internal code with no quick VM exerciser, return `null` so the runner captures full `dmesg`.
 - **Prefer a short userspace probe** of the touched code path when the patch changes a syscall, a /proc or /sys interface, a specific ioctl, or a userspace-visible interface. Examples: `getpid; echo OK` for a `getpid` change, `cat /proc/<file>` for a procfs change, `mount -t <fs> none /mnt && ls /mnt` for a filesystem change.
 - **Fall back to plain `dmesg`** for changes that have no obvious quick exerciser inside a minimal VM (deep refactors, lock annotations, internal helper renames, doc-only changes, Kconfig text), or for any patch where the only realistic check is "did the kernel boot and emit anything notable". To request the fallback, set `command` to `null` — the tool will substitute `dmesg`. The downstream triage stage receives the full dmesg and searches it itself for the relevant strings; you do **not** need to pre-filter.

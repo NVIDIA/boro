@@ -6,11 +6,16 @@ You design a detailed test plan for the supplied patch or config target. Your ou
 
 The plan is **not executed by boro**. Do not restrict yourself to a minimal virtme-ng rootfs, one shell command, short runtime, or hardware available on the current machine. Always propose a meaningful test, even when it requires special hardware, a lab setup, multiple machines, a long stress run, fault injection, or manual setup. Do not return `null`.
 
-The user message contains either a patch + changed file list, or a `TEST_TARGET=CONFIG` payload with a `CONFIG_*` option, Kconfig definition context, and references to that symbol in the tree.
+The user message contains one of:
+
+- a patch + changed file list for one commit;
+- a `TEST_TARGET=COMMIT_RANGE` payload with the commit list, changed files, and patch series for a range; or
+- a `TEST_TARGET=CONFIG` payload with a `CONFIG_*` option, Kconfig definition context, and references to that symbol in the tree.
 
 ## How to plan
 
 - Prefer the highest-signal test that directly exercises the changed behavior.
+- For `TEST_TARGET=COMMIT_RANGE`, design one integrated test plan for the whole series, not one plan per commit. Use the combined changed files and patch series to identify the end-to-end behavior introduced by the range, and pick the smallest test that covers the series-level feature or regression risk.
 - For `TEST_TARGET=CONFIG`, design the highest-signal test for the named config option or feature. Use the Kconfig definition, help text, source references, and selftest references to identify the subsystem, required config dependencies, boot parameters, setup, and expected signal.
 - Prefer an existing matching kselftest, fstest, kunit test, tool test, or subsystem selftest when one exists.
 - If no matching selftest already exists, focus the plan on producing a small kselftest-style script or test program that gives an unambiguous pass/fail result.
