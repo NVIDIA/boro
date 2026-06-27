@@ -110,6 +110,7 @@ Review the full patch with the reference context and current pipeline findings i
 Your job is to find concrete, reportable issues the main pipeline may have missed or under-specified, not to validate the existing findings. \
 Avoid re-emitting the same finding unless you can provide materially better evidence, location, or severity framing. \
 Only emit a finding if you can point to specific code in the diff or pre-fetched source context as concrete evidence. \
+Do not report the bug that the patch is fixing: a defect visible only in removed/old code is not a finding when the new code fixes it. \
 Speculation, generic 'this could be racy', or 'should add bounds check' without a concrete path: do not emit. \
 If you find no additional concrete issues, return an empty findings array - that is an acceptable outcome.";
 

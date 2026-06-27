@@ -51,14 +51,22 @@ For each finding, decide one of:
   cases: the finding misreads the patch, ignores a lock or invariant
   visible in the diff, flags a "race" that the code already serializes,
   demands handling for a path the function does not reach, or
-  speculates about a caller without evidence. When in doubt about
-  whether a finding is genuinely wrong, KEEP it - filtering is for
-  clear false positives, not for taste.
+  speculates about a caller without evidence. Also DROP a finding when
+  its substance is only that the old/removed code was buggy and the
+  reviewed diff fixes that bug. If the new/right-side code removes the
+  complained-about behavior, the finding is about fixed pre-patch code
+  and must not survive validation. When in doubt about whether a finding
+  is genuinely wrong, KEEP it - filtering is for clear false positives,
+  not for taste.
 
 Hard rules:
 
 - Do NOT introduce new findings. Every finding you emit must
   correspond to one in the input (by `location` and substance).
+- A finding must describe a problem that remains in or is introduced by
+  the reviewed commit. Do NOT keep a finding merely because the parent
+  version was wrong; the final report is a review of the patch, not a
+  confirmation that the fixed bug used to exist.
 - Do NOT merge findings across commits.
 - Do NOT merge findings within a commit unless they share a
   `location`; if you do merge, keep one `location` verbatim.

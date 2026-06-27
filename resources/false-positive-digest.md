@@ -92,6 +92,13 @@ If the diff is patch N of a series and a concern is fixed in a later patch
 of the same series, treat it as not-a-finding (or note the later-fix patch).
 Intermediate patches may intentionally use a stub later replaced.
 
+### 13. Fixed old-code bugs
+Do NOT emit a concern merely because the removed/old code had a real bug.
+If the reviewed diff moves, deletes, initializes, checks, or otherwise fixes
+that old behavior, the old bug is evidence that the patch is a fix, not a
+review finding. Only report it if the new/right-side code still has the bug,
+the fix is incomplete, or the patch introduces a different bug.
+
 ## How to write a concern that survives consolidation
 
 - Name the function, file, and line/region from the diff.

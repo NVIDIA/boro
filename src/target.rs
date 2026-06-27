@@ -77,6 +77,10 @@ mod tests {
         assert!(lkml_system_prompt(ReviewTarget::Qemu).contains("qemu-devel"));
         assert!(second_opinion_system_prompt(ReviewTarget::Kernel).contains("kernel reviewer"));
         assert!(second_opinion_system_prompt(ReviewTarget::Qemu).contains("QEMU reviewer"));
+        assert!(second_opinion_system_prompt(ReviewTarget::Kernel)
+            .contains("bug that the patch is fixing"));
+        assert!(second_opinion_system_prompt(ReviewTarget::Qemu)
+            .contains("bug that the patch is fixing"));
         assert!(quick_summary_system_prompt(ReviewTarget::Kernel).contains("Linux kernel"));
         assert!(quick_summary_system_prompt(ReviewTarget::Qemu).contains("QEMU"));
     }

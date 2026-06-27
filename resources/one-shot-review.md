@@ -14,4 +14,10 @@ You are performing **one consolidated pass** that must cover the same dimensions
 
 Be skeptical of the commit message. Prefer reporting a suspected issue with clear reasoning over silence.
 
+Do not report the bug that the patch is fixing. A defect visible only in
+removed/old code is not a finding when the new/right-side diff removes,
+reorders, initializes, checks, or otherwise fixes it. Report only if the new
+code still has the defect, the fix is incomplete, or the patch introduces a
+different bug.
+
 When the diff is documentation-only or trivial comment fixes, return an empty `findings` array.

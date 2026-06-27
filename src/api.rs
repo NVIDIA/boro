@@ -1028,6 +1028,7 @@ pub const RETRY_REMINDER_FINDINGS: &str =
 Return ONLY a JSON object with a 'findings' array (each item: \
 {\"problem\": string, \"severity\": \"Low|Medium|High|Critical\", \"severity_explanation\": string, \
 \"location\"?: {\"file\": string, \"line\": int, \"line_end\"?: int, \"side\": \"LEFT|RIGHT\"}}). \
+Do not report defects that exist only in the removed/old code when the reviewed patch fixes them. \
 The 'location' field is optional - omit it when the finding cannot be anchored to a specific hunk. \
 If you have nothing to flag, return `{\"findings\": []}`. \
 No markdown fences, no prose outside the JSON.";
@@ -2855,6 +2856,7 @@ Return ONLY JSON (no markdown fences): \
 {{\"concerns\":[{{\"type\":\"string\",\"description\":\"string\",\"reasoning\":\"string\",\"location\":{{\"file\":\"path/in/diff\",\"line\":N,\"line_end\":N,\"side\":\"LEFT|RIGHT\"}}}}]}}. \
 Top-level key must be \"concerns\" (not \"findings\"). \
 Use a short \"type\" label prefixed with \"s{stage}:\" (e.g. \"s{stage}:uaf\"). \
+Do not emit a concern merely because the old/removed code was buggy when the new/right-side diff fixes that behavior; report only remaining, incomplete, or newly introduced bugs. \
 The \"location\" field is OPTIONAL - include it only when you can anchor the concern to a specific hunk in the diff: \
 \"file\" must match the diff path exactly (post-image for RIGHT, pre-image for LEFT), \"line\" is 1-based, \"line_end\" optional for a range, \"side\" is \"RIGHT\" for added/modified lines or \"LEFT\" for removed/context lines in the old file. \
 Do NOT invent locations - omit when unsure. \
@@ -2913,6 +2915,7 @@ Add `concerns` for substantive problems; use `type` values such as `msg:typo`, `
 Return ONLY JSON (no markdown fences): \
 {{\"concerns\":[{{\"type\":\"string\",\"description\":\"string\",\"reasoning\":\"string\",\"location\":{{\"file\":\"path/in/diff\",\"line\":N,\"line_end\":N,\"side\":\"LEFT|RIGHT\"}}}}]}}. \
 Top-level key must be \"concerns\" (not \"findings\"). \
+Do not emit a concern merely because the old/removed code was buggy when the new/right-side diff fixes that behavior; report only remaining, incomplete, or newly introduced bugs. \
 The \"location\" field is OPTIONAL - include it only when you can anchor the concern to a specific hunk in the diff (\"file\" matches the diff path exactly; \"line\" is 1-based in that file; \"side\" is \"RIGHT\" for the new file or \"LEFT\" for the old file). \
 Do NOT invent locations - omit when unsure. \
 Use an empty concerns array if nothing to report."
@@ -2951,7 +2954,7 @@ pub fn consolidation_user_payload(
 You are the lead reviewer. Deduplicate and assign severity. \
 Include a finding only if the evidence is concrete and anchored to a location in the diff; that evidence may come from the diff itself or from the pre-fetched source context around touched code. \
 Discard anything based on generic assumptions or on code paths unrelated to the touched lines. \
-Respect introduced vs pre-existing issues: high/critical pre-existing issues in an enclosing function or directly referenced definition may be kept when this patch touches or revalidates that path; low/medium pre-existing issues should be dropped unless introduced or made worse by this patch. \
+Respect introduced vs pre-existing issues: drop pre-existing issues when the reviewed diff fixes them. A finding must identify a bug that remains in the new/right-side code, an incomplete fix, or a different bug introduced by the patch. High/critical pre-existing issues in an enclosing function or directly referenced definition may be kept only when they still exist after the patch and this patch touches or revalidates that path; low/medium pre-existing issues should be dropped unless introduced or made worse by this patch. \
 Keep valid concerns about commit-message English/grammar/typos or misleading changelog text (often `msg:*` types) when they are user-visible issues.\n\
 If the series context lists patches **after** the one under review, you may discard a concern only when a later subject (or clear evidence) shows the issue was actually addressed; do not dismiss based on vague promises in commit messages alone.\n\
 When referring to other patches in this series, use their **subjects** (one-line titles), not git hashes.\n\
@@ -3092,7 +3095,9 @@ Review the whole patch independently. Emit only additional concrete findings \
 that should be merged with the current findings above and sent to validation. \
 Do not duplicate an existing finding unless your version materially improves the \
 evidence, location, or severity framing. If you find no additional concrete \
-issues, return an empty findings array.\n\n\
+issues, return an empty findings array. Do not report a defect that exists only \
+in the removed/old code when the reviewed patch fixes it; report only remaining, \
+incomplete, or newly introduced bugs.\n\n\
 {USER_JSON_INSTRUCTION}"
     )
 }
@@ -3447,6 +3452,45 @@ mod tests {
         assert!(SYSTEM_REVIEW_VALIDATION_FINDINGS.contains("\"source\": \"upstream-fixes\""));
         assert!(SYSTEM_REVIEW_VALIDATION_FINDINGS.contains("KEEP these findings"));
         assert!(SYSTEM_REVIEW_VALIDATION_FINDINGS.contains("valid without a `location`"));
+    }
+
+    #[test]
+    fn validation_prompt_drops_fixed_old_code_findings() {
+        assert!(SYSTEM_REVIEW_VALIDATION_FINDINGS.contains("old/removed code was buggy"));
+        assert!(SYSTEM_REVIEW_VALIDATION_FINDINGS.contains("reviewed diff fixes that bug"));
+        assert!(SYSTEM_REVIEW_VALIDATION_FINDINGS.contains("must not survive validation"));
+    }
+
+    #[test]
+    fn consolidation_prompt_drops_fixed_pre_existing_issues() {
+        let prior = json!({"concerns": []});
+        let s = consolidation_user_payload("", &prior, "Not applicable", "");
+        assert!(s.contains("drop pre-existing issues when the reviewed diff fixes them"));
+        assert!(s.contains("bug that remains in the new/right-side code"));
+        assert!(s.contains("incomplete fix"));
+    }
+
+    #[test]
+    fn concern_source_prompts_reject_fixed_old_code_only_reports() {
+        let broad = broad_concerns_user_payload("", "subject", "diff");
+        assert!(broad.contains("old/removed code was buggy"));
+        assert!(broad.contains("new/right-side diff fixes that behavior"));
+
+        let specialist = specialist_stage_user_payload("", "", "diff", "", 5, "", "");
+        assert!(specialist.contains("old/removed code was buggy"));
+        assert!(specialist.contains("new/right-side diff fixes that behavior"));
+    }
+
+    #[test]
+    fn second_opinion_prompt_rejects_fixed_old_code_only_reports() {
+        let s = second_opinion_user_payload("", &json!({"findings": []}), "subject", "diff");
+        assert!(s.contains("defect that exists only"));
+        assert!(s.contains("reviewed patch fixes it"));
+        assert_eq!(
+            s.matches("If you find no additional concrete issues")
+                .count(),
+            1
+        );
     }
 
     #[test]
