@@ -256,8 +256,8 @@ described above.
 Before discovery starts, boro runs one deterministic, stateless query
 against `lore.kernel.org` to surface existing mailing-list activity around
 the patch - v-bumps, `Fixes:` patches sent later, and substantive
-maintainer review. It also fetches a blob-less snapshot of the upstream
-selected branch directly into Git's transient `FETCH_HEAD` and checks its
+maintainer review. It also fetches the selected upstream branch directly
+into Git's transient `FETCH_HEAD` and checks its
 commit messages for `Fixes: <12-char-reviewed-sha>` trailers. That catches
 follow-up fixes which have reached the configured upstream branch but are
 not discoverable in the configured lore window. The lore result feeds every

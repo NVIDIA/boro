@@ -97,13 +97,7 @@ pub async fn prepare_master_fetch(
 ) -> Result<MasterRepo> {
     let fetch = Command::new("git")
         .current_dir(repo)
-        .args([
-            "fetch",
-            "--no-tags",
-            "--filter=blob:none",
-            upstream_uri,
-            upstream_branch,
-        ])
+        .args(["fetch", "--no-tags", upstream_uri, upstream_branch])
         .output()
         .await
         .context("fetch selected upstream branch")?;
@@ -659,6 +653,19 @@ mod tests {
         git(repo, &["rev-parse", "HEAD"])
     }
 
+    fn git_optional(repo: &Path, args: &[&str]) -> (i32, String, String) {
+        let out = StdCommand::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("git {} failed to spawn: {e}", args.join(" ")));
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        )
+    }
+
     #[test]
     fn strip_plain_subject() {
         assert_eq!(
@@ -927,6 +934,26 @@ body\n";
         assert_eq!(fixes.len(), 1);
         assert_eq!(fixes[0].sha, fix);
         assert_eq!(fixes[0].subject, "net: follow-up fix");
+    }
+
+    #[tokio::test]
+    async fn prepare_master_fetch_does_not_leave_local_path_remote() {
+        let tmp = init_git_repo();
+        let repo = tmp.path();
+        empty_commit(repo, "base", None);
+
+        let _master = prepare_master_fetch(repo, ".", "master", None)
+            .await
+            .unwrap();
+        let remotes = git(repo, &["remote"]);
+        let (config_status, config, config_err) =
+            git_optional(repo, &["config", "--get-regexp", "^remote\\."]);
+
+        assert_eq!(remotes, "");
+        assert_eq!(
+            config_status, 1,
+            "unexpected remote config after fetch:\nstdout:\n{config}\nstderr:\n{config_err}"
+        );
     }
 
     #[tokio::test]
