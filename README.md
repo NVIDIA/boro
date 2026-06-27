@@ -133,9 +133,9 @@ on your `PATH`.
 [`public-inbox`](https://public-inbox.org/) package) on `$PATH` for the
 upstream-followup stage. Without `lei`, boro still runs every other stage
 and produces a complete review - it just skips the lore.kernel.org
-retrieval, so the review is purely based on local git information and
-contains no citations to existing upstream discussion. To disable the
-stage explicitly even when `lei` is installed, set `BORO_LORE_ENABLED=0`.
+retrieval. The Linux-master `Fixes:` lookup remains available. To disable
+the lore portion explicitly even when `lei` is installed, set
+`BORO_LORE_ENABLED=0`.
 
 ## Build & install
 
@@ -240,21 +240,32 @@ steps 10-12 and falls back to `BORO_MODEL` when unset.
 - `findings`: run findings validation and skip LKML rendering.
 - `off`: skip findings validation and render LKML prose from raw `findings[]`.
 
+`boro review --upstream-repo URI --upstream-branch BRANCH COMMIT_RANGE`
+selects the Git repository and branch checked for follow-up fixes. It defaults to
+`git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git`; use a
+local path or `file://` URI to inspect a local Linux repository instead.
+`--upstream-branch` defaults to `master`.
+
 With `--fast`, the per-commit discovery pipeline is replaced by a single
 review call using `BORO_MODEL`; the second-opinion pass, global validation,
 LKML rendering, and summary reporting still use `BORO_VALIDATION_MODEL` as
 described above.
 
-### Upstream follow-up stage (lore.kernel.org retrieval)
+### Upstream follow-up stage (lore.kernel.org + upstream branch)
 
 Before discovery starts, boro runs one deterministic, stateless query
-against `lore.kernel.org` to surface any existing upstream activity around
+against `lore.kernel.org` to surface existing mailing-list activity around
 the patch - v-bumps, `Fixes:` patches sent later, and substantive
-maintainer review. The result feeds every downstream discovery stage as
-part of the reference bundle, so concerns the upstream community already
-raised end up in boro's final report with citation URLs back to the
-source thread.
-
+maintainer review. It also fetches a blob-less snapshot of the upstream
+selected branch directly into Git's transient `FETCH_HEAD` and checks its
+commit messages for `Fixes: <12-char-reviewed-sha>` trailers. That catches
+follow-up fixes which have reached the configured upstream branch but are
+not discoverable in the configured lore window. The lore result feeds every
+downstream discovery stage as part of the reference bundle, so concerns the
+upstream community already raised can be used by later review stages. Git
+`Fixes:` hits from the configured upstream branch are also added as
+high-severity findings, so they survive validation and appear in the final
+report even when the model would otherwise ignore reference-only context.
 The query is:
 
 ```
@@ -271,13 +282,13 @@ Config (all optional):
 | `BORO_LORE_MAX_BYTES` | `65536`                       | Max bytes kept from the lei result    |
 | `BORO_LORE_INBOX_URL` | `https://lore.kernel.org/all` | Remote inbox                          |
 
-Requires `lei` (from the `public-inbox` package) on `$PATH`. If `lei` is
-not installed boro detects this once at startup, silently skips the
-upstream-followup stage for the whole run, and the review proceeds with
-local git information only (no lore citations in the report). Once `lei`
-is available, a failing lei call or model call mid-run is logged and the
-commit review continues with no follow-up summary attached - the stage
-cannot block downstream work.
+The lore portion requires `lei` (from the `public-inbox` package) on
+`$PATH`; the upstream branch lookup uses only `git` and still runs when
+`lei` is not installed. It runs independently of the lore lookup, including
+when `lei` is available. The upstream branch is fetched once per kernel
+review into `FETCH_HEAD`; boro does not add or modify a configured remote. A
+failed fetch, `lei` query, or model call is logged; the review continues with
+whichever follow-up source remains available.
 
 ### Comment / code consistency stage
 

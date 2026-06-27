@@ -19,6 +19,8 @@ The user message gives you a JSON object of this exact shape:
           "problem": "<short statement of the issue>",
           "severity": "Low|Medium|High|Critical",
           "severity_explanation": "<why this severity>",
+          "source": "<optional machine source marker>",
+          "upstream_fix": "<optional upstream fix metadata>",
           "location": {
             "file": "<path/in/diff>",
             "line": <int>,
@@ -60,6 +62,12 @@ Hard rules:
 - Do NOT merge findings across commits.
 - Do NOT merge findings within a commit unless they share a
   `location`; if you do merge, keep one `location` verbatim.
+- Findings with `"source": "upstream-fixes"` are deterministic results
+  from the configured upstream Git branch: a later commit has a
+  `Fixes:` trailer naming the commit under review. KEEP these findings
+  verbatim, including `source` and `upstream_fix`, unless the JSON is
+  malformed. They are valid without a `location`; do not drop them for
+  being unanchored to a diff hunk.
 - Preserve `severity` enum values (`Low`, `Medium`, `High`, `Critical`).
 - Preserve `location` exactly as given when keeping or tightening a
   finding. Do NOT round, renumber, or "correct" a line number - the

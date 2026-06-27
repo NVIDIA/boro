@@ -117,6 +117,11 @@ struct CommitReviewResult {
     phase0_selected_prompts: Option<Vec<String>>,
 }
 
+struct UpstreamFollowupResult {
+    summary: String,
+    master_fixes: Vec<lore::MasterFix>,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "boro")]
 #[command(version)]
@@ -199,6 +204,18 @@ struct ReviewArgs {
     #[arg(long = "validation-mode", value_enum, default_value_t = ValidationMode::Filter)]
     validation_mode: ValidationMode,
 
+    /// Git URI whose selected branch is checked for follow-up fixes.
+    #[arg(
+        long = "upstream-repo",
+        value_name = "URI",
+        default_value = lore::UPSTREAM_MASTER_BRANCH_URL
+    )]
+    upstream: String,
+
+    /// Branch in --upstream-repo checked for follow-up fixes.
+    #[arg(long, value_name = "BRANCH", default_value = "master")]
+    upstream_branch: String,
+
     /// Git revision range, e.g. HEAD~4..HEAD. A single commit means COMMIT^..COMMIT.
     #[arg(value_name = "COMMIT_RANGE")]
     range: String,
@@ -245,6 +262,8 @@ enum CommitAction {
         fast: bool,
         no_tools: bool,
         max_context_size: usize,
+        upstream: String,
+        upstream_branch: String,
         /// Model config for the per-commit second-opinion call. Carries the resolved
         /// `BORO_VALIDATION_*` config (which falls back to the main model when those
         /// env vars are unset).
@@ -387,6 +406,7 @@ async fn commit_review_inner(
     totals: &mut RunTotals,
     worker_ctx: Option<&WorkerLineCtx>,
     publisher: &SnapshotPublisher,
+    master_repo: Option<&lore::MasterRepo>,
 ) -> Result<Value> {
     v(vd, format!("running git show {sha} ..."));
     let patch = git::show_patch(repo, sha)?;
@@ -509,6 +529,7 @@ async fn commit_review_inner(
             publisher,
             effective_repo,
             second_opinion,
+            master_repo,
         )
         .await?
     };
@@ -549,6 +570,7 @@ async fn execute_commit_task(
     dry_run: bool,
     worker_line: Option<WorkerLineCtx>,
     publisher: SnapshotPublisher,
+    master_repo: Option<Arc<lore::MasterRepo>>,
 ) -> (Value, RunTotals) {
     let mut totals = RunTotals::default();
     let task_start = Instant::now();
@@ -664,6 +686,7 @@ async fn execute_commit_task(
             no_tools,
             max_context_size,
             second_opinion,
+            ..
         } => {
             commit_review_inner(
                 idx,
@@ -684,6 +707,7 @@ async fn execute_commit_task(
                 &mut totals,
                 worker_line.as_ref(),
                 &publisher,
+                master_repo.as_deref(),
             )
             .await
         }
@@ -1713,6 +1737,8 @@ async fn main() -> Result<()> {
                 fast: args.fast,
                 no_tools: args.no_tools,
                 max_context_size: args.max_context_size,
+                upstream: args.upstream.clone(),
+                upstream_branch: args.upstream_branch.clone(),
                 second_opinion: None,
             },
             args.range.clone(),
@@ -1984,6 +2010,41 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
         }
     }
 
+    // Fetch the selected upstream branch once into FETCH_HEAD. Workers only run
+    // read-only `git log` queries against that one-run snapshot. The last SHA
+    // in the review range is the reviewed branch/commit tip; upstream fixes
+    // already reachable there are not reportable follow-ups.
+    let review_tip = shas.last().map(String::as_str);
+    let master_repo = if action.is_review()
+        && review_target == config::ReviewTarget::Kernel
+        && !cli.global.dry_run
+    {
+        let (upstream, upstream_branch) = match &action {
+            CommitAction::Review {
+                upstream,
+                upstream_branch,
+                ..
+            } => (upstream, upstream_branch),
+            _ => unreachable!("only review uses the upstream branch lookup"),
+        };
+        v(
+            &vdest,
+            format!("upstream-followup: fetching {upstream} {upstream_branch} into FETCH_HEAD"),
+        );
+        match lore::prepare_master_fetch(&repo, upstream, upstream_branch, review_tip).await {
+            Ok(master) => Some(Arc::new(master)),
+            Err(e) => {
+                v(
+                    &vdest,
+                    format!("upstream-followup: upstream branch fetch failed (continuing): {e:#}"),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     v(
         &vdest,
         format!(
@@ -2033,6 +2094,7 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
         let model = model.clone();
         let range = range.clone();
         let action = action.clone();
+        let master_repo = master_repo.clone();
         let vd = vdest.with_prefix(verbose_worker_line_prefix(
             idx + 1,
             num_commits,
@@ -2059,6 +2121,7 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
                 dry_run,
                 worker_line,
                 publisher,
+                master_repo,
             )
             .await;
             (idx, val, run_totals)
@@ -2528,9 +2591,9 @@ async fn run_phase0_selection(
 }
 
 /// Run the upstream-followup stage. Returns the rendered Markdown summary to splice into the
-/// reference bundle for downstream discovery stages, or `None` when lore is unreachable or
-/// returns nothing actionable. Errors are logged but never propagated - a failing follow-up
-/// stage must not block a commit review.
+/// reference bundle for downstream discovery stages plus any deterministic upstream-branch
+/// `Fixes:` hits. Errors are logged but never propagated - a failing follow-up stage must not
+/// block a commit review.
 #[allow(clippy::too_many_arguments)]
 async fn run_upstream_followup_stage(
     client: &reqwest::Client,
@@ -2548,7 +2611,9 @@ async fn run_upstream_followup_stage(
     totals: &mut RunTotals,
     publisher: &SnapshotPublisher,
     usage_step: &mut Vec<StageUsage>,
-) -> Option<String> {
+    master_repo: Option<&lore::MasterRepo>,
+    lore_active: bool,
+) -> Option<UpstreamFollowupResult> {
     let subject = match git::commit_subject(repo, sha) {
         Ok(s) => s,
         Err(e) => {
@@ -2564,6 +2629,56 @@ async fn run_upstream_followup_stage(
         return None;
     }
 
+    let t_lei = Instant::now();
+    let mut master_fixes = Vec::new();
+    let master_summary = if let Some(master) = master_repo {
+        match lore::find_master_fixes(master, sha).await {
+            Ok(fixes) => {
+                v(
+                    vd,
+                    format!(
+                        "upstream-followup: upstream branch returned {} unapplied Fixes: match(es)",
+                        fixes.len()
+                    ),
+                );
+                if vd.stream_model_responses() && !fixes.is_empty() {
+                    eprintln!(
+                        "upstream-followup: found {} follow-up fix(es) in upstream branch:",
+                        fixes.len()
+                    );
+                    for fix in &fixes {
+                        eprintln!("  {} {}", short_sha10(&fix.sha), fix.subject);
+                    }
+                }
+                let rendered = lore::render_master_fixes(&fixes);
+                master_fixes = fixes;
+                rendered
+            }
+            Err(e) => {
+                v(
+                    vd,
+                    format!("upstream-followup: upstream branch query failed: {e:#}"),
+                );
+                String::new()
+            }
+        }
+    } else {
+        String::new()
+    };
+    if !lore_active {
+        let stage = StageUsage {
+            step: "followup",
+            usage: TokenUsage::default(),
+            wall: t_lei.elapsed(),
+            error: None,
+        };
+        usage_step.push(stage.clone());
+        publisher.add_stage(stage);
+        return (!master_summary.is_empty()).then_some(UpstreamFollowupResult {
+            summary: master_summary,
+            master_fixes,
+        });
+    }
     v(
         vd,
         format!(
@@ -2571,7 +2686,6 @@ async fn run_upstream_followup_stage(
             lore_cfg.inbox_url, lore_cfg.window, lore_cfg.max_bytes
         ),
     );
-    let t_lei = Instant::now();
     let mbox_result = match lore::fetch_upstream_mbox(&subject, lore_cfg).await {
         Ok(r) => r,
         Err(e) => {
@@ -2584,7 +2698,10 @@ async fn run_upstream_followup_stage(
             };
             usage_step.push(stage.clone());
             publisher.add_stage(stage);
-            return None;
+            return (!master_summary.is_empty()).then_some(UpstreamFollowupResult {
+                summary: master_summary,
+                master_fixes,
+            });
         }
     };
     v(
@@ -2607,10 +2724,14 @@ async fn run_upstream_followup_stage(
         };
         usage_step.push(stage.clone());
         publisher.add_stage(stage);
-        return Some(lore::render_followup_summary(
-            &lore::no_activity_json(),
-            &lore_cfg.inbox_url,
-        ));
+        return Some(UpstreamFollowupResult {
+            summary: format!(
+                "{}{}",
+                lore::render_followup_summary(&lore::no_activity_json(), &lore_cfg.inbox_url,),
+                master_summary
+            ),
+            master_fixes,
+        });
     }
 
     let user = api::upstream_followup_user_payload(
@@ -2657,7 +2778,14 @@ async fn run_upstream_followup_stage(
     usage_step.push(stage.clone());
     publisher.add_stage(stage);
     match parsed {
-        Some(json) => Some(lore::render_followup_summary(&json, &lore_cfg.inbox_url)),
+        Some(json) => Some(UpstreamFollowupResult {
+            summary: format!(
+                "{}{}",
+                lore::render_followup_summary(&json, &lore_cfg.inbox_url),
+                master_summary
+            ),
+            master_fixes,
+        }),
         None => {
             if let Some(e) = err {
                 v(
@@ -2665,7 +2793,10 @@ async fn run_upstream_followup_stage(
                     format!("upstream-followup failed after retries (continuing without): {e:#}"),
                 );
             }
-            None
+            (!master_summary.is_empty()).then_some(UpstreamFollowupResult {
+                summary: master_summary,
+                master_fixes,
+            })
         }
     }
 }
@@ -2779,6 +2910,44 @@ fn append_findings(base: &mut Value, extra: &Value) -> usize {
     added
 }
 
+fn append_upstream_fix_findings(base: &mut Value, fixes: &[lore::MasterFix]) -> usize {
+    if fixes.is_empty() {
+        return 0;
+    }
+    if !base.is_object() {
+        *base = json!({ "findings": [] });
+    }
+    if base.get("findings").and_then(|f| f.as_array()).is_none() {
+        base["findings"] = json!([]);
+    }
+    let Some(findings) = base.get_mut("findings").and_then(|f| f.as_array_mut()) else {
+        return 0;
+    };
+    let mut added = 0usize;
+    for fix in fixes {
+        let short = short_sha10(&fix.sha);
+        findings.push(json!({
+            "problem": format!(
+                "The reviewed commit has an upstream follow-up fix: {short} {}.",
+                fix.subject
+            ),
+            "severity": "High",
+            "severity_explanation": format!(
+                "The configured upstream branch contains commit {} with a Fixes: trailer naming this reviewed commit. This is high-confidence evidence that upstream later corrected a regression introduced here.",
+                fix.sha
+            ),
+            "source": "upstream-fixes",
+            "upstream_fix": {
+                "sha": &fix.sha,
+                "subject": &fix.subject,
+                "date": &fix.date,
+            }
+        }));
+        added += 1;
+    }
+    added
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_two_pass(
     client: &reqwest::Client,
@@ -2802,6 +2971,7 @@ async fn run_two_pass(
     publisher: &SnapshotPublisher,
     effective_repo: &Path,
     second_opinion: Option<&config::ResolvedModel>,
+    master_repo: Option<&lore::MasterRepo>,
 ) -> Result<CommitReviewResult> {
     let mut usage_step: Vec<StageUsage> = Vec::new();
     let mut stage_tot = api::CumulativeTokenUsage::default();
@@ -2876,7 +3046,7 @@ async fn run_two_pass(
         }
     };
 
-    let followup_summary = if lore_active {
+    let followup_summary = if lore_active || master_repo.is_some() {
         let spinner =
             stage_progress_line(patch_tag, sha_short, 1, display_total, "Upstream follow-up");
         run_upstream_followup_stage(
@@ -2895,6 +3065,8 @@ async fn run_two_pass(
             totals,
             publisher,
             &mut usage_step,
+            master_repo,
+            lore_active,
         )
         .await
     } else {
@@ -2914,7 +3086,7 @@ async fn run_two_pass(
         changed_paths,
         max_context_size,
         phase0_selected_prompts.as_deref(),
-        followup_summary.as_deref(),
+        followup_summary.as_ref().map(|f| f.summary.as_str()),
     )?;
     let prefetch_block = prefetch_context_block(effective_repo, patch_diff, vd).await;
     let reference_with_prefetch = if prefetch_block.is_empty() {
@@ -3120,6 +3292,19 @@ async fn run_two_pass(
         // Validation-model second-opinion review. Run even though the main pipeline produced no
         // findings so the stronger model gets a full independent look at the patch.
         let mut findings_val = json!({ "findings": [] });
+        let upstream_added = followup_summary
+            .as_ref()
+            .map(|f| append_upstream_fix_findings(&mut findings_val, &f.master_fixes))
+            .unwrap_or(0);
+        if upstream_added > 0 {
+            v(
+                vd,
+                format!(
+                    "upstream-followup added {upstream_added} upstream fix finding(s); merged into commit findings"
+                ),
+            );
+            publisher.set_findings(findings_val.clone());
+        }
         if let Some(cfg) = second_opinion {
             let so_findings = run_second_opinion(
                 client,
@@ -3281,6 +3466,20 @@ async fn run_two_pass(
             "consolidation did not return usable findings; using merged concerns as fallback findings",
         );
         consolidated_findings = api::findings_from_merged_concerns(&merged);
+        publisher.set_findings(consolidated_findings.clone());
+    }
+
+    let upstream_added = followup_summary
+        .as_ref()
+        .map(|f| append_upstream_fix_findings(&mut consolidated_findings, &f.master_fixes))
+        .unwrap_or(0);
+    if upstream_added > 0 {
+        v(
+            vd,
+            format!(
+                "upstream-followup added {upstream_added} upstream fix finding(s); merged into commit findings"
+            ),
+        );
         publisher.set_findings(consolidated_findings.clone());
     }
 
@@ -3478,6 +3677,28 @@ diff --git a/foo.c b/foo.c
         assert_eq!(usage["completion_tokens"], 7);
         assert_eq!(usage["cache_creation_tokens"], 1);
         assert_eq!(usage["cache_read_tokens"], 3);
+    }
+
+    #[test]
+    fn upstream_fixes_become_high_severity_findings() {
+        let fixes = vec![lore::MasterFix {
+            sha: "0123456789abcdef".to_string(),
+            subject: "net: fix later regression".to_string(),
+            date: "2026-06-01T00:00:00+00:00".to_string(),
+        }];
+        let mut findings = json!({ "findings": [] });
+
+        let added = append_upstream_fix_findings(&mut findings, &fixes);
+
+        assert_eq!(added, 1);
+        let f = &findings["findings"][0];
+        assert_eq!(f["severity"], "High");
+        assert_eq!(f["source"], "upstream-fixes");
+        assert_eq!(f["upstream_fix"]["sha"], "0123456789abcdef");
+        assert!(f["problem"]
+            .as_str()
+            .unwrap()
+            .contains("net: fix later regression"));
     }
 
     #[test]

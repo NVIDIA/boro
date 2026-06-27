@@ -14,8 +14,30 @@
 
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tokio::process::Command;
+
+/// Default upstream branch repository, used to find commits with a `Fixes:`
+/// trailer for a patch being reviewed. It is fetched directly into
+/// `FETCH_HEAD`, without changing configured remotes.
+pub const UPSTREAM_MASTER_BRANCH_URL: &str =
+    "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git";
+const UPSTREAM_MASTER_REF: &str = "FETCH_HEAD";
+
+#[derive(Debug)]
+pub struct MasterRepo {
+    repo: PathBuf,
+    applied_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MasterFix {
+    pub sha: String,
+    pub subject: String,
+    pub date: String,
+}
 
 /// Result of a lei fetch for a single commit. `mbox` has noisy headers stripped and is
 /// already truncated to at most `BORO_LORE_MAX_BYTES` bytes (whole-message boundaries).
@@ -63,6 +85,149 @@ impl LoreConfig {
             inbox_url,
         }
     }
+}
+
+/// Fetch the selected upstream branch directly into Git's transient
+/// `FETCH_HEAD`, without adding or changing any configured remote.
+pub async fn prepare_master_fetch(
+    repo: &Path,
+    upstream_uri: &str,
+    upstream_branch: &str,
+    applied_ref: Option<&str>,
+) -> Result<MasterRepo> {
+    let fetch = Command::new("git")
+        .current_dir(repo)
+        .args([
+            "fetch",
+            "--no-tags",
+            "--filter=blob:none",
+            upstream_uri,
+            upstream_branch,
+        ])
+        .output()
+        .await
+        .context("fetch selected upstream branch")?;
+    if !fetch.status.success() {
+        anyhow::bail!(
+            "git fetch of selected upstream branch failed: {}",
+            String::from_utf8_lossy(&fetch.stderr).trim()
+        );
+    }
+    Ok(MasterRepo {
+        repo: repo.to_path_buf(),
+        applied_ref: applied_ref.map(str::to_string),
+    })
+}
+
+/// Return upstream commits whose `Fixes:` trailer names `sha`, excluding fixes
+/// already applied at the review range tip. The kernel's documented convention
+/// uses the first 12 hex digits; longer hashes are intentionally reduced to
+/// that canonical lookup form.
+pub async fn find_master_fixes(master: &MasterRepo, sha: &str) -> Result<Vec<MasterFix>> {
+    let prefix: String = sha.chars().take(12).collect();
+    if prefix.len() < 7 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(Vec::new());
+    }
+    let needle = format!("Fixes: {prefix}");
+    let output = Command::new("git")
+        .current_dir(&master.repo)
+        .args([
+            "log",
+            UPSTREAM_MASTER_REF,
+            "--regexp-ignore-case",
+            "--fixed-strings",
+            "--grep",
+            &needle,
+            "--format=%H%x1f%s%x1f%cI",
+        ])
+        .output()
+        .await
+        .context("query Fixes trailers in selected upstream branch")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git log against selected upstream branch failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let fixes: Vec<MasterFix> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\x1f');
+            Some(MasterFix {
+                sha: fields.next()?.to_string(),
+                subject: fields.next()?.to_string(),
+                date: fields.next()?.to_string(),
+            })
+        })
+        .collect();
+    if let Some(applied_ref) = master.applied_ref.as_deref() {
+        filter_unapplied_master_fixes(master, &prefix, applied_ref, fixes).await
+    } else {
+        Ok(fixes)
+    }
+}
+
+async fn filter_unapplied_master_fixes(
+    master: &MasterRepo,
+    reviewed_prefix: &str,
+    applied_ref: &str,
+    fixes: Vec<MasterFix>,
+) -> Result<Vec<MasterFix>> {
+    if fixes.is_empty() {
+        return Ok(fixes);
+    }
+    let needle = format!("Fixes: {reviewed_prefix}");
+    let output = Command::new("git")
+        .current_dir(&master.repo)
+        .args([
+            "log",
+            applied_ref,
+            "--regexp-ignore-case",
+            "--fixed-strings",
+            "--grep",
+            &needle,
+            "--format=%H%x1f%s",
+        ])
+        .output()
+        .await
+        .with_context(|| format!("query already-applied Fixes trailers in {applied_ref}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git log against reviewed branch tip failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let mut applied_shas = HashSet::new();
+    let mut applied_subjects = HashSet::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split('\x1f');
+        if let Some(sha) = fields.next().filter(|s| !s.is_empty()) {
+            applied_shas.insert(sha.to_string());
+        }
+        if let Some(subject) = fields.next().filter(|s| !s.is_empty()) {
+            applied_subjects.insert(subject.to_string());
+        }
+    }
+
+    Ok(fixes
+        .into_iter()
+        .filter(|fix| !applied_shas.contains(&fix.sha) && !applied_subjects.contains(&fix.subject))
+        .collect())
+}
+
+pub fn render_master_fixes(fixes: &[MasterFix]) -> String {
+    if fixes.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("## Follow-up fixes in configured upstream branch\n\n");
+    for fix in fixes {
+        out.push_str(&format!(
+            "- [{}](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id={}): {} ({})\n",
+            fix.sha, fix.sha, fix.subject, fix.date
+        ));
+    }
+    out
 }
 
 /// True when `lei` is installed and runnable on `$PATH`. Probed once per process via
@@ -448,6 +613,51 @@ source thread (e.g. \"The upstream discussion (<url>) noted ...\").\n",
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::process::Command as StdCommand;
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let out = StdCommand::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("git {} failed to spawn: {e}", args.join(" ")));
+        assert!(
+            out.status.success(),
+            "git {} failed\nstdout:\n{}\nstderr:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn init_git_repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        git(tmp.path(), &["init", "-b", "master"]);
+        git(tmp.path(), &["config", "user.name", "Boro Test"]);
+        git(tmp.path(), &["config", "user.email", "boro@example.com"]);
+        tmp
+    }
+
+    fn empty_commit(repo: &Path, subject: &str, body: Option<&str>) -> String {
+        let mut cmd = StdCommand::new("git");
+        cmd.current_dir(repo)
+            .args(["commit", "--allow-empty", "-m", subject]);
+        if let Some(body) = body {
+            cmd.args(["-m", body]);
+        }
+        let out = cmd
+            .output()
+            .unwrap_or_else(|e| panic!("git commit failed to spawn: {e}"));
+        assert!(
+            out.status.success(),
+            "git commit failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        git(repo, &["rev-parse", "HEAD"])
+    }
 
     #[test]
     fn strip_plain_subject() {
@@ -680,5 +890,89 @@ body\n";
         assert!(lore_url("", "https://lore.kernel.org/all/").is_empty());
         assert!(lore_url("  ", "https://lore.kernel.org/all/").is_empty());
         assert!(lore_url("<>", "https://lore.kernel.org/all/").is_empty());
+    }
+
+    #[test]
+    fn render_master_fixes_includes_kernel_commit_links() {
+        let fixes = vec![MasterFix {
+            sha: "0123456789abcdef".to_string(),
+            subject: "net: fix a race".to_string(),
+            date: "2026-06-01T00:00:00+00:00".to_string(),
+        }];
+        let rendered = render_master_fixes(&fixes);
+        assert!(rendered.contains("Follow-up fixes in configured upstream branch"));
+        assert!(rendered.contains("net: fix a race"));
+        assert!(rendered.contains("commit/?id=0123456789abcdef"));
+    }
+
+    #[tokio::test]
+    async fn master_fixes_reported_when_not_applied_to_review_tip() {
+        let tmp = init_git_repo();
+        let repo = tmp.path();
+        empty_commit(repo, "base", None);
+        let reviewed = empty_commit(repo, "net: add bad change", None);
+        let body = format!(
+            "Fixes: {} (\"net: add bad change\")",
+            reviewed.chars().take(12).collect::<String>()
+        );
+        let fix = empty_commit(repo, "net: follow-up fix", Some(&body));
+        git(repo, &["fetch", ".", "master"]);
+
+        let master = MasterRepo {
+            repo: repo.to_path_buf(),
+            applied_ref: Some(reviewed.clone()),
+        };
+        let fixes = find_master_fixes(&master, &reviewed).await.unwrap();
+
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0].sha, fix);
+        assert_eq!(fixes[0].subject, "net: follow-up fix");
+    }
+
+    #[tokio::test]
+    async fn master_fixes_skipped_when_already_applied_to_review_tip() {
+        let tmp = init_git_repo();
+        let repo = tmp.path();
+        empty_commit(repo, "base", None);
+        let reviewed = empty_commit(repo, "net: add bad change", None);
+        let body = format!(
+            "Fixes: {} (\"net: add bad change\")",
+            reviewed.chars().take(12).collect::<String>()
+        );
+        empty_commit(repo, "net: follow-up fix", Some(&body));
+        git(repo, &["fetch", ".", "master"]);
+
+        let master = MasterRepo {
+            repo: repo.to_path_buf(),
+            applied_ref: Some("HEAD".to_string()),
+        };
+        let fixes = find_master_fixes(&master, &reviewed).await.unwrap();
+
+        assert!(fixes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn master_fixes_skipped_when_cherry_pick_subject_is_applied() {
+        let tmp = init_git_repo();
+        let repo = tmp.path();
+        empty_commit(repo, "base", None);
+        let reviewed = empty_commit(repo, "net: add bad change", None);
+        let body = format!(
+            "Fixes: {} (\"net: add bad change\")",
+            reviewed.chars().take(12).collect::<String>()
+        );
+        let review_tip = empty_commit(repo, "net: follow-up fix", Some(&body));
+        git(repo, &["branch", "reviewed", &review_tip]);
+        git(repo, &["reset", "--hard", &reviewed]);
+        empty_commit(repo, "net: follow-up fix", Some(&body));
+        git(repo, &["fetch", ".", "master"]);
+
+        let master = MasterRepo {
+            repo: repo.to_path_buf(),
+            applied_ref: Some("reviewed".to_string()),
+        };
+        let fixes = find_master_fixes(&master, &reviewed).await.unwrap();
+
+        assert!(fixes.is_empty());
     }
 }

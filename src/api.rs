@@ -3388,10 +3388,14 @@ the entire message).",
         );
     }
     out.push_str(
-        "\n\nReply inline, never top-post: place each comment immediately **after** the \
-`>`-quoted hunk it refers to, not before it. The buggy code appears first, then a blank line, \
-then your question or observation. Do not introduce a finding by stating it and then quoting \
-the code below - that is top-posting and is not acceptable on LKML.",
+        "\n\nReply inline, never top-post: for each finding with a diff location, place the \
+comment immediately **after** the `>`-quoted hunk it refers to, not before it. The buggy code \
+appears first, then a blank line, then your question or observation. Do not introduce a finding \
+by stating it and then quoting the code below - that is top-posting and is not acceptable on \
+LKML. For findings without a diff location, including commit-message issues and \
+`source: \"upstream-fixes\"` findings, do not invent a diff quote; include them as a short \
+standalone note tied to the commit under review. Upstream-fix findings must mention the \
+follow-up fix sha and subject from the finding.",
     );
     out
 }
@@ -3436,6 +3440,13 @@ mod tests {
                 "validation-findings prompt missing required token {needle:?}"
             );
         }
+    }
+
+    #[test]
+    fn validation_prompt_keeps_upstream_fix_findings() {
+        assert!(SYSTEM_REVIEW_VALIDATION_FINDINGS.contains("\"source\": \"upstream-fixes\""));
+        assert!(SYSTEM_REVIEW_VALIDATION_FINDINGS.contains("KEEP these findings"));
+        assert!(SYSTEM_REVIEW_VALIDATION_FINDINGS.contains("valid without a `location`"));
     }
 
     #[test]
@@ -3959,6 +3970,22 @@ index 111..222 100644
             !s.contains("copy lines **verbatim**"),
             "verbatim directive should only appear with attachments"
         );
+    }
+
+    #[test]
+    fn lkml_payload_preserves_upstream_fix_findings_without_hunks() {
+        let findings = json!({"findings":[{
+            "problem":"upstream fixed this",
+            "severity":"High",
+            "severity_explanation":"Fixes trailer",
+            "source":"upstream-fixes",
+            "upstream_fix":{"sha":"0123456789abcdef","subject":"net: fix later regression"}
+        }]});
+        let s = lkml_report_user_payload("tpl", &findings, "h", SAMPLE_PATCH);
+        assert!(s.contains("source: \"upstream-fixes\""));
+        assert!(s.contains("do not invent a diff quote"));
+        assert!(s.contains("follow-up fix sha and subject"));
+        assert!(!s.contains("# Verbatim diff hunks for findings"));
     }
 
     #[test]
