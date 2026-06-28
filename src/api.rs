@@ -1451,7 +1451,7 @@ pub async fn chat_completion_stage_timeout(
         tool_loop,
         worker_line,
         effective_repo,
-        Some(StageDeadline::new(model_timeout::REVIEW_STAGE_TIMEOUT)),
+        Some(StageDeadline::new(model_timeout::review_stage_timeout())),
     )
     .await
 }
@@ -2139,7 +2139,7 @@ where
         parse_fn,
         schema_reminder,
         max_attempts,
-        Some(StageDeadline::new(model_timeout::REVIEW_STAGE_TIMEOUT)),
+        Some(StageDeadline::new(model_timeout::review_stage_timeout())),
     )
     .await
 }

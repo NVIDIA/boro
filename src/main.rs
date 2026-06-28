@@ -184,6 +184,10 @@ enum Command {
 
 #[derive(Args, Debug, Clone)]
 struct ReviewArgs {
+    /// Per-stage model timeout in seconds (default 600).
+    #[arg(long, value_name = "SECONDS", default_value_t = 600)]
+    timeout: u64,
+
     /// Skip concerns + consolidation; one review call + LKML pass per commit.
     #[arg(short = 'x', long)]
     fast: bool,
@@ -1725,6 +1729,10 @@ async fn main() -> Result<()> {
 
     if let Command::Apply(args) = &cli.command {
         return run_apply_command(&cli.global, args, run_start).await;
+    }
+
+    if let Command::Review(args) = &cli.command {
+        model_timeout::set_review_stage_timeout(Duration::from_secs(args.timeout));
     }
 
     // Resolve subcommand into CommitAction + range + per-subcommand defaults.

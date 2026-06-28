@@ -372,6 +372,9 @@ boro review HEAD~3..HEAD --json | scripts/boro-json-view | less -R
 For `boro test`, the `--timeout SECONDS` flag bounds the in-VM command
 (default 300s). Bump it when running long kselftests.
 
+For `boro review`, `--timeout SECONDS` sets the timeout for each model stage
+(default 600s), including retries, tool loops, and subprocess backends.
+
 Use `boro test --plan COMMIT_RANGE` or `boro test --plan --config CONFIG_FOO`
 to ask for a detailed test plan without invoking `vng -b` or booting the
 kernel. For a multi-commit range, boro asks for one plan that covers the whole

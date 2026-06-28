@@ -13,6 +13,20 @@ use anyhow::{anyhow, Context, Result};
 
 pub const REVIEW_STAGE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+// This is configured once from `boro review --timeout` before the concurrent
+// review workers start. Keep the default as a Duration for callers that need a
+// compile-time value, while storing the runtime override as seconds.
+static REVIEW_STAGE_TIMEOUT_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(REVIEW_STAGE_TIMEOUT.as_secs());
+
+pub fn set_review_stage_timeout(timeout: Duration) {
+    REVIEW_STAGE_TIMEOUT_SECS.store(timeout.as_secs(), Ordering::SeqCst);
+}
+
+pub fn review_stage_timeout() -> Duration {
+    Duration::from_secs(REVIEW_STAGE_TIMEOUT_SECS.load(Ordering::SeqCst))
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelStageTimeout {
     label: String,
