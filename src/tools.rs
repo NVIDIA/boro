@@ -726,8 +726,8 @@ fn git_show(repo: &Path, args: &Value) -> Result<Value> {
 ///
 /// Path validation goes through [`validate_repo_relative`] (rejects absolute paths and `..`).
 /// `old_string` must occur exactly once unless `replace_all=true`. `new_string` must differ from
-/// `old_string`. The replacement is written in place; the host (apply.rs) detects modified files
-/// via `git status` after the model's final turn and amends the commit.
+/// `old_string`. The replacement is written in place; the host (apply.rs) detects tracked
+/// working-tree changes via `git status` and amends them.
 fn edit_file(repo: &Path, args: &Value) -> Result<Value> {
     let path_str = args
         .get("path")
