@@ -1636,7 +1636,10 @@ fn marker_size(line: &str, marker: char) -> Option<usize> {
 }
 
 fn is_exact_marker(line: &str, marker: char, size: usize) -> bool {
-    line.trim_end_matches('\n') == marker.to_string().repeat(size)
+    // Strip both `\r` and `\n` so a CRLF-terminated separator (`=======\r\n`) is
+    // recognized. The sibling `<`/`|`/`>` markers already tolerate a trailing `\r`
+    // via `marker_size`/`starts_with`; this keeps the `=` separator consistent.
+    line.trim_end_matches(['\r', '\n']) == marker.to_string().repeat(size)
 }
 
 fn diff_strings(repo: &Path, old: &str, new: &str) -> Result<String> {
@@ -3707,6 +3710,20 @@ mod tests {
         assert_eq!(conflicts[0].local, "local\n");
         assert_eq!(conflicts[0].base, "base\n");
         assert_eq!(conflicts[0].remote, "remote\n");
+    }
+
+    #[test]
+    fn parse_crlf_diff3_conflict() {
+        // git writes conflict markers with the file's own line ending, so a CRLF
+        // file yields a `=======\r\n` separator. Parsing must still find the hunk.
+        let content = "before\r\n<<<<<<< HEAD\r\nlocal\r\n||||||| parent\r\nbase\r\n=======\r\nremote\r\n>>>>>>> commit\r\nafter\r\n";
+        let conflicts = parse_conflicts_in_file("kernel/foo.c", content).unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].start_line, 2);
+        assert_eq!(conflicts[0].end_line, 8);
+        assert_eq!(conflicts[0].local, "local\r\n");
+        assert_eq!(conflicts[0].base, "base\r\n");
+        assert_eq!(conflicts[0].remote, "remote\r\n");
     }
 
     #[test]
