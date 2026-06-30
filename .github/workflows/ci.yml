@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Format and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust with rustfmt
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup component add rustfmt --toolchain stable
+
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+
+      - name: Run tests
+        run: cargo +stable test --all-targets --locked
