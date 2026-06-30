@@ -803,7 +803,11 @@ fn git_show(repo: &Path, args: &Value) -> Result<Value> {
         .get("object")
         .and_then(|x| x.as_str())
         .ok_or_else(|| anyhow!("git_show: missing object"))?;
-    if object.len() > 512 || object.contains('\n') || object.contains('\0') {
+    if object.len() > 512
+        || object.contains('\n')
+        || object.contains('\0')
+        || object.starts_with('-')
+    {
         anyhow::bail!("git_show: invalid object");
     }
     let suppress = args
@@ -1532,6 +1536,31 @@ mod tests {
         fs::write(dir.path().join(name), content).unwrap();
     }
 
+    fn run_git_test(dir: &TempDir, args: &[&str]) {
+        let out = Command::new("git")
+            .current_dir(dir.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn git_repo_with_commit() -> TempDir {
+        let d = TempDir::new().unwrap();
+        run_git_test(&d, &["init"]);
+        run_git_test(&d, &["config", "user.email", "test@example.com"]);
+        run_git_test(&d, &["config", "user.name", "Test User"]);
+        write_file(&d, "f.c", "int x = 1;\n");
+        run_git_test(&d, &["add", "f.c"]);
+        run_git_test(&d, &["commit", "-m", "base"]);
+        d
+    }
+
     fn git_args(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_string()).collect()
     }
@@ -1972,6 +2001,18 @@ struct opaque;
                 "err: {err}"
             );
         }
+    }
+
+    #[test]
+    fn git_show_rejects_option_object_before_spawning_git() {
+        let d = git_repo_with_commit();
+        let leak = d.path().join("leak.diff");
+        let args = json!({
+            "object": "--output=leak.diff",
+        });
+        let err = git_show(d.path(), &args).unwrap_err();
+        assert!(err.to_string().contains("invalid object"), "err: {err}");
+        assert!(!leak.exists(), "git_show created {}", leak.display());
     }
 
     #[test]
