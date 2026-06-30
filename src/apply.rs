@@ -87,7 +87,7 @@ Constraints:
 - Preserve vertical whitespace when editing. Do not add gratuitous blank lines;
   remove extra blank lines introduced by the auto-resolution when they are part
   of the defect.
-- After your final answer the host will run `git add` on every modified file and `git commit --amend --no-edit`. If you are unsure how to fix something safely, leave it and use "needs_human".
+- After your final answer the host will run full `git status --porcelain=v1 -z --untracked-files=all`, reject untracked files, stage tracked modifications, then run `git commit --amend --no-edit`. If you are unsure how to fix something safely, leave it and use "needs_human".
 
 When done, respond with ONLY this JSON object:
 {"verdict":"clean"|"amended"|"needs_human","explanation":"string"}
@@ -119,7 +119,7 @@ Rules:
   - move the logic to existing target-tree state if the surrounding code clearly shows the local adaptation.
 - If there is no safe local repair, do not edit. Return "needs_human" and explain why.
 
-After your final answer the host will run `git add` on every modified file and `git commit --amend --no-edit`.
+After your final answer the host will run full `git status --porcelain=v1 -z --untracked-files=all`, reject untracked files, stage tracked modifications, then run `git commit --amend --no-edit`.
 
 When done, respond with ONLY this JSON object:
 {"verdict":"clean"|"amended"|"needs_human","explanation":"string"}
@@ -614,7 +614,7 @@ pub fn dry_run(commit_id: &str) -> ApplyOutcome {
 
 pub async fn run(req: ApplyRequest<'_>) -> Result<ApplyOutcome> {
     let started = Instant::now();
-    ensure_no_unmerged_files(req.repo)?;
+    ensure_clean_apply_worktree(req.repo)?;
     let commit_subject = git::commit_subject(req.repo, req.commit_id)
         .ok()
         .map(|s| s.trim().to_string())
@@ -1108,6 +1108,74 @@ fn unmerged_files(repo: &Path) -> Result<Vec<String>> {
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .collect())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StatusEntry {
+    code: String,
+    path: String,
+}
+
+fn ensure_clean_apply_worktree(repo: &Path) -> Result<()> {
+    ensure_no_unmerged_files(repo)?;
+    let entries = git_status_porcelain(repo)?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let preview: Vec<String> = entries
+        .iter()
+        .take(5)
+        .map(|entry| format!("{} {}", entry.code, entry.path))
+        .collect();
+    let extra = entries.len().saturating_sub(preview.len());
+    let suffix = if extra == 0 {
+        String::new()
+    } else {
+        format!("\n... and {extra} more path(s)")
+    };
+    anyhow::bail!(
+        "repository has local modifications or untracked files; boro apply requires a clean worktree except ignored files\n{}\nResolve, stash, or remove them before retrying.{suffix}",
+        preview.join("\n")
+    );
+}
+
+fn git_status_porcelain(repo: &Path) -> Result<Vec<StatusEntry>> {
+    let out = Command::new("git")
+        .current_dir(repo)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .context("git status --porcelain=v1 -z --untracked-files=all")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git status --porcelain=v1 -z --untracked-files=all failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    Ok(parse_git_status_porcelain_z(&out.stdout))
+}
+
+fn parse_git_status_porcelain_z(stdout: &[u8]) -> Vec<StatusEntry> {
+    let mut entries = Vec::new();
+    let mut fields = stdout.split(|b| *b == 0).filter(|field| !field.is_empty());
+
+    while let Some(field) = fields.next() {
+        if field.len() < 4 {
+            continue;
+        }
+        let code = String::from_utf8_lossy(&field[..2]).into_owned();
+        let path = String::from_utf8_lossy(&field[3..]).into_owned();
+        if path.is_empty() {
+            continue;
+        }
+        if matches!(field[0], b'R' | b'C') || matches!(field[1], b'R' | b'C') {
+            fields.next();
+        }
+        entries.push(StatusEntry { code, path });
+    }
+
+    entries
 }
 
 fn cherry_pick_xs(repo: &Path, commit_id: &str) -> Result<GitCommandOutput> {
@@ -2310,15 +2378,16 @@ async fn post_apply_review_stage(
         err.as_ref(),
     );
 
-    // Detect files the model wrote via edit_file (working-tree changes vs HEAD).
-    let modified_files = working_tree_changes(repo)?;
+    // The apply command requires a clean worktree up front, so any tracked change left here
+    // happened during the post-apply review/repair flow.
+    let modified_files = post_apply_worktree_changes(repo)?;
 
     let (verdict, explanation) = match parsed {
         Some((v, e)) => (v, e),
         None => {
             let detail = err.as_ref().map(|e| format!(": {e:#}")).unwrap_or_default();
             // The model failed to return a valid verdict, but it may still have called edit_file.
-            // Keep any edits the model made: we'll amend below if working_tree_changes is non-empty.
+            // Keep any tracked edits it made: we'll amend below if git status reports changes.
             let synthesized = format!(
                 "post-apply review model did not produce a valid verdict{detail}. The cherry-pick is applied at HEAD; inspect the commit manually."
             );
@@ -2335,7 +2404,7 @@ async fn post_apply_review_stage(
         (String::new(), String::new())
     } else {
         verbose.line(format!(
-            "apply: post-apply review wrote {} file(s) via edit_file; staging and amending",
+            "apply: post-apply review left {} tracked file(s) modified; staging and amending",
             modified_files.len()
         ));
         amend_modified_files(repo, &modified_files)?
@@ -2486,7 +2555,7 @@ async fn post_apply_static_repair_stage(
         err.as_ref(),
     );
 
-    let modified_files = working_tree_changes(repo)?;
+    let modified_files = post_apply_worktree_changes(repo)?;
     let (verdict, mut explanation) = match parsed {
         Some((v, e)) => (v, e),
         None => {
@@ -2508,7 +2577,7 @@ async fn post_apply_static_repair_stage(
         (String::new(), String::new())
     } else {
         verbose.line(format!(
-            "apply: post-apply source repair wrote {} file(s) via edit_file; staging and amending",
+            "apply: post-apply source repair left {} tracked file(s) modified; staging and amending",
             modified_files.len()
         ));
         amend_modified_files(repo, &modified_files)?
@@ -2573,41 +2642,26 @@ fn append_command_output(dst: &mut String, src: &str) {
     dst.push_str(src);
 }
 
-/// List paths that differ between the working tree and HEAD. Used to detect files the model
-/// rewrote via `edit_file`. Both modified-but-unstaged and already-staged paths are returned;
-/// in the post-apply review flow the staging area should be empty when the model finishes, so
-/// either signal means "edit_file ran".
-fn working_tree_changes(repo: &Path) -> Result<Vec<String>> {
-    let out = Command::new("git")
-        .current_dir(repo)
-        .args(["status", "--porcelain"])
-        .output()
-        .context("git status --porcelain (post-apply review)")?;
-    if !out.status.success() {
+/// Return tracked files that differ from HEAD after post-apply review/repair.
+/// Untracked paths are rejected instead of silently staging them into the amended commit.
+fn post_apply_worktree_changes(repo: &Path) -> Result<Vec<String>> {
+    let entries = git_status_porcelain(repo)?;
+    let mut modified = Vec::new();
+    let mut untracked = Vec::new();
+    for entry in entries {
+        if entry.code == "??" {
+            untracked.push(entry.path);
+        } else {
+            modified.push(entry.path);
+        }
+    }
+    if !untracked.is_empty() {
         anyhow::bail!(
-            "git status --porcelain failed: {}",
-            String::from_utf8_lossy(&out.stderr)
+            "post-apply edit stage left untracked file(s); refusing to amend them: {}",
+            untracked.join(", ")
         );
     }
-    let mut files = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if line.len() < 4 {
-            continue;
-        }
-        // Porcelain v1: two status chars, space, path. Renames look like "R  old -> new"; take
-        // the new path for those.
-        let path_part = &line[3..];
-        let path = if let Some((_, new)) = path_part.split_once(" -> ") {
-            new.trim()
-        } else {
-            path_part.trim()
-        };
-        if path.is_empty() {
-            continue;
-        }
-        files.push(path.to_string());
-    }
-    Ok(files)
+    Ok(modified)
 }
 
 /// Stage the listed files and run `git commit --amend --no-edit`. Returns the amend command's
@@ -4403,6 +4457,136 @@ struct target_type {
         assert!(review.explanation.contains("post-review was clean"));
         assert!(review.explanation.contains("obj->target_field"));
         assert!(review.explanation.contains("struct target_type"));
+    }
+
+    #[test]
+    fn ensure_clean_apply_worktree_rejects_untracked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        run_git_test(dir.path(), &["init"]).unwrap();
+        run_git_test(dir.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        run_git_test(dir.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(dir.path().join("tracked.txt"), "base\n").unwrap();
+        run_git_test(dir.path(), &["add", "tracked.txt"]).unwrap();
+        run_git_test(dir.path(), &["commit", "-m", "base"]).unwrap();
+
+        fs::write(dir.path().join("scratch.txt"), "user data\n").unwrap();
+
+        let err = ensure_clean_apply_worktree(dir.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("clean worktree except ignored files"),
+            "err: {err:#}"
+        );
+        assert!(err.to_string().contains("?? scratch.txt"), "err: {err:#}");
+    }
+
+    #[test]
+    fn ensure_clean_apply_worktree_rejects_tracked_modifications() {
+        let dir = tempfile::tempdir().unwrap();
+        run_git_test(dir.path(), &["init"]).unwrap();
+        run_git_test(dir.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        run_git_test(dir.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(dir.path().join("tracked.txt"), "base\n").unwrap();
+        run_git_test(dir.path(), &["add", "tracked.txt"]).unwrap();
+        run_git_test(dir.path(), &["commit", "-m", "base"]).unwrap();
+
+        fs::write(dir.path().join("tracked.txt"), "base\nlocal edit\n").unwrap();
+
+        let err = ensure_clean_apply_worktree(dir.path()).unwrap_err();
+        assert!(err.to_string().contains(" M tracked.txt"), "err: {err:#}");
+    }
+
+    #[test]
+    fn ensure_clean_apply_worktree_allows_ignored_files() {
+        let dir = tempfile::tempdir().unwrap();
+        run_git_test(dir.path(), &["init"]).unwrap();
+        run_git_test(dir.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        run_git_test(dir.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(dir.path().join(".gitignore"), "ignored.log\n").unwrap();
+        fs::write(dir.path().join("tracked.txt"), "base\n").unwrap();
+        run_git_test(dir.path(), &["add", ".gitignore", "tracked.txt"]).unwrap();
+        run_git_test(dir.path(), &["commit", "-m", "base"]).unwrap();
+
+        fs::write(dir.path().join("ignored.log"), "ignore me\n").unwrap();
+
+        ensure_clean_apply_worktree(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn parse_git_status_porcelain_z_consumes_rename_source_path() {
+        let entries = parse_git_status_porcelain_z(
+            b"R  new name.txt\0old name.txt\0 M tracked.txt\0?? scratch.txt\0",
+        );
+        assert_eq!(
+            entries,
+            vec![
+                StatusEntry {
+                    code: "R ".to_string(),
+                    path: "new name.txt".to_string(),
+                },
+                StatusEntry {
+                    code: " M".to_string(),
+                    path: "tracked.txt".to_string(),
+                },
+                StatusEntry {
+                    code: "??".to_string(),
+                    path: "scratch.txt".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn post_apply_worktree_changes_returns_all_dirty_tracked_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        run_git_test(dir.path(), &["init"]).unwrap();
+        run_git_test(dir.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        run_git_test(dir.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+        run_git_test(dir.path(), &["add", "a.txt", "b.txt"]).unwrap();
+        run_git_test(dir.path(), &["commit", "-m", "base"]).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "a\nedit\n").unwrap();
+        fs::write(dir.path().join("b.txt"), "b\nedit\n").unwrap();
+
+        let files = post_apply_worktree_changes(dir.path()).unwrap();
+        assert_eq!(files, vec!["a.txt".to_string(), "b.txt".to_string()]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn post_apply_worktree_changes_reports_symlink_target_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        run_git_test(dir.path(), &["init"]).unwrap();
+        run_git_test(dir.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        run_git_test(dir.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(dir.path().join("target.txt"), "base\n").unwrap();
+        std::os::unix::fs::symlink("target.txt", dir.path().join("link.txt")).unwrap();
+        run_git_test(dir.path(), &["add", "target.txt", "link.txt"]).unwrap();
+        run_git_test(dir.path(), &["commit", "-m", "base"]).unwrap();
+
+        fs::write(dir.path().join("link.txt"), "base\nvia link\n").unwrap();
+
+        let files = post_apply_worktree_changes(dir.path()).unwrap();
+        assert_eq!(files, vec!["target.txt".to_string()]);
+    }
+
+    #[test]
+    fn post_apply_worktree_changes_rejects_untracked_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        run_git_test(dir.path(), &["init"]).unwrap();
+        run_git_test(dir.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        run_git_test(dir.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(dir.path().join("tracked.txt"), "base\n").unwrap();
+        run_git_test(dir.path(), &["add", "tracked.txt"]).unwrap();
+        run_git_test(dir.path(), &["commit", "-m", "base"]).unwrap();
+
+        fs::write(dir.path().join("scratch.txt"), "not tracked\n").unwrap();
+
+        let err = post_apply_worktree_changes(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("untracked file"), "err: {err:#}");
+        assert!(err.to_string().contains("scratch.txt"), "err: {err:#}");
     }
 
     fn run_git_test(repo: &Path, args: &[&str]) -> Result<()> {
