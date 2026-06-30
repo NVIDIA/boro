@@ -3,11 +3,15 @@
 
 use rust_embed::{EmbeddedFile, RustEmbed};
 
-use super::TargetSpec;
+use super::{render_local_prompts, TargetSpec};
 
 #[derive(RustEmbed)]
 #[folder = "resources/prompts/kernel/"]
 struct PromptCorpus;
+
+#[derive(RustEmbed)]
+#[folder = "resources/prompts/kernel.local/"]
+struct LocalPromptCorpus;
 
 pub struct KernelTarget;
 
@@ -131,6 +135,10 @@ impl TargetSpec for KernelTarget {
 
     fn core_files(&self) -> &'static [&'static str] {
         CORE_FILES
+    }
+
+    fn local_reference(&self) -> String {
+        render_local_prompts(LocalPromptCorpus::iter(), LocalPromptCorpus::get)
     }
 
     fn prompts_source_verbose(&self) -> &'static str {
