@@ -13,7 +13,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -304,7 +304,7 @@ fn truncate_diff(s: &str) -> String {
 }
 
 pub fn validate_repo_relative(repo_root: &Path, relative: &str) -> Result<PathBuf> {
-    if relative.contains("..") || relative.starts_with('/') {
+    if path_escapes_repo(relative) {
         anyhow::bail!("invalid path: {relative}");
     }
     let base = repo_root
@@ -324,6 +324,15 @@ pub fn validate_repo_relative(repo_root: &Path, relative: &str) -> Result<PathBu
         anyhow::bail!("path escapes repository root: {relative}");
     }
     Ok(full)
+}
+
+fn path_escapes_repo(relative: &str) -> bool {
+    Path::new(relative).components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir
+        )
+    })
 }
 
 fn read_files(repo: &Path, args: &Value) -> Result<Value> {
@@ -645,6 +654,127 @@ fn validate_git_args(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn validate_git_diff_args(repo: &Path, args: &[String]) -> Result<()> {
+    validate_git_args(args)?;
+
+    let mut pathspecs = false;
+    for arg in args {
+        if pathspecs {
+            if arg.is_empty() {
+                anyhow::bail!("git_diff: empty pathspec is not allowed");
+            }
+            validate_repo_relative(repo, arg)?;
+            continue;
+        }
+        if arg == "--" {
+            pathspecs = true;
+            continue;
+        }
+        if arg.starts_with("--") {
+            validate_git_diff_long_option(arg)?;
+            continue;
+        }
+        if arg.starts_with('-') {
+            validate_git_diff_short_option(arg)?;
+            continue;
+        }
+        if path_escapes_repo(arg) {
+            anyhow::bail!("git_diff: paths must stay inside the repository");
+        }
+    }
+    Ok(())
+}
+
+fn validate_git_diff_long_option(arg: &str) -> Result<()> {
+    if matches!(
+        arg,
+        "--cached"
+            | "--staged"
+            | "--merge-base"
+            | "--patch"
+            | "--raw"
+            | "--numstat"
+            | "--shortstat"
+            | "--summary"
+            | "--compact-summary"
+            | "--name-only"
+            | "--name-status"
+            | "--check"
+            | "--full-index"
+            | "--binary"
+            | "--no-renames"
+            | "--ignore-space-at-eol"
+            | "--ignore-space-change"
+            | "--ignore-all-space"
+            | "--ignore-blank-lines"
+            | "--minimal"
+            | "--patience"
+    ) {
+        return Ok(());
+    }
+
+    for prefix in [
+        "--stat=",
+        "--stat-width=",
+        "--stat-name-width=",
+        "--stat-count=",
+        "--unified=",
+        "--inter-hunk-context=",
+        "--diff-filter=",
+        "--find-renames=",
+        "--find-copies=",
+    ] {
+        if arg.starts_with(prefix) {
+            return Ok(());
+        }
+    }
+
+    if matches!(arg, "--stat" | "--find-renames" | "--find-copies") {
+        return Ok(());
+    }
+
+    if arg == "--no-index" {
+        anyhow::bail!("git_diff: --no-index is not allowed");
+    }
+    if arg == "--output" || arg.starts_with("--output=") {
+        anyhow::bail!("git_diff: --output is not allowed");
+    }
+    if arg == "--pathspec-from-file" || arg.starts_with("--pathspec-from-file=") {
+        anyhow::bail!("git_diff: --pathspec-from-file is not allowed");
+    }
+    if matches!(arg, "--ext-diff" | "--textconv") {
+        anyhow::bail!("git_diff: {arg} is not allowed");
+    }
+
+    anyhow::bail!("git_diff: option '{arg}' is not allowed")
+}
+
+fn validate_git_diff_short_option(arg: &str) -> Result<()> {
+    let mut chars = arg[1..].chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            'p' | 'u' | 'w' | 'b' | 'B' | 'R' | 'z' | 's' => {}
+            'M' | 'C' => {
+                let rest: String = chars.collect();
+                if rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit() || c == '%') {
+                    return Ok(());
+                }
+                anyhow::bail!("git_diff: option '-{ch}{rest}' is not allowed");
+            }
+            'U' => {
+                let rest: String = chars.collect();
+                if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                    return Ok(());
+                }
+                anyhow::bail!("git_diff: option '-U{rest}' is not allowed");
+            }
+            'O' => anyhow::bail!("git_diff: -O is not allowed"),
+            _ => anyhow::bail!("git_diff: option '-{ch}' is not allowed"),
+        }
+    }
+    Ok(())
+}
+
 fn git_diff(repo: &Path, args: &Value) -> Result<Value> {
     let raw: Vec<String> = args
         .get("args")
@@ -653,7 +783,7 @@ fn git_diff(repo: &Path, args: &Value) -> Result<Value> {
         .iter()
         .filter_map(|v| v.as_str().map(|s| s.to_string()))
         .collect();
-    validate_git_args(&raw)?;
+    validate_git_diff_args(repo, &raw)?;
     let out = Command::new("git")
         .current_dir(repo)
         .arg("diff")
@@ -724,7 +854,8 @@ fn git_show(repo: &Path, args: &Value) -> Result<Value> {
 
 /// Rewrite a file inside the repo by replacing an exact substring.
 ///
-/// Path validation goes through [`validate_repo_relative`] (rejects absolute paths and `..`).
+/// Path validation goes through [`validate_repo_relative`] (rejects absolute paths and parent
+/// directory components).
 /// `old_string` must occur exactly once unless `replace_all=true`. `new_string` must differ from
 /// `old_string`. The replacement is written in place; the host (apply.rs) detects tracked
 /// working-tree changes via `git status` and amends them.
@@ -1401,6 +1532,10 @@ mod tests {
         fs::write(dir.path().join(name), content).unwrap();
     }
 
+    fn git_args(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
     fn smart(dir: &TempDir, name: &str, start: Option<usize>, end: Option<usize>) -> Value {
         let args = json!({
             "files": [{
@@ -1749,6 +1884,94 @@ struct opaque;
         });
         let err = rg(d.path(), &args).unwrap_err();
         assert!(err.to_string().contains("invalid path"), "err: {err}");
+    }
+
+    #[test]
+    fn validate_repo_relative_allows_dotdot_inside_filename() {
+        let d = TempDir::new().unwrap();
+        validate_repo_relative(d.path(), "foo..bar").unwrap();
+        validate_repo_relative(d.path(), "src/v1..v2/file.c").unwrap();
+    }
+
+    #[test]
+    fn git_diff_allows_revision_range_and_repo_pathspec() {
+        let d = TempDir::new().unwrap();
+        let args = git_args(&["HEAD~2..HEAD", "--", "src/v1..v2/file.c"]);
+        validate_git_diff_args(d.path(), &args).unwrap();
+    }
+
+    #[test]
+    fn git_diff_allows_safe_display_options() {
+        let d = TempDir::new().unwrap();
+        for args in [
+            git_args(&["--stat", "HEAD^", "HEAD"]),
+            git_args(&["--name-only", "HEAD^", "HEAD"]),
+            git_args(&["-uw", "HEAD^", "HEAD"]),
+            git_args(&["-U3", "HEAD^", "HEAD"]),
+        ] {
+            validate_git_diff_args(d.path(), &args).unwrap();
+        }
+    }
+
+    #[test]
+    fn git_diff_rejects_no_index_before_spawning_git() {
+        let d = TempDir::new().unwrap();
+        let leak = d.path().join("leak.diff");
+        let args = json!({
+            "args": ["--no-index", "--output=leak.diff", "/dev/null", "/etc/hosts"],
+        });
+        let err = git_diff(d.path(), &args).unwrap_err();
+        assert!(err.to_string().contains("--no-index"), "err: {err}");
+        assert!(!leak.exists(), "git_diff created {}", leak.display());
+    }
+
+    #[test]
+    fn git_diff_rejects_output_option() {
+        let d = TempDir::new().unwrap();
+        for args in [
+            git_args(&["--output=leak.diff", "HEAD^", "HEAD"]),
+            git_args(&["--output", "leak.diff", "HEAD^", "HEAD"]),
+        ] {
+            let err = validate_git_diff_args(d.path(), &args).unwrap_err();
+            assert!(err.to_string().contains("--output"), "err: {err}");
+        }
+    }
+
+    #[test]
+    fn git_diff_rejects_file_input_options() {
+        let d = TempDir::new().unwrap();
+        for args in [
+            git_args(&["-O/etc/hosts", "HEAD^", "HEAD"]),
+            git_args(&["-O", "/etc/hosts", "HEAD^", "HEAD"]),
+            git_args(&["-uO/etc/hosts", "HEAD^", "HEAD"]),
+            git_args(&["-pO/etc/hosts", "HEAD^", "HEAD"]),
+            git_args(&["-wO/etc/hosts", "HEAD^", "HEAD"]),
+            git_args(&["-zO/etc/hosts", "HEAD^", "HEAD"]),
+            git_args(&["--pathspec-from-file=/etc/hosts", "HEAD^", "HEAD"]),
+            git_args(&["--pathspec-from-file", "/etc/hosts", "HEAD^", "HEAD"]),
+            git_args(&["--ext-diff", "HEAD^", "HEAD"]),
+        ] {
+            let err = validate_git_diff_args(d.path(), &args).unwrap_err();
+            assert!(err.to_string().starts_with("git_diff:"), "err: {err}");
+        }
+    }
+
+    #[test]
+    fn git_diff_rejects_absolute_and_parent_pathspecs() {
+        let d = TempDir::new().unwrap();
+        for args in [
+            git_args(&["HEAD^", "HEAD", "--", "/etc/passwd"]),
+            git_args(&["HEAD^", "HEAD", "--", "../escape.c"]),
+            git_args(&["HEAD^", "HEAD", "--", "src/../escape.c"]),
+            git_args(&["HEAD^", "HEAD", "../escape.c"]),
+            git_args(&["HEAD^", "HEAD", "src/../escape.c"]),
+        ] {
+            let err = validate_git_diff_args(d.path(), &args).unwrap_err();
+            assert!(
+                err.to_string().contains("repository") || err.to_string().contains("invalid path"),
+                "err: {err}"
+            );
+        }
     }
 
     #[test]
