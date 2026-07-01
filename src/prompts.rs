@@ -64,6 +64,7 @@ pub fn build_reference_context(
     max_total: usize,
     phase0_selected: Option<&[String]>,
     followup_summary: Option<&str>,
+    checkpatch_summary: Option<&str>,
 ) -> Result<String> {
     use std::collections::HashSet;
     let mut parts: Vec<String> = Vec::new();
@@ -168,11 +169,28 @@ pub fn build_reference_context(
         if !trimmed.is_empty() {
             let block = format!("\n\n# --- upstream follow-up ---\n\n{trimmed}\n");
             if used + block.len() <= max_total {
+                used += block.len();
                 parts.push(block);
             } else {
                 parts.push(
                     "\n\n# --- upstream follow-up ---\n[skipped: context budget]\n".to_string(),
                 );
+                used = max_total;
+            }
+        }
+    }
+
+    // checkpatch is intentionally the terminal context block, so it does not update `used`.
+    // If any budgeted block is ever appended after it, add `used += block.len()` here as the
+    // follow-up block above does, or its budget check will be wrong.
+    if let Some(summary) = checkpatch_summary {
+        let trimmed = summary.trim();
+        if !trimmed.is_empty() {
+            let block = format!("\n\n# --- checkpatch ---\n\n{trimmed}\n");
+            if used + block.len() <= max_total {
+                parts.push(block);
+            } else {
+                parts.push("\n\n# --- checkpatch ---\n[skipped: context budget]\n".to_string());
             }
         }
     }
@@ -239,7 +257,7 @@ mod tests {
 
     #[test]
     fn reference_context_checks_ubuntu_annotations_justification() {
-        let context = build_reference_context(ReviewTarget::Kernel, &[], 100_000, None, None)
+        let context = build_reference_context(ReviewTarget::Kernel, &[], 100_000, None, None, None)
             .expect("build context");
         assert!(context.contains("Ubuntu kernel annotations policy"));
         assert!(context.contains("note<...>"));
@@ -248,8 +266,9 @@ mod tests {
 
     #[test]
     fn ubuntu_annotations_policy_is_kernel_target_only() {
-        let qemu_context = build_reference_context(ReviewTarget::Qemu, &[], 100_000, None, None)
-            .expect("build QEMU context");
+        let qemu_context =
+            build_reference_context(ReviewTarget::Qemu, &[], 100_000, None, None, None)
+                .expect("build QEMU context");
         assert!(!qemu_context.contains("Ubuntu kernel annotations policy"));
     }
 
@@ -332,6 +351,7 @@ mod tests {
             300_000,
             Some(&["subsystem/networking-core.md".to_string()]),
             None,
+            None,
         )
         .expect("ctx");
         assert!(
@@ -353,6 +373,7 @@ mod tests {
             300_000,
             Some(&[]),
             None,
+            None,
         )
         .expect("ctx");
         assert!(
@@ -368,6 +389,7 @@ mod tests {
             ReviewTarget::Kernel,
             &["mm/page_alloc.c".to_string()],
             300_000,
+            None,
             None,
             None,
         )
@@ -387,6 +409,7 @@ mod tests {
             300_000,
             None,
             Some(summary),
+            None,
         )
         .expect("ctx");
         assert!(ref_md.contains("# --- upstream follow-up ---"));
@@ -401,8 +424,51 @@ mod tests {
             300_000,
             None,
             Some("   "),
+            None,
         )
         .expect("ctx");
         assert!(!ref_md.contains("upstream follow-up"));
+    }
+
+    #[test]
+    fn checkpatch_summary_appended_when_provided() {
+        let summary = "net/foo.c:12: ERROR: spaces required around that '='";
+        let ref_md = build_reference_context(
+            ReviewTarget::Kernel,
+            &["mm/page_alloc.c".to_string()],
+            300_000,
+            None,
+            None,
+            Some(summary),
+        )
+        .expect("ctx");
+        assert!(ref_md.contains("# --- checkpatch ---"));
+        assert!(ref_md.contains("ERROR: spaces required around that '='"));
+    }
+
+    #[test]
+    fn checkpatch_summary_skipped_when_empty() {
+        let ref_md = build_reference_context(
+            ReviewTarget::Kernel,
+            &["mm/page_alloc.c".to_string()],
+            300_000,
+            None,
+            None,
+            Some("   "),
+        )
+        .expect("ctx");
+        assert!(!ref_md.contains("# --- checkpatch ---"));
+    }
+
+    #[test]
+    fn checkpatch_summary_emits_skip_marker_when_over_budget() {
+        // A tiny total budget is exhausted by the mandatory instructions, so the checkpatch
+        // block is emitted as a budget-skip marker rather than the findings themselves.
+        let findings = "net/foo.c:1: ERROR: DISTINCTIVE_FINDING_TOKEN";
+        let ref_md =
+            build_reference_context(ReviewTarget::Kernel, &[], 50, None, None, Some(findings))
+                .expect("ctx");
+        assert!(ref_md.contains("# --- checkpatch ---\n[skipped: context budget]"));
+        assert!(!ref_md.contains("DISTINCTIVE_FINDING_TOKEN"));
     }
 }

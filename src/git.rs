@@ -98,6 +98,26 @@ pub fn show_patch(repo: &Path, sha: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Full mbox-format patch for `sha` (`git format-patch -1 --stdout`). Unlike [`show_patch`]
+/// (`git show --pretty=medium`), this yields the `From `/`Subject:` mbox layout that
+/// `scripts/checkpatch.pl` expects, so its commit-log-level checks run over the real commit
+/// message rather than git-show headers and a 4-space-indented body.
+pub fn format_patch(repo: &Path, sha: &str) -> Result<String> {
+    let out = Command::new("git")
+        .current_dir(repo)
+        .args(["format-patch", "-1", "--stdout", sha])
+        .output()
+        .with_context(|| format!("git format-patch -1 --stdout {sha}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git format-patch -1 --stdout {}: {}",
+            sha,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Single-line subject for `sha` (`git log -1 --format=%s`). Used to build the lei query for
 /// the upstream-followup stage.
 pub fn commit_subject(repo: &Path, sha: &str) -> Result<String> {
@@ -210,7 +230,49 @@ pub fn changed_paths(repo: &Path, sha: &str) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_commit_range_arg;
+    use super::{format_patch, normalize_commit_range_arg};
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn format_patch_yields_mbox_with_subject() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git(repo, &["init", "-q"]);
+        git(repo, &["config", "user.email", "test@example.com"]);
+        git(repo, &["config", "user.name", "Test"]);
+        git(repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("file.txt"), "hello\n").expect("write file");
+        git(repo, &["add", "file.txt"]);
+        git(repo, &["commit", "-q", "-m", "add greeting file"]);
+
+        let mbox = format_patch(repo, "HEAD").expect("format_patch");
+        assert!(
+            mbox.starts_with("From "),
+            "mbox should start with `From `: {mbox}"
+        );
+        assert!(
+            mbox.contains("Subject:"),
+            "mbox should contain a Subject header: {mbox}"
+        );
+        assert!(
+            mbox.contains("add greeting file"),
+            "mbox should carry the commit subject"
+        );
+    }
 
     #[test]
     fn normalizes_single_revision_to_one_commit_range() {

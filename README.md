@@ -136,6 +136,11 @@ and produces a complete review - it just skips the lore.kernel.org
 retrieval. The Linux-master `Fixes:` lookup remains available. To disable
 the lore portion explicitly even when `lei` is installed, set
 `BORO_LORE_ENABLED=0`.
+- Optional: `perl` and the kernel tree's `scripts/checkpatch.pl` for the
+checkpatch ground-truth stage. It is opt-in: set `BORO_CHECKPATCH_ENABLED=1`
+to feed checkpatch's error- and warning-level findings into the reviewer as
+deterministic evidence. When disabled, or when `perl` or the script are
+absent, boro still runs every other stage and produces a complete review.
 
 ## Build & install
 
@@ -281,6 +286,16 @@ Config (all optional):
 | `BORO_LORE_WINDOW`    | `1.year.ago..`                | Public-inbox `rt:` window.            |
 | `BORO_LORE_MAX_BYTES` | `65536`                       | Max bytes kept from the lei result    |
 | `BORO_LORE_INBOX_URL` | `https://lore.kernel.org/all` | Remote inbox                          |
+| `BORO_CHECKPATCH_ENABLED`   | `0`     | Set to `1` to feed `checkpatch.pl` findings into the review |
+| `BORO_CHECKPATCH_MAX_BYTES` | `16384` | Max bytes kept from the checkpatch findings                 |
+
+The checkpatch stage is opt-in and kernel-only. When enabled it runs
+`scripts/checkpatch.pl --no-tree` on each reviewed commit and injects the
+error- and warning-level findings into the reviewer's reference context as a
+`# --- checkpatch ---` block. It needs `perl` and the tree's
+`scripts/checkpatch.pl`; a missing script, missing `perl`, or a checkpatch
+failure silently skips the stage for that commit. checkpatch's non-zero exit
+on findings is expected and does not fail the review.
 
 The lore portion requires `lei` (from the `public-inbox` package) on
 `$PATH`; the upstream branch lookup uses only `git` and still runs when
