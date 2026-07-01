@@ -1314,9 +1314,8 @@ mod tests {
     }
 
     #[test]
-    fn write_report_json_includes_summary_shape() {
-        // Synthetic `out` with the run-wide summary block we now emit. JSON consumers
-        // should see both the AI prose and the locally-computed per-severity counts.
+    fn write_report_json_round_trips_quick_summary_highlights() {
+        // The additive highlights field must not disturb the legacy summary text or counts.
         let out = serde_json::json!({
             "schema_version": 1,
             "range": "HEAD~1..HEAD",
@@ -1324,6 +1323,14 @@ mod tests {
             "summary": {
                 "text": "Most serious issue: UAF in driver foo.",
                 "counts": {"Critical": 1, "High": 0, "Medium": 2, "Low": 0},
+                "highlights": [{
+                    "finding_ref": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef:0",
+                    "commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                    "severity": "Critical",
+                    "title": "UAF in driver foo",
+                    "question": "Can this object be released before the callback runs?",
+                    "location": {"file": "drivers/foo.c", "line": 42, "side": "RIGHT"}
+                }],
             },
         });
         let mut buf = Vec::new();
@@ -1332,9 +1339,15 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         assert_eq!(parsed["summary"]["counts"]["Critical"], 1);
         assert_eq!(parsed["summary"]["counts"]["Medium"], 2);
-        assert!(parsed["summary"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("UAF in driver foo"));
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(
+            parsed["summary"]["text"],
+            "Most serious issue: UAF in driver foo."
+        );
+        assert_eq!(parsed["summary"]["highlights"][0]["severity"], "Critical");
+        assert_eq!(
+            parsed["summary"]["highlights"][0]["location"]["file"],
+            "drivers/foo.c"
+        );
     }
 }
