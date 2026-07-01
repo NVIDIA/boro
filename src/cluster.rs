@@ -8,8 +8,10 @@ use serde_json::Value;
 
 /// Cluster a list of specialist concerns by `description`, dropping near-duplicates.
 ///
-/// First-seen concern of each cluster is kept (preserves stage order); subsequent
-/// near-duplicates are discarded. "Near-duplicate" means either the first 10 normalized
+/// The first-seen concern of each cluster is normally kept (preserving stage order).
+/// A later near-duplicate replaces it when the later concern carries a complete
+/// configuration/linkage proof and the first one does not, so specialist evidence is not
+/// discarded before consolidation. "Near-duplicate" means either the first 10 normalized
 /// tokens match exactly or the trigram Jaccard similarity exceeds 0.6.
 ///
 /// Concerns with an empty/missing `description` are passed through unchanged so that
@@ -37,21 +39,48 @@ pub fn cluster_concerns(concerns: &[Value]) -> Vec<Value> {
     }
 
     let mut kept: Vec<Value> = Vec::with_capacity(concerns.len());
-    let mut kept_sigs: Vec<(Vec<String>, Vec<String>)> = Vec::with_capacity(concerns.len());
+    // Keep the output index alongside each signature because concerns without a description
+    // are retained in `kept` but do not participate in clustering.
+    let mut kept_sigs: Vec<((Vec<String>, Vec<String>), usize)> =
+        Vec::with_capacity(concerns.len());
 
     for (i, sig) in sigs.iter().enumerate() {
         match sig {
             None => kept.push(concerns[i].clone()),
             Some(s) => {
-                if kept_sigs.iter().any(|k| similar(k, s)) {
+                if let Some((_, kept_idx)) = kept_sigs.iter().find(|(k, _)| similar(k, s)) {
+                    if !has_complete_linkage_proof(&kept[*kept_idx])
+                        && has_complete_linkage_proof(&concerns[i])
+                    {
+                        kept[*kept_idx] = concerns[i].clone();
+                    }
                     continue;
                 }
                 kept.push(concerns[i].clone());
-                kept_sigs.push(s.clone());
+                kept_sigs.push((s.clone(), kept.len() - 1));
             }
         }
     }
     kept
+}
+
+fn has_complete_linkage_proof(concern: &Value) -> bool {
+    let Some(proof) = concern.get("proof") else {
+        return false;
+    };
+    [
+        "failing_config",
+        "caller_condition",
+        "provider_condition",
+        "failure",
+    ]
+    .iter()
+    .all(|field| {
+        proof
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    })
 }
 
 fn similar(a: &(Vec<String>, Vec<String>), b: &(Vec<String>, Vec<String>)) -> bool {
@@ -163,6 +192,53 @@ mod tests {
         let out = cluster_concerns(&[a.clone(), b]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0], a, "first-seen entry should be kept verbatim");
+    }
+
+    #[test]
+    fn cluster_concerns_prefers_complete_linkage_proof() {
+        let broad = json!({
+            "type": "build",
+            "description": "foo() is unavailable when CONFIG_FOO is disabled",
+            "reasoning": "foo() may not be declared in every configuration"
+        });
+        let stage7 = json!({
+            "type": "s7:linkage",
+            "description": "foo() is unavailable when CONFIG_FOO is disabled",
+            "reasoning": "With CONFIG_FOO=n the unconditional caller is compiled, but the declaration is guarded by CONFIG_FOO, producing an undeclared identifier.",
+            "proof": {
+                "failing_config": "CONFIG_FOO=n",
+                "caller_condition": "unconditional obj-y caller",
+                "provider_condition": "declaration guarded by IS_ENABLED(CONFIG_FOO)",
+                "failure": "foo is an undeclared identifier"
+            }
+        });
+
+        let out = cluster_concerns(&[broad, stage7.clone()]);
+
+        assert_eq!(
+            out,
+            vec![stage7],
+            "the proof-bearing refinement must survive"
+        );
+    }
+
+    #[test]
+    fn incomplete_linkage_proof_does_not_replace_first_seen() {
+        let first = concern("foo() is unavailable in one configuration");
+        let incomplete = json!({
+            "type": "s7:linkage",
+            "description": "foo() is unavailable in one configuration",
+            "reasoning": "missing the concrete failure",
+            "proof": {
+                "failing_config": "CONFIG_FOO=n",
+                "caller_condition": "unconditional",
+                "provider_condition": "CONFIG_FOO"
+            }
+        });
+
+        let out = cluster_concerns(&[first.clone(), incomplete]);
+
+        assert_eq!(out, vec![first]);
     }
 
     #[test]

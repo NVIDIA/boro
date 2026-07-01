@@ -52,10 +52,20 @@ mod tests {
         assert!(prompt.contains("checked-out review tree as authoritative"));
         assert!(prompt.contains("missing prerequisite"));
         assert!(prompt.contains("CONFIG_BAR=n"));
+        assert!(prompt.contains("`failing_config`"));
+        assert!(prompt.contains("`caller_condition`"));
+        assert!(prompt.contains("`provider_condition`"));
+        assert!(prompt.contains("structured `proof` object"));
+        assert!(prompt.contains("not guaranteed"));
 
         let single_pass = include_str!("../resources/one-shot-review.md");
         assert!(single_pass.contains("Build / configuration portability"));
         assert!(single_pass.contains("relevant `CONFIG_*={y,m,n}` states"));
         assert!(single_pass.contains("checked-out tree as authoritative"));
+        assert!(single_pass.contains("`failing_config`"));
+        assert!(single_pass.contains("`provider_condition`"));
+        assert!(single_pass.contains("substitute for this proof"));
+        assert!(single_pass.contains("Every finding must carry concrete proof"));
+        assert!(single_pass.contains("interleaving or lock-order cycle"));
     }
 }

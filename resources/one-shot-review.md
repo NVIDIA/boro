@@ -18,6 +18,23 @@ You are performing **one consolidated pass** that must cover the same dimensions
    a newer upstream tree are present.
 8. **Hardware / drivers** — register/DMA/barriers/state machines when the diff touches drivers or HW.
 
+Every finding must carry concrete proof appropriate to its issue type: the
+relevant code or text facts, a reachable trigger or witness when applicable,
+the violated invariant or direct contradiction, and the concrete failure or
+user-visible defect. Use a witness state and path for execution flow, an
+interleaving or lock-order cycle for concurrency, an
+acquisition/handoff/cleanup path for resources, an attacker-controlled input
+path for security, and exact contradictory text for comment or commit-message
+issues. Do not use “may”, “might”, “could”, or “not guaranteed” as a substitute
+for missing evidence.
+
+Every configuration or linkage finding must state a concrete proof: one valid
+`failing_config`, the exact `caller_condition`, the exact `provider_condition`
+for the declaration/definition/export/stub in the checked-out tree, and the
+resulting compile, link, or semantic `failure`. Verify all four with repository
+tools. Do not use “may”, “might”, “not guaranteed”, or “could be absent” as a
+substitute for this proof.
+
 Be skeptical of the commit message. Prefer reporting a suspected issue with clear reasoning over silence.
 
 Do not report the bug that the patch is fixing. A defect visible only in
