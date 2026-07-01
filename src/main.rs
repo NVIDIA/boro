@@ -44,6 +44,11 @@ use progress::{phase_tag, MultiPatchSpinner, WorkerLineCtx};
 use snapshot::{snapshot_to_value, CommitSnapshot, SnapshotPublisher};
 use verbose::VerboseDest;
 
+fn fast_review_tool_config(repo: &Path, no_tools: bool) -> Option<api::ToolLoopConfig<'_>> {
+    (!no_tools)
+        .then(|| api::ToolLoopConfig::new(repo).requiring(api::ToolVerification::SensitiveFindings))
+}
+
 /// CLI surface for `--backend`. Maps to [`config::Backend`] before reaching the rest of the code.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum BackendArg {
@@ -189,7 +194,7 @@ struct ReviewArgs {
     #[arg(long, value_name = "SECONDS", default_value_t = 600)]
     timeout: u64,
 
-    /// Skip concerns + consolidation; one review call + LKML pass per commit.
+    /// Run upstream follow-up, one review call, and the LKML report pass per commit.
     #[arg(short = 'x', long)]
     fast: bool,
 
@@ -299,6 +304,10 @@ impl CommitAction {
         matches!(self, CommitAction::Review { no_tools: true, .. })
     }
 
+    fn review_fast(&self) -> bool {
+        matches!(self, CommitAction::Review { fast: true, .. })
+    }
+
     fn is_review(&self) -> bool {
         matches!(self, CommitAction::Review { .. })
     }
@@ -384,7 +393,7 @@ fn stage_progress_line(
     format!("{patch_tag} {sha_short} [step {step}/{total}] {description}")
 }
 
-/// One commit: git + reference bundle + single-pass or full multi-pass review.
+/// One commit: git + reference bundle + fast single-pass or full multi-pass review.
 /// Per-commit consolidation (concerns -> findings) and LKML generation run inside this task.
 ///
 /// `repo` is the main repo root (used for SHA-based `git show`/`diff-tree` lookups, which work
@@ -423,6 +432,159 @@ async fn commit_review_inner(
         vd,
         format!("{} file(s) touched: {}", changed.len(), changed.join(", ")),
     );
+
+    if fast {
+        if dry_run {
+            if !vd.stderr {
+                eprintln!("commit {sha}: patch_chars={}", patch.len());
+            }
+            return Ok(json!({
+                "sha": sha,
+                "dry_run": true,
+                "patch_chars": patch.len(),
+                "fast": true,
+            }));
+        }
+
+        let commit_headers = git::show_commit_headers(repo, sha)?;
+        let patch_diff = git::show_patch_diff_only(repo, sha)?;
+        let patch_tag = patch_series_tag(idx + 1, num_commits);
+        let sha_short = short_sha10(sha);
+        let mut stage_tot = api::CumulativeTokenUsage::default();
+        let mut usage_steps = Vec::new();
+        let subsystem_index = prompts::load_subsystem_index(target, 120_000)?;
+        let phase0_spinner = subsystem_index
+            .as_ref()
+            .map(|_| stage_progress_line(&patch_tag, &sha_short, 0, 2, "Identify subsystem"));
+        let phase0_selected_prompts = match run_phase0_selection(
+            client,
+            model,
+            target,
+            subsystem_index.as_deref(),
+            &patch,
+            vd,
+            totals,
+            phase0_spinner.as_deref(),
+            Some(&mut stage_tot),
+            worker_ctx,
+            effective_repo,
+        )
+        .await
+        {
+            Ok(Some((guides, _raw, usage, wall))) => {
+                let stage = StageUsage {
+                    step: "subsystem",
+                    usage,
+                    wall,
+                    error: None,
+                };
+                usage_steps.push(stage.clone());
+                publisher.add_stage(stage);
+                publisher.set_phase0(Some(guides.clone()));
+                Some(guides)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                v(vd, format!("phase 0 failed (continuing without): {e:#}"));
+                let stage = StageUsage {
+                    step: "subsystem",
+                    usage: TokenUsage::default(),
+                    wall: Duration::from_millis(0),
+                    error: Some(api::short_error_reason(&e)),
+                };
+                usage_steps.push(stage.clone());
+                publisher.add_stage(stage);
+                None
+            }
+        };
+        let lore_cfg = lore::LoreConfig::from_env();
+        let lore_active = lore_cfg.enabled && lore::lei_available();
+        if lore_cfg.enabled && !lore_active {
+            v(
+                vd,
+                "upstream-followup stage: `lei` not found on $PATH; continuing with the upstream branch lookup only",
+            );
+        }
+        let followup = if lore_active || master_repo.is_some() {
+            let spinner = stage_progress_line(&patch_tag, &sha_short, 1, 2, "Upstream follow-up");
+            run_upstream_followup_stage(
+                client,
+                model,
+                repo,
+                sha,
+                &commit_headers,
+                &patch_diff,
+                &lore_cfg,
+                &spinner,
+                vd,
+                &mut stage_tot,
+                worker_ctx,
+                effective_repo,
+                totals,
+                publisher,
+                &mut usage_steps,
+                master_repo,
+                lore_active,
+            )
+            .await
+        } else {
+            None
+        };
+        let reference = prompts::build_reference_context(
+            target,
+            &changed,
+            max_context_size,
+            phase0_selected_prompts.as_deref(),
+            followup.as_ref().map(|result| result.summary.as_str()),
+        )?;
+        let prefetch_block = prefetch_context_block(effective_repo, &patch_diff, vd).await;
+        let reference_with_prefetch = if prefetch_block.is_empty() {
+            reference
+        } else {
+            format!("{reference}{prefetch_block}")
+        };
+        let user =
+            api::single_pass_user_payload(&reference_with_prefetch, &commit_headers, &patch_diff);
+        let spinner = stage_progress_line(&patch_tag, &sha_short, 2, 2, "Second-opinion check");
+        let tool_cfg = fast_review_tool_config(effective_repo, no_tools);
+        let started = Instant::now();
+        let (raw, usage) = api::chat_completion_stage_timeout(
+            client,
+            model,
+            crate::target::reviewer_system_prompt(target),
+            &user,
+            model.temperature,
+            Some(&spinner),
+            Some(&mut stage_tot),
+            vd,
+            tool_cfg.as_ref(),
+            worker_ctx,
+            effective_repo,
+        )
+        .await?;
+        totals.add_usage(usage);
+        let stage = StageUsage {
+            step: "2nd-opinion",
+            usage,
+            wall: started.elapsed(),
+            error: None,
+        };
+        publisher.add_stage(stage.clone());
+        usage_steps.push(stage);
+        publisher.set_findings(json!({ "findings": [] }));
+        let mut result = json!({
+            "sha": sha,
+            "findings": [],
+            "_fast_review": api::strip_json_fences(&raw),
+            "usage": commit_usage_json(&usage_steps),
+            "usage_steps": usage_steps_array(&usage_steps),
+            "fast": true,
+        });
+        if let Some(selected) = phase0_selected_prompts.filter(|selected| !selected.is_empty()) {
+            result["phase0_selected_prompts"] = json!(selected);
+        }
+        return Ok(result);
+    }
 
     v(
         vd,
@@ -470,11 +632,7 @@ async fn commit_review_inner(
     let commit_headers = git::show_commit_headers(repo, sha)?;
     let patch_diff = git::show_patch_diff_only(repo, sha)?;
 
-    let series_for_consolidation = if fast {
-        String::new()
-    } else {
-        series_context_for_consolidation(repo, range, idx, num_commits)
-    };
+    let series_for_consolidation = series_context_for_consolidation(repo, range, idx, num_commits);
     v(
         vd,
         format!(
@@ -486,59 +644,31 @@ async fn commit_review_inner(
     let patch_tag = patch_series_tag(idx + 1, num_commits);
     let sha_short = short_sha10(sha);
     let tool_cfg = (!no_tools).then(|| api::ToolLoopConfig::new(effective_repo));
-    let review = if fast {
-        let prefetch_block = prefetch_context_block(effective_repo, &patch_diff, vd).await;
-        let reference_with_prefetch = if prefetch_block.is_empty() {
-            reference.clone()
-        } else {
-            format!("{reference}{prefetch_block}")
-        };
-        run_single_pass(
-            client,
-            model,
-            target,
-            &reference_with_prefetch,
-            &prefetch_block,
-            &commit_headers,
-            &patch_diff,
-            vd,
-            &patch_tag,
-            &sha_short,
-            tool_cfg.as_ref(),
-            totals,
-            worker_ctx,
-            publisher,
-            effective_repo,
-            second_opinion,
-        )
-        .await?
-    } else {
-        run_two_pass(
-            client,
-            model,
-            target,
-            repo,
-            sha,
-            &patch_tag,
-            &sha_short,
-            &patch,
-            &commit_headers,
-            &patch_diff,
-            &changed,
-            max_context_size,
-            max_context_size / 2,
-            &series_for_consolidation,
-            vd,
-            tool_cfg.as_ref(),
-            totals,
-            worker_ctx,
-            publisher,
-            effective_repo,
-            second_opinion,
-            master_repo,
-        )
-        .await?
-    };
+    let review = run_two_pass(
+        client,
+        model,
+        target,
+        repo,
+        sha,
+        &patch_tag,
+        &sha_short,
+        &patch,
+        &commit_headers,
+        &patch_diff,
+        &changed,
+        max_context_size,
+        max_context_size / 2,
+        &series_for_consolidation,
+        vd,
+        tool_cfg.as_ref(),
+        totals,
+        worker_ctx,
+        publisher,
+        effective_repo,
+        second_opinion,
+        master_repo,
+    )
+    .await?;
 
     let mut findings_val = review.findings_val.clone();
     let repaired = cleanup_repair_and_validate_findings(
@@ -839,8 +969,8 @@ async fn execute_commit_task(
 }
 
 /// Drop any `location` entry on a finding whose `file` is not in the patch's changed
-/// paths. Run once at the commit level after consolidation so it covers fast-mode,
-/// two-pass-mode, and merged second-opinion findings uniformly. The finding itself is
+/// paths. Run once at the commit level after consolidation so it covers the full
+/// multi-pass review and merged second-opinion findings uniformly. The finding itself is
 /// preserved (the prose still has review signal); only the suspect anchor is dropped.
 fn drop_hallucinated_locations(findings_val: &mut Value, changed: &[String], vd: &VerboseDest) {
     let Some(arr) = findings_val
@@ -1478,7 +1608,15 @@ async fn render_commit_lkml_phase(
             .cloned()
             .or_else(|| c.get("findings").cloned())
             .unwrap_or_else(|| json!([]));
-        let arr_empty = chosen.as_array().is_some_and(|a| a.is_empty());
+        let fast_review = c
+            .get("_fast_review")
+            .and_then(|value| value.as_str())
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_owned);
+        let arr_empty = fast_review.is_none()
+            && chosen
+                .as_array()
+                .is_some_and(|findings| findings.is_empty());
         let patch = c
             .get("patch")
             .and_then(|s| s.as_str())
@@ -1507,13 +1645,22 @@ async fn render_commit_lkml_phase(
             let commit_headers =
                 git::show_commit_headers(repo.as_path(), &sha_for_task).unwrap_or_default();
             let patch_capped = api::cap_utf8(&patch, 120_000);
-            let findings_val = json!({ "findings": chosen });
-            let user = api::lkml_report_user_payload(
-                template.as_str(),
-                &findings_val,
-                &commit_headers,
-                &patch_capped,
-            );
+            let user = if let Some(review) = fast_review.as_deref() {
+                api::fast_lkml_report_user_payload(
+                    template.as_str(),
+                    review,
+                    &commit_headers,
+                    &patch_capped,
+                )
+            } else {
+                let findings_val = json!({ "findings": chosen });
+                api::lkml_report_user_payload(
+                    template.as_str(),
+                    &findings_val,
+                    &commit_headers,
+                    &patch_capped,
+                )
+            };
             let label = format!("[lkml] {}", &sha_for_task[..sha_for_task.len().min(12)]);
             let progress_line = progress_ui.as_ref().map(|ui| ui.stage_ctx(label.clone()));
             let mut stage_tot = api::CumulativeTokenUsage::default();
@@ -1538,7 +1685,7 @@ async fn render_commit_lkml_phase(
                 Err(e) => {
                     v(&vd, format!("LKML render failed for {sha_for_task}: {e:#}"));
                     (
-                        None,
+                        fast_review.clone(),
                         TokenUsage::default(),
                         Some(api::short_error_reason(&e)),
                     )
@@ -2065,7 +2212,7 @@ async fn main() -> Result<()> {
 
     // Validation is review-only and on by default; capture the opt-out flag.
     let validation_mode = match &cli.command {
-        Command::Review(a) => a.validation_mode,
+        Command::Review(a) if !a.fast => a.validation_mode,
         _ => ValidationMode::Off,
     };
     let validation_disabled = validation_mode == ValidationMode::Off;
@@ -2186,8 +2333,8 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
     // vars early gives a fast failure for bad input, and lets the header
     // preview the validation model when it differs from the main one. The
     // global validation stage can still be opted out via --validation-mode=off;
-    // the per-commit second-opinion call is always on for review runs.
-    let validation_cfg = if action.is_review() {
+    // the per-commit second-opinion call is always on for staged review runs.
+    let validation_cfg = if action.is_review() && !action.review_fast() {
         Some(
             config::resolve_validation_from_env(&model)
                 .context("resolve validation config from BORO_VALIDATION_* env")?,
@@ -2562,13 +2709,21 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
             patch_ui.clone(),
         )
         .await;
+
+        if let Some(commits) = out["commits"].as_array_mut() {
+            for commit in commits {
+                if let Some(object) = commit.as_object_mut() {
+                    object.remove("_fast_review");
+                }
+            }
+        }
     }
 
     // Run-wide quick summary. One AI call (validation model, falls back to main model) that
     // produces a short prose summary of the findings, plus locally-computed severity counts.
     // Always on for `review` regardless of validation mode (filter / off / findings); skipped
     // on dry-run, Ctrl-C, or non-review subcommands.
-    if !cli.global.dry_run && !cancelled && action.is_review() {
+    if !cli.global.dry_run && !cancelled && action.is_review() && !action.review_fast() {
         let summary_model = validation_cfg.as_ref().unwrap_or(&model);
         run_quick_summary(
             &client,
@@ -2627,138 +2782,6 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
         std::process::exit(130);
     }
     Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_single_pass(
-    client: &reqwest::Client,
-    model: &config::ResolvedModel,
-    target: config::ReviewTarget,
-    reference: &str,
-    validation_context: &str,
-    commit_headers: &str,
-    patch_diff: &str,
-    vd: &VerboseDest,
-    patch_tag: &str,
-    sha_short: &str,
-    tool_cfg: Option<&api::ToolLoopConfig<'_>>,
-    totals: &mut RunTotals,
-    worker_ctx: Option<&WorkerLineCtx>,
-    publisher: &SnapshotPublisher,
-    effective_repo: &Path,
-    second_opinion: Option<&config::ResolvedModel>,
-) -> Result<CommitReviewResult> {
-    let user = api::single_pass_user_payload(reference, commit_headers, patch_diff);
-    let sys_len = crate::target::reviewer_system_prompt(target).len();
-    let usr_len = user.len();
-    v(
-        vd,
-        format!(
-            "API: single-pass chat/completions - system={sys_len} chars, user={usr_len} chars (~{} input tokens rough)",
-            rough_token_hint(sys_len + usr_len)
-        ),
-    );
-
-    let display_total = 1 + second_opinion.is_some() as u32;
-    let spin = stage_progress_line(patch_tag, sha_short, 1, display_total, "Single-pass review");
-    let mut stage_tot = api::CumulativeTokenUsage::default();
-    let t_review = Instant::now();
-    let (parsed_review, _raw, usage, review_err, _attempts) =
-        api::chat_completion_with_retry_stage_timeout(
-            client,
-            model,
-            crate::target::reviewer_system_prompt(target),
-            &user,
-            model.temperature,
-            Some(&spin),
-            Some(&mut stage_tot),
-            vd,
-            tool_cfg,
-            worker_ctx,
-            effective_repo,
-            api::parse_findings_json,
-            api::RETRY_REMINDER_FINDINGS,
-            api::STAGE_RETRY_MAX_ATTEMPTS,
-        )
-        .await;
-    let d_review = t_review.elapsed();
-    totals.add_usage(usage);
-    let review_stage = StageUsage {
-        step: "review",
-        usage,
-        wall: d_review,
-        error: review_err.as_ref().map(api::short_error_reason),
-    };
-    let mut usage_step: Vec<StageUsage> = vec![review_stage.clone()];
-    publisher.add_stage(review_stage);
-
-    v(
-        vd,
-        format!(
-            "single-pass response: prompt_tokens={:?} tokens={:?}",
-            usage.prompt, usage.completion,
-        ),
-    );
-
-    let mut findings_val = match parsed_review {
-        Some(v) => v,
-        None => {
-            if let Some(e) = review_err {
-                v(
-                    vd,
-                    format!(
-                        "single-pass failed after retries (continuing with empty findings): {e:#}"
-                    ),
-                );
-            }
-            json!({ "findings": [] })
-        }
-    };
-    publisher.set_findings(findings_val.clone());
-
-    if let Some(cfg) = second_opinion {
-        let so_findings = run_second_opinion(
-            client,
-            cfg,
-            target,
-            reference,
-            &findings_val,
-            commit_headers,
-            patch_diff,
-            patch_tag,
-            sha_short,
-            2,
-            display_total,
-            vd,
-            worker_ctx,
-            totals,
-            publisher,
-            &mut usage_step,
-            effective_repo,
-            tool_cfg,
-        )
-        .await;
-        let added = append_findings(&mut findings_val, &so_findings);
-        if added > 0 {
-            v(
-                vd,
-                format!("second-opinion added {added} finding(s); merged into commit findings"),
-            );
-            publisher.set_findings(findings_val.clone());
-        } else {
-            v(vd, "second-opinion returned no additional findings");
-        }
-    }
-
-    let usage_json = commit_usage_json(&usage_step);
-    let steps = usage_steps_array(&usage_step);
-    Ok(CommitReviewResult {
-        findings_val,
-        usage_commit: usage_json,
-        usage_steps: Some(steps),
-        phase0_selected_prompts: None,
-        validation_context: validation_context.to_string(),
-    })
 }
 
 async fn prefetch_context_block(
@@ -3108,7 +3131,6 @@ async fn run_second_opinion(
     cfg: &config::ResolvedModel,
     target: config::ReviewTarget,
     reference: &str,
-    current_findings: &Value,
     commit_headers: &str,
     patch_diff: &str,
     patch_tag: &str,
@@ -3123,8 +3145,11 @@ async fn run_second_opinion(
     effective_repo: &Path,
     tool_cfg: Option<&api::ToolLoopConfig<'_>>,
 ) -> Value {
-    let user =
-        api::second_opinion_user_payload(reference, current_findings, commit_headers, patch_diff);
+    // Keep this pass identical to `--fast`: the reference bundle already contains
+    // the fast-review instructions and upstream follow-up, and the payload adds the
+    // commit message plus diff. The only intentional difference is the caller's
+    // model (`BORO_VALIDATION_MODEL` here, `BORO_MODEL` under `--fast`).
+    let user = api::single_pass_user_payload(reference, commit_headers, patch_diff);
     v(
         vd,
         format!(
@@ -3145,7 +3170,7 @@ async fn run_second_opinion(
     let (parsed, _raw, usage, err, _attempts) = api::chat_completion_with_retry_stage_timeout(
         client,
         cfg,
-        crate::target::second_opinion_system_prompt(target),
+        crate::target::reviewer_system_prompt(target),
         &user,
         cfg.temperature,
         Some(&spinner),
@@ -3634,7 +3659,6 @@ async fn run_two_pass(
                 cfg,
                 target,
                 &reference_with_prefetch,
-                &findings_val,
                 commit_headers,
                 patch_diff,
                 patch_tag,
@@ -3816,7 +3840,6 @@ async fn run_two_pass(
             cfg,
             target,
             &reference_with_prefetch,
-            &consolidated_findings,
             commit_headers,
             patch_diff,
             patch_tag,
@@ -4297,5 +4320,46 @@ diff --git a/foo.c b/foo.c
             .as_str()
             .unwrap()
             .contains("added source comment"));
+    }
+}
+
+#[cfg(test)]
+mod fast_cli_tests {
+    use super::*;
+
+    #[test]
+    fn fast_cli_enables_the_single_pass_mode() {
+        let cli = Cli::try_parse_from(["boro", "review", "--fast", "HEAD"]).unwrap();
+        let Command::Review(args) = cli.command else {
+            panic!("expected review command");
+        };
+        assert!(args.fast);
+        assert!(!args.no_tools);
+    }
+
+    #[test]
+    fn fast_honors_no_tools() {
+        let cli = Cli::try_parse_from(["boro", "review", "--fast", "--no-tools", "HEAD"]).unwrap();
+        let Command::Review(args) = cli.command else {
+            panic!("expected review command");
+        };
+        assert!(args.fast);
+        assert!(args.no_tools);
+        assert!(fast_review_tool_config(Path::new("."), args.no_tools).is_none());
+    }
+
+    #[test]
+    fn fast_requires_repository_verification_for_sensitive_findings() {
+        let cfg = fast_review_tool_config(Path::new("."), false).unwrap();
+        assert_eq!(cfg.verification, api::ToolVerification::SensitiveFindings);
+    }
+
+    #[test]
+    fn fast_uses_single_pass_prompt_builder() {
+        let payload = api::single_pass_user_payload("reference", "headers", "patch");
+        assert!(payload.contains("reference"));
+        assert!(payload.contains("headers"));
+        assert!(payload.contains("patch"));
+        assert!(payload.contains("Return ONLY a JSON object"));
     }
 }

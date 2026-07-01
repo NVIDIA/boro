@@ -1953,7 +1953,7 @@ async fn chat_completion_inner(
                 .await?
                 .context("read chat/completions body")?;
 
-            // One-shot fallback: if the provider rejected our cache markers
+            // Single-request fallback: if the provider rejected our cache markers
             // (e.g. Vertex/Gemini, whose caching API is incompatible with
             // inline `cache_control` when system / tools are also set on the
             // request), strip the markers from the system + initial user
@@ -3681,6 +3681,24 @@ pub const SYSTEM_CONFIG_FRAGMENT: &str = include_str!("../resources/config-fragm
 pub const SYSTEM_REVIEW_VALIDATION_FINDINGS: &str =
     include_str!("../resources/review-validation-findings.md");
 
+pub fn fast_lkml_report_user_payload(
+    inline_template: &str,
+    fast_review: &str,
+    commit_headers: &str,
+    patch_capped: &str,
+) -> String {
+    let fast_review = cap_utf8(fast_review, 120_000);
+    format!(
+        "{inline_template}\n\n# Commit (headers)\n\n```\n{commit_headers}\n```\n\n\
+# Patch (for quoting context; may be truncated)\n\n```\n{patch_capped}\n```\n\n\
+# Fast review result\n\n{fast_review}\n\n\
+Turn the fast review result into the final LKML-ready email body per the rules above. \
+Preserve every concrete finding, but do not invent new findings. When quoting the patch, copy \
+lines verbatim. Return only the email body text, with no JSON and no markdown code fence wrapping \
+the entire message."
+    )
+}
+
 /// Per-commit input to the findings-mode validation payload. The
 /// builder serializes a list of these as the model's user message.
 pub struct ValidationFindingsCommit<'a> {
@@ -3757,38 +3775,6 @@ Return ONLY a JSON object: {{\"commits\":[{{\"sha\":\"<sha12>\",\"findings\":[..
 Preserve every kept finding's \"location\" object byte-for-byte from the input. \
 When \"context_status\" reports a truncated field, do not treat absence from that field as evidence; use repository tools when the claim requires the omitted context. \
 No markdown fences, no prose outside the JSON."
-    )
-}
-
-/// User payload for the second-opinion stage. Carries the same reference bundle as Pass 1 plus
-/// commit headers, patch diff, and current pipeline findings. The stage still reviews the full
-/// patch, but sees the current findings so it can avoid duplicate output.
-pub fn second_opinion_user_payload(
-    reference: &str,
-    current_findings: &Value,
-    commit_headers: &str,
-    patch_diff: &str,
-) -> String {
-    let headers_capped = cap_utf8(commit_headers, 48_000);
-    let patch_capped = cap_utf8(patch_diff, 400_000);
-    let findings_capped = cap_utf8(
-        &serde_json::to_string_pretty(current_findings)
-            .unwrap_or_else(|_| "{\"findings\":[]}".to_string()),
-        80_000,
-    );
-    format!(
-        "{reference}\n\n\
-Current findings from the main multi-stage pipeline (these will be merged with your output before validation):\n\n```json\n{findings_capped}\n```\n\n\
-# Commit (headers)\n\n```\n{headers_capped}\n```\n\n\
-# Patch under second-opinion review (diff only)\n\n```\n{patch_capped}\n```\n\n\
-Review the whole patch independently. Emit only additional concrete findings \
-that should be merged with the current findings above and sent to validation. \
-Do not duplicate an existing finding unless your version materially improves the \
-evidence, location, or severity framing. If you find no additional concrete \
-issues, return an empty findings array. Do not report a defect that exists only \
-in the removed/old code when the reviewed patch fixes it; report only remaining, \
-incomplete, or newly introduced bugs.\n\n\
-{USER_JSON_INSTRUCTION}"
     )
 }
 
@@ -4303,6 +4289,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fast_lkml_payload_carries_review_and_patch() {
+        let payload = fast_lkml_report_user_payload(
+            "inline rules",
+            "Finding: broken locking",
+            "Subject: [PATCH] fix",
+            "diff --git a/foo.c b/foo.c",
+        );
+        assert!(payload.contains("inline rules"));
+        assert!(payload.contains("Finding: broken locking"));
+        assert!(payload.contains("Subject: [PATCH] fix"));
+        assert!(payload.contains("diff --git a/foo.c b/foo.c"));
+        assert!(payload.contains("final LKML-ready email body"));
+    }
+
+    #[test]
     fn findings_json_after_prose_in_markdown_fence() {
         let raw = "Reasoning here.\n\n```json\n{\"findings\":[]}\n```\n";
         let v = parse_findings_json(raw).unwrap();
@@ -4659,15 +4660,11 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
     }
 
     #[test]
-    fn second_opinion_prompt_rejects_fixed_old_code_only_reports() {
-        let s = second_opinion_user_payload("", &json!({"findings": []}), "subject", "diff");
-        assert!(s.contains("defect that exists only"));
-        assert!(s.contains("reviewed patch fixes it"));
-        assert_eq!(
-            s.matches("If you find no additional concrete issues")
-                .count(),
-            1
-        );
+    fn independent_review_prompt_rejects_fixed_old_code_only_reports() {
+        let reference = include_str!("../resources/fast-review.md");
+        let s = single_pass_user_payload(reference, "subject", "diff");
+        assert!(s.contains("Do not report the bug that the patch is fixing"));
+        assert!(s.contains("new/right-side diff removes"));
     }
 
     #[test]
@@ -5608,43 +5605,6 @@ index 111..222 100644
                 "directive must specify comment goes after the quoted hunk"
             );
         }
-    }
-
-    #[test]
-    fn second_opinion_user_payload_carries_prompt_frame() {
-        let current = json!({
-            "findings": [{
-                "problem": "existing issue",
-                "severity": "Low",
-                "severity_explanation": "existing explanation"
-            }]
-        });
-        let s = second_opinion_user_payload("ref-bundle", &current, "commit hdr", "diff body");
-        // The "active ingredient" - the user-approved prompt frame - must be present verbatim.
-        assert!(
-            s.contains("Current findings from the main multi-stage pipeline"),
-            "missing current-findings context"
-        );
-        assert!(
-            s.contains("evidence, location, or severity framing"),
-            "missing duplicate-avoidance evidence framing"
-        );
-        assert!(
-            s.contains("additional concrete findings"),
-            "missing additional-findings framing"
-        );
-        assert!(
-            s.contains("Review the whole patch independently"),
-            "missing full-patch review framing"
-        );
-        // Same JSON shape as regular review stages.
-        assert!(s.contains(r#""findings""#));
-        assert!(s.contains("severity"));
-        assert!(s.contains("existing issue"));
-        // Body content survives.
-        assert!(s.contains("ref-bundle"));
-        assert!(s.contains("commit hdr"));
-        assert!(s.contains("diff body"));
     }
 
     #[test]

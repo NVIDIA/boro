@@ -70,8 +70,8 @@ pub fn build_reference_context(
     let mut used = 0usize;
     let mut loaded_subsystem: HashSet<String> = HashSet::new();
 
-    let one_shot = include_str!("../resources/one-shot-review.md");
-    parts.push(format!("# boro instructions\n{one_shot}\n"));
+    let single_pass = include_str!("../resources/fast-review.md");
+    parts.push(format!("# boro instructions\n{single_pass}\n"));
     used += parts.last().map(|s| s.len()).unwrap_or(0);
 
     let local_reference = target::local_reference(target);

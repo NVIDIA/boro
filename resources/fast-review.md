@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Single-pass review (boro)
+# Fast review (boro)
 
 You are performing **one consolidated pass** that must cover the same dimensions as the multi-stage sashiko protocol, without running separate model calls per stage:
 
