@@ -68,4 +68,23 @@ mod tests {
         assert!(single_pass.contains("Every finding must carry concrete proof"));
         assert!(single_pass.contains("interleaving or lock-order cycle"));
     }
+
+    #[test]
+    fn execution_stage_tracks_validation_across_candidate_substitution() {
+        let prompt = instruction_body(3).expect("stage 3 prompt");
+        assert!(prompt.contains("Validation provenance and candidate substitution"));
+        assert!(prompt.contains("validation applies only to the object that was checked"));
+        assert!(prompt.contains("alias, sibling, parent,\n   representative, first set bit"));
+        assert!(prompt.contains("Membership in the same mask, set, domain"));
+        assert!(prompt.contains("validating object A and consuming object B"));
+
+        let portability = instruction_body(7).expect("stage 7 prompt");
+        assert!(portability.contains("architecture-overridable predicate or helper"));
+        assert!(portability.contains("representative non-stub implementations"));
+
+        let single_pass = include_str!("../resources/one-shot-review.md");
+        assert!(single_pass.contains("Execution flow and validation provenance"));
+        assert!(single_pass.contains("set/domain membership alone does not carry"));
+        assert!(single_pass.contains("architecture-overridable helpers"));
+    }
 }

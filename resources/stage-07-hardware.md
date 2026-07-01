@@ -71,6 +71,13 @@ guarded or a `!CONFIG_BAR` stub is present in this tree, report that
 
 ## Hardware and architecture audit
 
+When generic code relies on an architecture-overridable predicate or helper,
+inspect representative non-stub implementations in the checked-out tree. Do
+not infer that two predicates are equivalent merely because one architecture's
+default implementation is a constant or no-op. If the patch validates one
+object and returns a related object, verify that the returned object still
+satisfies every architecture-dependent part of the original predicate.
+
 If the patch touches driver or hardware-specific code, rigorously review
 register accesses, IRQ handling, DMA mapping/unmapping, memory barriers, and
 timing/delays. Look for missing `dma_wmb()`/`dma_rmb()` barriers, incorrect

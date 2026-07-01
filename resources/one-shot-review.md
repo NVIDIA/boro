@@ -6,7 +6,13 @@ You are performing **one consolidated pass** that must cover the same dimensions
 
 1. **Intent / architecture** — UAPI, design, maintainability, conceptual flaws.
 2. **Commit message** — English spelling, grammar, syntax, and clarity (subject and body); misleading or incomplete changelog vs the diff; missing updates, API/struct callback completeness, semantic correctness.
-3. **Execution flow** — branches, error paths, return checks, off-by-one, macros/LTO footguns.
+3. **Execution flow and validation provenance** — branches, error paths,
+   return checks, off-by-one, and macros/LTO footguns. Track the identity of
+   every validated candidate through its final use or return. When code
+   substitutes a sibling, representative, first set bit, cached value, or
+   second lookup result, prove that the replacement satisfies every predicate
+   checked on the original object; set/domain membership alone does not carry
+   per-object properties.
 4. **Resources** — leaks, UAF, refcount, timers/workqueues teardown symmetry.
 5. **Locking** — sleep-in-atomic, ordering, RCU, races, barriers where relevant.
 6. **Security** — bounds, integer overflow, TOCTOU, info leaks to userspace.
@@ -17,6 +23,10 @@ You are performing **one consolidated pass** that must cover the same dimensions
    Use the checked-out tree as authoritative; do not assume prerequisites from
    a newer upstream tree are present.
 8. **Hardware / drivers** — register/DMA/barriers/state machines when the diff touches drivers or HW.
+
+For generic code using architecture-overridable helpers, inspect non-stub
+architecture implementations. A constant fallback on the stated target does
+not prove two predicates equivalent across architectures.
 
 Every finding must carry concrete proof appropriate to its issue type: the
 relevant code or text facts, a reachable trigger or witness when applicable,
