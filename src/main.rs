@@ -3180,16 +3180,34 @@ async fn run_two_pass(
         ),
     );
     let checkpatch_summary: Option<String> = if checkpatch_active {
-        match checkpatch::run_checkpatch(effective_repo, patch, checkpatch_cfg.max_bytes).await {
-            checkpatch::CheckpatchOutcome::Findings(summary) => Some(summary),
-            checkpatch::CheckpatchOutcome::Clean => None,
-            checkpatch::CheckpatchOutcome::Failed(reason) => {
-                // Never abort the review; surface the failure so an opted-in user can tell a
-                // broken checkpatch integration apart from a genuinely clean commit.
+        // checkpatch.pl expects git format-patch / mbox input, not `git show --pretty=medium`
+        // (the `patch` param), so feed it the mbox to keep commit-log-level checks accurate.
+        match git::format_patch(repo, sha) {
+            Ok(mbox) => {
+                match checkpatch::run_checkpatch(effective_repo, &mbox, checkpatch_cfg.max_bytes)
+                    .await
+                {
+                    checkpatch::CheckpatchOutcome::Findings(summary) => Some(summary),
+                    checkpatch::CheckpatchOutcome::Clean => None,
+                    checkpatch::CheckpatchOutcome::Failed(reason) => {
+                        // Never abort the review; surface the failure so an opted-in user can tell a
+                        // broken checkpatch integration apart from a genuinely clean commit.
+                        v(
+                            vd,
+                            format!(
+                            "checkpatch stage failed for this commit (continuing without): {reason}"
+                        ),
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
                 v(
                     vd,
                     format!(
-                        "checkpatch stage failed for this commit (continuing without): {reason}"
+                        "checkpatch stage skipped for this commit (continuing without): could not \
+                         build format-patch mbox: {e:#}"
                     ),
                 );
                 None
