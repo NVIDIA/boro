@@ -8,6 +8,43 @@ permissions:
   contents: read
 
 jobs:
+  dco:
+    name: DCO sign-off
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check commit sign-offs
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+
+          missing=0
+          while IFS= read -r commit; do
+            # Use a DCO app if author identity or base-trusted enforcement is required.
+            if ! git show -s --format=%B "$commit" |
+              git interpret-trailers --parse |
+              grep -Eiq '^Signed-off-by:[[:space:]]+[^[:space:]]'; then
+              echo "::error::Commit $commit is missing a Signed-off-by trailer."
+              missing=1
+            fi
+          done < <(git rev-list --reverse "${BASE_SHA}..${HEAD_SHA}")
+
+          if ((missing)); then
+            echo "See CONTRIBUTING.md for instructions on signing commits."
+          fi
+          exit "$missing"
+
   test:
     name: Format and test
     runs-on: ubuntu-latest
