@@ -10,7 +10,13 @@ You are performing **one consolidated pass** that must cover the same dimensions
 4. **Resources** — leaks, UAF, refcount, timers/workqueues teardown symmetry.
 5. **Locking** — sleep-in-atomic, ordering, RCU, races, barriers where relevant.
 6. **Security** — bounds, integer overflow, TOCTOU, info leaks to userspace.
-7. **Hardware / drivers** — register/DMA/barriers/state machines when the diff touches drivers or HW.
+7. **Build / configuration portability** — for every newly referenced symbol,
+   compare the caller's and provider's preprocessor, Kconfig, architecture,
+   Kbuild, and built-in/module conditions. Prove that whenever the caller is
+   compiled the provider exists, checking relevant `CONFIG_*={y,m,n}` states.
+   Use the checked-out tree as authoritative; do not assume prerequisites from
+   a newer upstream tree are present.
+8. **Hardware / drivers** — register/DMA/barriers/state machines when the diff touches drivers or HW.
 
 Be skeptical of the commit message. Prefer reporting a suspected issue with clear reasoning over silence.
 

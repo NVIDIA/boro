@@ -9,7 +9,7 @@ pub fn short_description(stage: u8) -> &'static str {
         4 => "Resource management",
         5 => "Locking and concurrency",
         6 => "Security",
-        7 => "Hardware and architecture portability",
+        7 => "Build, configuration, and hardware portability",
         8 => "Comment / code consistency",
         _ => "Specialist stage",
     }
@@ -37,5 +37,25 @@ pub fn instruction_body(stage: u8) -> Option<&'static str> {
         7 => Some(include_str!("../resources/stage-07-hardware.md")),
         8 => Some(include_str!("../resources/stage-08-comment-accuracy.md")),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portability_stage_requires_negative_config_checks() {
+        let prompt = instruction_body(7).expect("stage 7 prompt");
+        assert!(prompt.contains("caller is compiled => provider exists"));
+        assert!(prompt.contains("`y`, `m`, and `n`"));
+        assert!(prompt.contains("checked-out review tree as authoritative"));
+        assert!(prompt.contains("missing prerequisite"));
+        assert!(prompt.contains("CONFIG_BAR=n"));
+
+        let single_pass = include_str!("../resources/one-shot-review.md");
+        assert!(single_pass.contains("Build / configuration portability"));
+        assert!(single_pass.contains("relevant `CONFIG_*={y,m,n}` states"));
+        assert!(single_pass.contains("checked-out tree as authoritative"));
     }
 }
