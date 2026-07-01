@@ -133,6 +133,17 @@ pub struct ToolLoopConfig<'a> {
     /// If true, `tools::openai_tools_json` advertises `edit_file` and `tools::execute_tool`
     /// will run it. All other tools remain read-only.
     pub allow_edit_file: bool,
+    /// Output-dependent verification requirement. This turns prompt guidance into a runtime
+    /// postcondition: selected findings cannot be returned before at least one repository tool
+    /// has actually executed.
+    pub verification: ToolVerification,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolVerification {
+    Optional,
+    Stage7Linkage,
+    SensitiveFindings,
 }
 
 impl<'a> ToolLoopConfig<'a> {
@@ -141,7 +152,13 @@ impl<'a> ToolLoopConfig<'a> {
             repo,
             max_tool_iterations: 24,
             allow_edit_file: false,
+            verification: ToolVerification::Optional,
         }
+    }
+
+    pub fn requiring(mut self, verification: ToolVerification) -> Self {
+        self.verification = verification;
+        self
     }
 
     /// Construct a tool-loop config with the write-capable `edit_file` tool enabled. Use only
@@ -205,6 +222,77 @@ For git_show, pass `object` to `git show`: a commit hash, `HEAD`, a tag, or `<re
 If `HEAD:path` fails, try the patch commit before the colon; if that still fails, the path may be wrong for that commit: use paths from the patch text, or parent revision syntax such as `rev^:path`. \
 Prior tool results may appear in your context as a short `<tool_result elided ...>` stub - that's an intentional token-saving step (boro replaces consumed tool results with a placeholder once you've incorporated them into a later turn). Do not retry those calls; the information you extracted from them is already in your next assistant message. \
 When finished, respond with ONLY the JSON structure the user message requires (no markdown fences, no prose outside JSON).";
+
+const REQUIRED_TOOL_REMINDER: &str = "Your proposed output contains a repository-verifiable \
+linkage, declaration, definition, export, stub, symbol, or caller claim, but you did not execute \
+any repository tool. Before returning non-empty JSON, use grep_repo/read_files/read_symbol and, \
+when relevant, inspect Kbuild/Makefile or textual .c inclusion ownership. If the claim cannot be \
+verified from tool results, return an empty concerns/findings array.";
+
+fn output_requires_tool_verification(policy: ToolVerification, raw: &str) -> bool {
+    if policy == ToolVerification::Optional {
+        return false;
+    }
+    let parsed = match policy {
+        ToolVerification::Stage7Linkage => parse_model_json_with_key(raw, "concerns"),
+        ToolVerification::SensitiveFindings => parse_model_json_with_key(raw, "commits")
+            .or_else(|_| parse_model_json_with_key(raw, "findings")),
+        ToolVerification::Optional => return false,
+    };
+    let Ok(value) = parsed else {
+        return false; // The outer schema retry owns malformed output.
+    };
+
+    match policy {
+        ToolVerification::Stage7Linkage => value
+            .get("concerns")
+            .and_then(Value::as_array)
+            .is_some_and(|concerns| {
+                concerns.iter().any(|concern| {
+                    concern.get("proof").is_some()
+                        || concern
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|ty| {
+                                let ty = ty.to_ascii_lowercase();
+                                ty.contains("link") || ty.contains("config") || ty.contains("build")
+                            })
+                })
+            }),
+        ToolVerification::SensitiveFindings => {
+            const TERMS: &[&str] = &[
+                "not declared",
+                "missing declaration",
+                "not defined",
+                "missing definition",
+                "not exported",
+                "export_symbol",
+                "unresolved symbol",
+                "linkage error",
+                "missing stub",
+                "no caller",
+            ];
+            let lower = value.to_string().to_ascii_lowercase();
+            let nonempty = value
+                .get("findings")
+                .and_then(Value::as_array)
+                .is_some_and(|a| !a.is_empty())
+                || value
+                    .get("commits")
+                    .and_then(Value::as_array)
+                    .is_some_and(|commits| {
+                        commits.iter().any(|commit| {
+                            commit
+                                .get("findings")
+                                .and_then(Value::as_array)
+                                .is_some_and(|a| !a.is_empty())
+                        })
+                    });
+            nonempty && TERMS.iter().any(|term| lower.contains(term))
+        }
+        ToolVerification::Optional => false,
+    }
+}
 
 /// Replacement text for tool-result `content` after a later assistant turn has consumed it.
 /// Kept short to maximize input-token savings on the next POST.
@@ -1653,6 +1741,7 @@ async fn chat_completion_inner(
 
     let mut usages_acc: Vec<TokenUsage> = Vec::new();
     let mut tool_iterations = 0u32;
+    let mut successful_tool_calls = 0u32;
     let mut effective_max_input_tokens = model.max_input_tokens;
     let mut context_budget_retries = 0u32;
     let mut use_stream_options = true;
@@ -1660,6 +1749,7 @@ async fn chat_completion_inner(
     // require an explicit `tools=` parameter (e.g. some Bedrock adapters) don't reject requests.
     let mut disable_tools = false;
     let mut stream_stage_header_printed = false;
+    let mut verification_reminded = false;
 
     loop {
         // Drop consumed tool-result payloads from prior iterations. Each tool result whose content
@@ -2015,6 +2105,13 @@ async fn chat_completion_inner(
                 let join_out = await_with_stage_deadline(join, stage_deadline, &label).await?;
                 // Never abort the review on tool failure: send structured error back so the model can retry.
                 let out = tool_message_content_for_join_result(&tool_name, join_out);
+                let failed = serde_json::from_str::<Value>(&out)
+                    .ok()
+                    .and_then(|value| value.get("tool_error").and_then(Value::as_bool))
+                    .unwrap_or(false);
+                if !failed {
+                    successful_tool_calls += 1;
+                }
                 if dest.active() {
                     verbose_section(
                         dest,
@@ -2035,6 +2132,24 @@ async fn chat_completion_inner(
         }
 
         let content = message_content_to_string(&message);
+        if let Some(cfg) = tool_loop {
+            if successful_tool_calls == 0
+                && output_requires_tool_verification(cfg.verification, &content)
+            {
+                if verification_reminded {
+                    anyhow::bail!(
+                        "model returned a repository-verifiable finding twice without executing a required repository tool"
+                    );
+                }
+                verification_reminded = true;
+                dest.line(
+                    "required-tool verification: rejecting non-empty unverified output and asking the model to inspect the repository",
+                );
+                messages.push(message);
+                messages.push(json!({"role": "user", "content": REQUIRED_TOOL_REMINDER}));
+                continue;
+            }
+        }
         if dest.active() {
             v_chat(
                 dest,
@@ -2947,6 +3062,62 @@ pub fn parse_concerns_strict(raw: &str) -> Result<Value> {
     v.get("concerns")
         .and_then(|x| x.as_array())
         .ok_or_else(|| anyhow!("response missing 'concerns' array"))?;
+    Ok(v)
+}
+
+/// Stage 7's structured proof is a machine contract, not merely prompt advice. Reject generic
+/// placeholders so the retry loop gets a chance to demand checked-out-tree evidence.
+pub fn parse_stage7_concerns_strict(raw: &str) -> Result<Value> {
+    let v = parse_concerns_strict(raw)?;
+    let concerns = v["concerns"].as_array().expect("validated above");
+    for concern in concerns {
+        let is_linkage = concern.get("proof").is_some()
+            || concern
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|ty| {
+                    let ty = ty.to_ascii_lowercase();
+                    ty.contains("link") || ty.contains("config") || ty.contains("build")
+                });
+        if !is_linkage {
+            continue;
+        }
+        let proof = concern
+            .get("proof")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("stage 7 configuration/linkage concern missing proof object"))?;
+        const FIELDS: &[&str] = &[
+            "failing_config",
+            "caller_condition",
+            "provider_condition",
+            "failure",
+        ];
+        if proof.len() != FIELDS.len() || FIELDS.iter().any(|field| !proof.contains_key(*field)) {
+            anyhow::bail!("stage 7 proof must contain exactly the four required fields");
+        }
+        for field in FIELDS {
+            let text = proof[*field]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow!("stage 7 proof.{field} must be a non-empty string"))?;
+            let lower = text.to_ascii_lowercase();
+            if [
+                "any config",
+                "all config",
+                "every config",
+                "any file",
+                "if another file",
+            ]
+            .iter()
+            .any(|placeholder| lower.contains(placeholder))
+            {
+                anyhow::bail!(
+                    "stage 7 proof.{field} is hypothetical/generic rather than a concrete checked-out-tree condition"
+                );
+            }
+        }
+    }
     Ok(v)
 }
 
@@ -4914,6 +5085,31 @@ index 111..222 100644
         )
         .expect("parses");
         assert_eq!(v["concerns"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stage7_parser_rejects_hypothetical_generic_proof() {
+        let raw = r#"{"concerns":[{"type":"s7:linkage","description":"d","reasoning":"r","proof":{"failing_config":"Any config where another file calls it","caller_condition":"Any file including the header","provider_condition":"not exported","failure":"unresolved symbol"}}]}"#;
+        assert!(parse_stage7_concerns_strict(raw).is_err());
+    }
+
+    #[test]
+    fn stage7_parser_accepts_concrete_four_field_proof() {
+        let raw = r#"{"concerns":[{"type":"s7:linkage","description":"d","reasoning":"r","proof":{"failing_config":"CONFIG_FOO=m with CONFIG_BAR=y","caller_condition":"foo.o is selected by obj-$(CONFIG_FOO)","provider_condition":"bar.o is built into vmlinux by obj-y","failure":"foo.ko has an undefined reference to bar"}}]}"#;
+        assert!(parse_stage7_concerns_strict(raw).is_ok());
+    }
+
+    #[test]
+    fn sensitive_finding_requires_tool_verification() {
+        let raw = r#"{"commits":[{"sha":"abc","findings":[{"problem":"helper is not exported","severity":"High"}]}]}"#;
+        assert!(output_requires_tool_verification(
+            ToolVerification::SensitiveFindings,
+            raw
+        ));
+        assert!(!output_requires_tool_verification(
+            ToolVerification::SensitiveFindings,
+            r#"{"commits":[{"sha":"abc","findings":[]}]}"#
+        ));
     }
 
     #[test]

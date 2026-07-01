@@ -99,6 +99,14 @@ that old behavior, the old bug is evidence that the patch is a fix, not a
 review finding. Only report it if the new/right-side code still has the bug,
 the fix is incomplete, or the patch introduces a different bug.
 
+### 14. Kernel symbol exports and translation units
+Do NOT infer a link failure merely because a non-static function lacks
+`EXPORT_SYMBOL*()`. Exports are needed for references from loadable modules,
+not ordinary built-in objects linked into vmlinux. Also check whether the `.c`
+files are textually included by an aggregator source file, in which case they
+are one translation unit. Verify the declaration, actual caller, provider,
+Kbuild ownership, and module boundary with repository tools before reporting.
+
 ## How to write a concern that survives consolidation
 
 - Name the function, file, and line/region from the diff.

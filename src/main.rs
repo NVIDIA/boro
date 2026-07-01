@@ -931,7 +931,52 @@ fn drop_unanchored_locations(
                 }
             }
         }
+
+        let identifiers = obj
+            .get("problem")
+            .and_then(Value::as_str)
+            .map(backticked_c_identifiers)
+            .unwrap_or_default();
+        if !identifiers.is_empty() {
+            let end = obj
+                .get("location")
+                .and_then(|l| l.get("line_end"))
+                .and_then(Value::as_u64)
+                .unwrap_or(line);
+            if !idx.range_contains_identifier(file, line, end, side, &identifiers) {
+                v(
+                    vd,
+                    format!(
+                        "dropping semantically mismatched location for finding (anchor does not contain any named identifier: {})",
+                        identifiers.join(", ")
+                    ),
+                );
+                obj.remove("location");
+            }
+        }
     }
+}
+
+fn backticked_c_identifiers(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('`') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('`') else {
+            break;
+        };
+        let token = rest[..end].trim().trim_end_matches("()");
+        if !token.is_empty()
+            && token.chars().enumerate().all(|(i, c)| {
+                c == '_' || c.is_ascii_alphanumeric() && (i > 0 || !c.is_ascii_digit())
+            })
+            && !out.iter().any(|existing| existing == token)
+        {
+            out.push(token.to_string());
+        }
+        rest = &rest[end + 1..];
+    }
+    out
 }
 
 /// Merge per-commit metadata (subject/author/date/parents, raw diff, changed paths) onto the
@@ -1140,7 +1185,9 @@ async fn run_findings_validation(
     let progress_line = progress_ui.map(|ui| ui.stage_ctx(label.clone()));
     let mut stage_tot = api::CumulativeTokenUsage::default();
     let t_val = Instant::now();
-    let tool_cfg = (!no_tools).then(|| api::ToolLoopConfig::new(repo));
+    let tool_cfg = (!no_tools).then(|| {
+        api::ToolLoopConfig::new(repo).requiring(api::ToolVerification::SensitiveFindings)
+    });
     let (parsed_opt, _last_raw, summed, last_err, _attempts) =
         api::chat_completion_with_retry_stage_timeout(
             client,
@@ -2083,7 +2130,7 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
                 (CommitAction::Review { .. }, config::Backend::OpenAi) if action.review_no_tools() =>
                     "disabled (--no-tools)",
                 (CommitAction::Review { .. }, config::Backend::OpenAi) =>
-                    "enabled (read_files, git_blame, git_diff, git_show - broad pass, specialists, consolidation, LKML; not phase 0)",
+                    "enabled (grep_repo, read_files, read_symbol, git history/diff/show, run_git, rg - review, specialists, validation, LKML; not phase 0 or consolidation)",
             }
         ),
     );
@@ -3380,6 +3427,10 @@ async fn run_two_pass(
             stages::short_description(st),
         );
         let t_st = Instant::now();
+        let required_tool_cfg = (st == 7 && tool_cfg.is_some()).then(|| {
+            api::ToolLoopConfig::new(effective_repo).requiring(api::ToolVerification::Stage7Linkage)
+        });
+        let stage_tool_cfg = required_tool_cfg.as_ref().or(tool_cfg);
         let (parsed_stage, _raw_s, u_s, stage_error, _attempts) =
             api::chat_completion_with_retry_stage_timeout(
                 client,
@@ -3390,10 +3441,16 @@ async fn run_two_pass(
                 Some(&spinner),
                 Some(&mut stage_tot),
                 vd,
-                tool_cfg,
+                stage_tool_cfg,
                 worker_ctx,
                 effective_repo,
-                api::parse_concerns_strict,
+                |raw| {
+                    if st == 7 {
+                        api::parse_stage7_concerns_strict(raw)
+                    } else {
+                        api::parse_concerns_strict(raw)
+                    }
+                },
                 api::RETRY_REMINDER_CONCERNS,
                 api::STAGE_RETRY_MAX_ATTEMPTS,
             )
@@ -3987,6 +4044,34 @@ diff --git a/foo.c b/foo.c
         assert!(arr[0].get("location").is_none());
         // Finding itself survives.
         assert_eq!(arr[0]["problem"], "x");
+    }
+
+    #[test]
+    fn drops_location_that_does_not_contain_named_symbol() {
+        let diff = "--- a/foo.c\n+++ b/foo.c\n@@ -1,3 +1,4 @@\n int unrelated;\n+int still_unrelated;\n+void target_helper(void);\n int tail;\n";
+        let idx = diff_index::DiffIndex::from_unified_diff(diff);
+        let mut findings = json!({"findings":[{
+            "problem":"`target_helper()` has broken linkage",
+            "severity":"High",
+            "severity_explanation":"x",
+            "location":{"file":"foo.c","line":2,"side":"RIGHT"}
+        }]});
+        drop_unanchored_locations(&mut findings, &idx, &vd());
+        assert!(findings["findings"][0].get("location").is_none());
+    }
+
+    #[test]
+    fn keeps_location_containing_named_symbol() {
+        let diff = "--- a/foo.c\n+++ b/foo.c\n@@ -1,1 +1,1 @@\n+void target_helper(void);\n";
+        let idx = diff_index::DiffIndex::from_unified_diff(diff);
+        let mut findings = json!({"findings":[{
+            "problem":"`target_helper()` has broken linkage",
+            "severity":"High",
+            "severity_explanation":"x",
+            "location":{"file":"foo.c","line":1,"side":"RIGHT"}
+        }]});
+        drop_unanchored_locations(&mut findings, &idx, &vd());
+        assert!(findings["findings"][0].get("location").is_some());
     }
 
     #[test]

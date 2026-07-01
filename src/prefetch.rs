@@ -96,6 +96,7 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
     let mut symbols_to_lookup = HashSet::new();
     let mut already_extracted = HashSet::new();
     let mut called_functions = HashSet::new();
+    let mut ownership_paths: HashSet<PathBuf> = file_ranges.keys().map(PathBuf::from).collect();
 
     for (file, ranges) in &file_ranges {
         if !file.ends_with(".c") && !file.ends_with(".h") {
@@ -242,12 +243,25 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
             let mut hits = priority;
             hits.extend(general);
             if let Some((path, start, end)) =
+                best_declaration_range(&sym, &hits, worktree_path, &caller_dirs)
+            {
+                if let Ok(rel) = path.strip_prefix(worktree_path) {
+                    ownership_paths.insert(rel.to_path_buf());
+                }
+                add_range(&mut range_map, path, start, end);
+            }
+            if let Some((path, start, end)) =
                 best_definition_range(&sym, &hits, worktree_path, &caller_dirs).await
             {
+                if let Ok(rel) = path.strip_prefix(worktree_path) {
+                    ownership_paths.insert(rel.to_path_buf());
+                }
                 add_range(&mut range_map, path, start, end);
             }
         }
     }
+
+    add_build_ownership_context(worktree_path, &ownership_paths, &mut range_map);
 
     render_range_map(&range_map, worktree_path, &file_ranges).await
 }
@@ -535,6 +549,110 @@ async fn best_definition_range(
         }
     }
     best.map(|(_, p, s, e)| (p, s, e))
+}
+
+fn best_declaration_range(
+    sym: &str,
+    hits: &[(PathBuf, u64)],
+    worktree_path: &Path,
+    caller_dirs: &HashSet<&str>,
+) -> Option<(PathBuf, usize, usize)> {
+    let mut seen = HashSet::new();
+    let mut best: Option<(i32, PathBuf, usize, usize)> = None;
+    for (path, _) in hits {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Some((start, end)) = function_declaration_range(&content, sym) else {
+            continue;
+        };
+        let rel = path
+            .strip_prefix(worktree_path)
+            .unwrap_or(path)
+            .to_string_lossy();
+        let score = 60 + proximity_score(&rel, false, caller_dirs);
+        if best.as_ref().is_none_or(|(old, _, _, _)| score > *old) {
+            best = Some((score, path.clone(), start, end));
+        }
+    }
+    best.map(|(_, path, start, end)| (path, start, end))
+}
+
+fn function_declaration_range(content: &str, sym: &str) -> Option<(usize, usize)> {
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_c::LANGUAGE.into()).ok()?;
+    let tree = parser.parse(content, None)?;
+    let source = content.as_bytes();
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    for node in root.children(&mut cursor) {
+        if node.kind() == "declaration" && function_name(node, source).as_deref() == Some(sym) {
+            return Some((node.start_position().row, node.end_position().row));
+        }
+    }
+    None
+}
+
+/// Include textual source aggregation and nearby Kbuild ownership lines. Linux scheduler and
+/// other core directories commonly build several apparent `.c` files as one translation unit;
+/// omitting this evidence encourages bogus `EXPORT_SYMBOL()` findings.
+fn add_build_ownership_context(
+    worktree_path: &Path,
+    paths: &HashSet<PathBuf>,
+    range_map: &mut LineRangeMap,
+) {
+    let mut needles = HashSet::new();
+    for path in paths {
+        let parts: Vec<_> = path.components().collect();
+        // A basename such as internal.h or core.c is far too broad and can flood the context.
+        // Require at least a directory + basename (e.g. ext/ext.c).
+        for keep in 2..=parts.len().min(3) {
+            let suffix: PathBuf = parts[parts.len() - keep..].iter().collect();
+            let text = suffix.to_string_lossy();
+            if text.ends_with(".c") || text.ends_with(".h") {
+                needles.insert(text.replace('\\', "/"));
+            }
+        }
+    }
+    if needles.is_empty() {
+        return;
+    }
+
+    for entry in WalkBuilder::new(worktree_path)
+        .hidden(false)
+        .ignore(true)
+        .git_ignore(true)
+        .build()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_some_and(|ty| ty.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let eligible = path.extension().and_then(|e| e.to_str()) == Some("c")
+            || name == "Makefile"
+            || name == "Kbuild";
+        if !eligible {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        for (line_no, line) in content.lines().enumerate() {
+            if needles.iter().any(|needle| line.contains(needle)) {
+                add_range(
+                    range_map,
+                    path.to_path_buf(),
+                    line_no.saturating_sub(3),
+                    (line_no + 3).min(content.lines().count().saturating_sub(1)),
+                );
+            }
+        }
+    }
 }
 
 fn proximity_score(def_path: &str, is_static: bool, caller_dirs: &HashSet<&str>) -> i32 {
@@ -870,5 +988,44 @@ int main(void)
 ";
         let funcs = extract_called_functions(source, &[(2, 2)]);
         assert!(funcs.contains("helper"));
+    }
+
+    #[test]
+    fn finds_function_prototype_declaration() {
+        let source =
+            "void before(void);\nvoid schedule_dsq_reenq(int value,\n\t\t       int flags);\n";
+        assert_eq!(
+            function_declaration_range(source, "schedule_dsq_reenq"),
+            Some((1, 2))
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetch_includes_prototype_definition_and_textual_build_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ext = tmp.path().join("kernel/sched/ext");
+        fs::create_dir_all(&ext).unwrap();
+        fs::write(
+            ext.join("internal.h"),
+            "void schedule_dsq_reenq(int value);\n\nstatic inline void local(void)\n{\n\tschedule_dsq_reenq(1);\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            ext.join("ext.c"),
+            "void schedule_dsq_reenq(int value)\n{\n\t(void)value;\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("kernel/sched/build_policy.c"),
+            "#include \"ext/internal.h\"\n#include \"ext/ext.c\"\n",
+        )
+        .unwrap();
+        let diff = "--- a/kernel/sched/ext/internal.h\n+++ b/kernel/sched/ext/internal.h\n@@ -3,0 +3,4 @@\n+static inline void local(void)\n+{\n+\tschedule_dsq_reenq(1);\n+}\n";
+
+        let context = prefetch_context(tmp.path(), diff).await.unwrap();
+
+        assert!(context.contains("void schedule_dsq_reenq(int value);"));
+        assert!(context.contains("void schedule_dsq_reenq(int value)\n{"));
+        assert!(context.contains("#include \"ext/ext.c\""));
     }
 }
