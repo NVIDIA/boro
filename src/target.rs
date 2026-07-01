@@ -18,7 +18,6 @@ pub trait TargetSpec: Sync {
     fn reviewer_system_prompt(&self) -> &'static str;
     fn phase0_system_prompt(&self) -> &'static str;
     fn lkml_system_prompt(&self) -> &'static str;
-    fn second_opinion_system_prompt(&self) -> &'static str;
     fn quick_summary_system_prompt(&self) -> &'static str;
 }
 
@@ -85,10 +84,6 @@ pub fn lkml_system_prompt(target: ReviewTarget) -> &'static str {
     spec(target).lkml_system_prompt()
 }
 
-pub fn second_opinion_system_prompt(target: ReviewTarget) -> &'static str {
-    spec(target).second_opinion_system_prompt()
-}
-
 pub fn quick_summary_system_prompt(target: ReviewTarget) -> &'static str {
     spec(target).quick_summary_system_prompt()
 }
@@ -105,12 +100,6 @@ mod tests {
         assert!(phase0_system_prompt(ReviewTarget::Qemu).contains("QEMU"));
         assert!(lkml_system_prompt(ReviewTarget::Kernel).contains("LKML"));
         assert!(lkml_system_prompt(ReviewTarget::Qemu).contains("qemu-devel"));
-        assert!(second_opinion_system_prompt(ReviewTarget::Kernel).contains("kernel reviewer"));
-        assert!(second_opinion_system_prompt(ReviewTarget::Qemu).contains("QEMU reviewer"));
-        assert!(second_opinion_system_prompt(ReviewTarget::Kernel)
-            .contains("bug that the patch is fixing"));
-        assert!(second_opinion_system_prompt(ReviewTarget::Qemu)
-            .contains("bug that the patch is fixing"));
         assert!(quick_summary_system_prompt(ReviewTarget::Kernel).contains("Linux kernel"));
         assert!(quick_summary_system_prompt(ReviewTarget::Qemu).contains("QEMU"));
     }

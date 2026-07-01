@@ -58,7 +58,7 @@ mod tests {
         assert!(prompt.contains("structured `proof` object"));
         assert!(prompt.contains("not guaranteed"));
 
-        let single_pass = include_str!("../resources/one-shot-review.md");
+        let single_pass = include_str!("../resources/fast-review.md");
         assert!(single_pass.contains("Build / configuration portability"));
         assert!(single_pass.contains("relevant `CONFIG_*={y,m,n}` states"));
         assert!(single_pass.contains("checked-out tree as authoritative"));
@@ -82,7 +82,7 @@ mod tests {
         assert!(portability.contains("architecture-overridable predicate or helper"));
         assert!(portability.contains("representative non-stub implementations"));
 
-        let single_pass = include_str!("../resources/one-shot-review.md");
+        let single_pass = include_str!("../resources/fast-review.md");
         assert!(single_pass.contains("Execution flow and validation provenance"));
         assert!(single_pass.contains("set/domain membership alone does not carry"));
         assert!(single_pass.contains("architecture-overridable helpers"));
