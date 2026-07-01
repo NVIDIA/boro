@@ -13,6 +13,8 @@ The user message gives you a JSON object of this exact shape:
     {
       "sha": "<sha12>",
       "subject": "<one-line commit subject>",
+      "commit_message": "<full commit headers and message body>",
+      "reference_context": "<prefetched source context, may be empty or truncated>",
       "diff": "<unified diff for the commit, may be truncated>",
       "findings": [
         {
@@ -36,6 +38,11 @@ The user message gives you a JSON object of this exact shape:
 }
 ```
 
+For a finding about the commit message itself, validate it against the full
+`commit_message`, not merely the one-line `subject` or the diff. Use
+`reference_context` to check claims about surrounding definitions, callers,
+invariants, and symbols that do not appear in the diff.
+
 For each finding, decide one of:
 
 - **KEEP** it: emit the finding **verbatim**. In particular, copy the
@@ -47,9 +54,10 @@ For each finding, decide one of:
   summaries. You MAY lower `severity` if the original was overstated;
   you MUST NOT raise `severity` (that would imply new evidence you do
   not have). Preserve `location` byte-for-byte.
-- **DROP** it, if the diff makes clear it is a false positive. Common
+- **DROP** it, if the commit message, reference context, or diff makes
+  clear it is a false positive. Common
   cases: the finding misreads the patch, ignores a lock or invariant
-  visible in the diff, flags a "race" that the code already serializes,
+  visible in the supplied context, flags a "race" that the code already serializes,
   demands handling for a path the function does not reach, or
   speculates about a caller without evidence. Also DROP a finding when
   its substance is only that the old/removed code was buggy and the

@@ -115,6 +115,7 @@ struct CommitReviewResult {
     usage_commit: Value,
     usage_steps: Option<Value>,
     phase0_selected_prompts: Option<Vec<String>>,
+    validation_context: String,
 }
 
 struct UpstreamFollowupResult {
@@ -497,6 +498,7 @@ async fn commit_review_inner(
             model,
             target,
             &reference_with_prefetch,
+            &prefetch_block,
             &commit_headers,
             &patch_diff,
             vd,
@@ -548,6 +550,10 @@ async fn commit_review_inner(
         "findings": findings_val.get("findings").cloned().unwrap_or(json!([])),
         "usage": review.usage_commit,
     });
+    if !review.validation_context.is_empty() {
+        // Internal hand-off to the global validation stage. Removed before output.
+        commit_obj["_validation_context"] = json!(review.validation_context);
+    }
     if let Some(st) = &review.usage_steps {
         commit_obj["usage_steps"] = st.clone();
     }
@@ -1060,7 +1066,7 @@ async fn run_findings_validation(
     // Snapshot the commits we need to send. We only validate commits that
     // have at least one finding; commits with empty findings are passed
     // through unchanged.
-    let mut payload_owned: Vec<(String, String, String, Value)> = Vec::new();
+    let mut payload_owned: Vec<(String, String, String, String, String, Value)> = Vec::new();
     if let Some(commits) = out["commits"].as_array() {
         for c in commits {
             let findings = match c.get("findings").and_then(|f| f.as_array()) {
@@ -1082,93 +1088,170 @@ async fn run_findings_validation(
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
-            payload_owned.push((sha12, subject, diff, Value::Array(findings.clone())));
+            let commit_message = git::show_commit_headers(repo, sha_full).unwrap_or_default();
+            let reference_context = c
+                .get("_validation_context")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            payload_owned.push((
+                sha12,
+                subject,
+                commit_message,
+                reference_context,
+                diff,
+                Value::Array(findings.clone()),
+            ));
         }
     }
     if payload_owned.is_empty() {
         v(vdest, "validation skipped (no findings to validate)");
         return;
     }
-    let payload_refs: Vec<api::ValidationFindingsCommit<'_>> = payload_owned
-        .iter()
-        .map(
-            |(sha, subject, diff, findings)| api::ValidationFindingsCommit {
-                sha: sha.as_str(),
-                subject: subject.as_str(),
-                diff: diff.as_str(),
-                findings,
-            },
-        )
-        .collect();
-    let user_msg = api::validation_findings_user_payload(&payload_refs);
-    log_validation_header(vdest, main_model, validation_cfg, mode);
-    let label = format!("[validation:{}] Validating findings", mode.label());
-    let progress_line = progress_ui.map(|ui| ui.stage_ctx(label.clone()));
-    let mut stage_tot = api::CumulativeTokenUsage::default();
-    let t_val = Instant::now();
-    let tool_cfg = (!no_tools).then(|| api::ToolLoopConfig::new(repo));
-    let (parsed_opt, _last_raw, summed, last_err, _attempts) =
-        api::chat_completion_with_retry_stage_timeout(
-            client,
-            validation_cfg,
-            api::SYSTEM_REVIEW_VALIDATION_FINDINGS,
-            &user_msg,
-            validation_cfg.temperature,
-            Some(&label),
-            Some(&mut stage_tot),
-            vdest,
-            tool_cfg.as_ref(),
-            progress_line.as_ref(),
-            repo,
-            api::parse_validation_findings,
-            api::RETRY_REMINDER_FINDINGS_VALIDATION,
-            api::STAGE_RETRY_MAX_ATTEMPTS,
-        )
-        .await;
-    if let Some(w) = progress_line.as_ref() {
-        w.finish_commit_line();
-    }
-    totals.add_usage(summed);
-    let wall_ms = t_val.elapsed().as_millis() as u64;
-    let validation_error = last_err.as_ref().map(api::short_error_reason);
-    append_validation_usage_step(
-        out,
-        &validation_cfg.model_id,
-        usage_step_json("findings", summed, wall_ms, validation_error),
-    );
-    let Some(parsed) = parsed_opt else {
-        let msg = last_err
-            .map(|e| format!("{e:#}"))
-            .unwrap_or_else(|| "no response".to_string());
-        v(
-            vdest,
-            format!("validation stage failed (continuing with raw findings): {msg}"),
-        );
-        return;
+    let refs_for = |indices: &[usize]| -> Vec<api::ValidationFindingsCommit<'_>> {
+        indices
+            .iter()
+            .map(|&idx| {
+                let (sha, subject, commit_message, reference_context, diff, findings) =
+                    &payload_owned[idx];
+                api::ValidationFindingsCommit {
+                    sha: sha.as_str(),
+                    subject: subject.as_str(),
+                    commit_message: commit_message.as_str(),
+                    reference_context: reference_context.as_str(),
+                    diff: diff.as_str(),
+                    findings,
+                }
+            })
+            .collect()
     };
+    let user_budget = api::validation_findings_user_budget(validation_cfg.max_input_tokens);
+    let all_indices: Vec<usize> = (0..payload_owned.len()).collect();
+    let all_payload_refs = refs_for(&all_indices);
+    let batches = api::validation_findings_batches(&all_payload_refs, user_budget);
+
+    log_validation_header(vdest, main_model, validation_cfg, mode);
     v(
         vdest,
         format!(
-            "validation done in {:.1?} ({} prompt + {} completion tokens)",
-            t_val.elapsed(),
-            summed.prompt.unwrap_or(0),
-            summed.completion.unwrap_or(0)
+            "validation: {} commit(s) split into {} structured batch(es), user-message budget {} bytes",
+            payload_owned.len(),
+            batches.len(),
+            user_budget
         ),
     );
-
-    // Index validator output by short sha so we can attach per-commit.
+    let mut stage_tot = api::CumulativeTokenUsage::default();
+    let tool_cfg = (!no_tools).then(|| api::ToolLoopConfig::new(repo));
     let mut by_sha: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
-    if let Some(arr) = parsed.get("commits").and_then(|c| c.as_array()) {
-        for entry in arr {
-            let Some(sha) = entry.get("sha").and_then(|s| s.as_str()) else {
-                continue;
+    let mut successful_batches = 0usize;
+    for (batch_idx, indices) in batches.iter().enumerate() {
+        let batch_num = batch_idx + 1;
+        let payload_refs = refs_for(indices);
+        let user_msg =
+            match api::validation_findings_user_payload_bounded(&payload_refs, user_budget) {
+                Ok(user_msg) => user_msg,
+                Err(e) => {
+                    let error = format!("{e:#}");
+                    v(
+                        vdest,
+                        format!(
+                            "validation batch {batch_num}/{} skipped: {error}",
+                            batches.len()
+                        ),
+                    );
+                    append_validation_usage_step(
+                        out,
+                        &validation_cfg.model_id,
+                        usage_step_json(
+                            format!("findings-{batch_num}/{}", batches.len()),
+                            TokenUsage::default(),
+                            0,
+                            Some(error),
+                        ),
+                    );
+                    continue;
+                }
             };
-            let findings = entry
-                .get("findings")
-                .cloned()
-                .unwrap_or_else(|| Value::Array(Vec::new()));
-            by_sha.insert(sha.to_string(), findings);
+        let label = format!(
+            "[validation:{}] Validating findings batch {batch_num}/{}",
+            mode.label(),
+            batches.len()
+        );
+        let progress_line = progress_ui.map(|ui| ui.stage_ctx(label.clone()));
+        let t_val = Instant::now();
+        let (parsed_opt, _last_raw, summed, last_err, _attempts) =
+            api::chat_completion_with_retry_stage_timeout_preserve_input(
+                client,
+                validation_cfg,
+                api::SYSTEM_REVIEW_VALIDATION_FINDINGS,
+                &user_msg,
+                validation_cfg.temperature,
+                Some(&label),
+                Some(&mut stage_tot),
+                vdest,
+                tool_cfg.as_ref(),
+                progress_line.as_ref(),
+                repo,
+                api::parse_validation_findings,
+                api::RETRY_REMINDER_FINDINGS_VALIDATION,
+                api::STAGE_RETRY_MAX_ATTEMPTS,
+            )
+            .await;
+        if let Some(w) = progress_line.as_ref() {
+            w.finish_commit_line();
         }
+        totals.add_usage(summed);
+        let wall_ms = t_val.elapsed().as_millis() as u64;
+        let validation_error = last_err.as_ref().map(api::short_error_reason);
+        append_validation_usage_step(
+            out,
+            &validation_cfg.model_id,
+            usage_step_json(
+                format!("findings-{batch_num}/{}", batches.len()),
+                summed,
+                wall_ms,
+                validation_error,
+            ),
+        );
+        let Some(parsed) = parsed_opt else {
+            let msg = last_err
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_else(|| "no response".to_string());
+            v(
+                vdest,
+                format!(
+                    "validation batch {batch_num}/{} failed (continuing with raw findings for that batch): {msg}",
+                    batches.len()
+                ),
+            );
+            continue;
+        };
+        successful_batches += 1;
+        v(
+            vdest,
+            format!(
+                "validation batch {batch_num}/{} done in {:.1?} ({} prompt + {} completion tokens)",
+                batches.len(),
+                t_val.elapsed(),
+                summed.prompt.unwrap_or(0),
+                summed.completion.unwrap_or(0)
+            ),
+        );
+        if let Some(arr) = parsed.get("commits").and_then(|c| c.as_array()) {
+            for entry in arr {
+                let Some(sha) = entry.get("sha").and_then(|s| s.as_str()) else {
+                    continue;
+                };
+                let findings = entry
+                    .get("findings")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new()));
+                by_sha.insert(sha.to_string(), findings);
+            }
+        }
+    }
+    if successful_batches == 0 {
+        return;
     }
 
     if let Some(commits) = out["commits"].as_array_mut() {
@@ -2315,6 +2398,15 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
         .await;
     }
 
+    // The prefetched source block is an internal validation hand-off, not report data.
+    if let Some(commits) = out["commits"].as_array_mut() {
+        for commit in commits {
+            if let Some(obj) = commit.as_object_mut() {
+                obj.remove("_validation_context");
+            }
+        }
+    }
+
     // Phase 3: render per-commit LKML from validated_findings (or raw
     // findings when validation was off / failed). Skipped in findings mode
     // (structured findings replace the narrative) and on dry-run / Ctrl-C.
@@ -2422,6 +2514,7 @@ async fn run_single_pass(
     model: &config::ResolvedModel,
     target: config::ReviewTarget,
     reference: &str,
+    validation_context: &str,
     commit_headers: &str,
     patch_diff: &str,
     vd: &VerboseDest,
@@ -2543,6 +2636,7 @@ async fn run_single_pass(
         usage_commit: usage_json,
         usage_steps: Some(steps),
         phase0_selected_prompts: None,
+        validation_context: validation_context.to_string(),
     })
 }
 
@@ -3429,6 +3523,7 @@ async fn run_two_pass(
             usage_commit: usage_json,
             usage_steps: Some(steps),
             phase0_selected_prompts,
+            validation_context: prefetch_block.clone(),
         });
     }
 
@@ -3610,6 +3705,7 @@ async fn run_two_pass(
         usage_commit: usage_json,
         usage_steps: Some(steps),
         phase0_selected_prompts,
+        validation_context: prefetch_block,
     })
 }
 

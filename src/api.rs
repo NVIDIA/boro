@@ -1106,6 +1106,14 @@ struct InputBudgetTrim {
     max_input_tokens: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputTruncationPolicy {
+    /// Prose-oriented requests may be shortened in the middle as a last resort.
+    Middle,
+    /// Structured requests must be fitted by their builder so serialization boundaries survive.
+    Reject,
+}
+
 fn request_json_len(body: &Value) -> usize {
     serde_json::to_vec(body)
         .map(|v| v.len())
@@ -1339,6 +1347,37 @@ fn enforce_request_input_budget(
     }))
 }
 
+fn enforce_request_input_budget_preserving_initial_user(
+    messages: &mut [Value],
+    body: &mut Value,
+    max_input_tokens: u32,
+) -> Result<Option<InputBudgetTrim>> {
+    let target_tokens = input_budget_target_tokens(max_input_tokens);
+    let before = estimate_request_input_tokens(body);
+    if before <= target_tokens {
+        return Ok(None);
+    }
+
+    // Tool conversations can grow after the valid structured request has already been sent.
+    // Reduce those transient results, but never cut the initial JSON-bearing user message.
+    let changed = shrink_tool_messages_to_fit(messages, body, target_tokens);
+    let after = estimate_request_input_tokens(body);
+    if after > target_tokens {
+        anyhow::bail!(
+            "structured request exceeds configured input budget: estimated {after} input tokens after trimming tool results, target {target_tokens} (max_input_tokens={max_input_tokens}); split the request or reduce its structured context"
+        );
+    }
+    if !changed {
+        return Ok(None);
+    }
+    Ok(Some(InputBudgetTrim {
+        before_estimate: before,
+        after_estimate: after,
+        target_tokens,
+        max_input_tokens,
+    }))
+}
+
 fn parse_number_after(haystack: &str, needle: &str) -> Option<u32> {
     let lower = haystack.to_ascii_lowercase();
     let start = lower.find(needle)? + needle.len();
@@ -1427,6 +1466,7 @@ pub async fn chat_completion(
         worker_line,
         effective_repo,
         None,
+        InputTruncationPolicy::Middle,
     )
     .await
 }
@@ -1458,6 +1498,7 @@ pub async fn chat_completion_stage_timeout(
         worker_line,
         effective_repo,
         Some(StageDeadline::new(model_timeout::review_stage_timeout())),
+        InputTruncationPolicy::Middle,
     )
     .await
 }
@@ -1476,6 +1517,7 @@ async fn chat_completion_inner(
     worker_line: Option<&WorkerLineCtx>,
     effective_repo: &Path,
     stage_deadline: Option<StageDeadline>,
+    input_truncation: InputTruncationPolicy,
 ) -> Result<(String, TokenUsage)> {
     let label = spinner_label
         .map(String::from)
@@ -1723,9 +1765,19 @@ async fn chat_completion_inner(
 
         let mut body = Value::Object(body);
         if let Some(max_input_tokens) = effective_max_input_tokens {
-            if let Some(trim) =
-                enforce_request_input_budget(&mut messages, &mut body, max_input_tokens)?
-            {
+            let trim = match input_truncation {
+                InputTruncationPolicy::Middle => {
+                    enforce_request_input_budget(&mut messages, &mut body, max_input_tokens)?
+                }
+                InputTruncationPolicy::Reject => {
+                    enforce_request_input_budget_preserving_initial_user(
+                        &mut messages,
+                        &mut body,
+                        max_input_tokens,
+                    )?
+                }
+            };
+            if let Some(trim) = trim {
                 v_chat(
                     dest,
                     format!(
@@ -2106,6 +2158,7 @@ where
         schema_reminder,
         max_attempts,
         None,
+        InputTruncationPolicy::Middle,
     )
     .await
 }
@@ -2146,6 +2199,50 @@ where
         schema_reminder,
         max_attempts,
         Some(StageDeadline::new(model_timeout::review_stage_timeout())),
+        InputTruncationPolicy::Middle,
+    )
+    .await
+}
+
+/// Retry a structured stage without allowing the generic request fitter to cut through its
+/// serialization. Callers must batch or shrink the structured fields before invoking this.
+#[allow(clippy::too_many_arguments)]
+pub async fn chat_completion_with_retry_stage_timeout_preserve_input<F, T>(
+    client: &reqwest::Client,
+    model: &ResolvedModel,
+    system: &str,
+    user: &str,
+    temperature: Option<f32>,
+    spinner_label: Option<&str>,
+    cumulative: Option<&mut CumulativeTokenUsage>,
+    dest: &VerboseDest,
+    tool_loop: Option<&ToolLoopConfig<'_>>,
+    worker_line: Option<&WorkerLineCtx>,
+    effective_repo: &Path,
+    parse_fn: F,
+    schema_reminder: &str,
+    max_attempts: u32,
+) -> (Option<T>, String, TokenUsage, Option<anyhow::Error>, u32)
+where
+    F: Fn(&str) -> Result<T>,
+{
+    chat_completion_with_retry_inner(
+        client,
+        model,
+        system,
+        user,
+        temperature,
+        spinner_label,
+        cumulative,
+        dest,
+        tool_loop,
+        worker_line,
+        effective_repo,
+        parse_fn,
+        schema_reminder,
+        max_attempts,
+        Some(StageDeadline::new(model_timeout::review_stage_timeout())),
+        InputTruncationPolicy::Reject,
     )
     .await
 }
@@ -2167,6 +2264,7 @@ async fn chat_completion_with_retry_inner<F, T>(
     schema_reminder: &str,
     max_attempts: u32,
     stage_deadline: Option<StageDeadline>,
+    input_truncation: InputTruncationPolicy,
 ) -> (Option<T>, String, TokenUsage, Option<anyhow::Error>, u32)
 where
     F: Fn(&str) -> Result<T>,
@@ -2204,6 +2302,7 @@ where
             worker_line,
             effective_repo,
             stage_deadline,
+            input_truncation,
         )
         .await;
         match result {
@@ -3061,24 +3160,67 @@ pub const SYSTEM_REVIEW_VALIDATION_FINDINGS: &str =
 pub struct ValidationFindingsCommit<'a> {
     pub sha: &'a str,
     pub subject: &'a str,
+    pub commit_message: &'a str,
+    pub reference_context: &'a str,
     pub diff: &'a str,
     /// The per-commit `findings[]` array exactly as it appears in `out`.
     pub findings: &'a Value,
 }
 
-/// Build the user message for `--validation-mode=findings`. Caps each diff
-/// at 80 KiB so a long series stays within the validator's context window;
-/// the prompt instructs the model to emit JSON, so the input is JSON too.
-pub fn validation_findings_user_payload(commits: &[ValidationFindingsCommit<'_>]) -> String {
+const VALIDATION_COMMIT_MESSAGE_MAX_BYTES: usize = 48_000;
+const VALIDATION_REFERENCE_MAX_BYTES: usize = 80_000;
+const VALIDATION_DIFF_MAX_BYTES: usize = 80_000;
+const VALIDATION_SCALE_DENOMINATOR: usize = 1_000_000;
+
+/// Conservative share of the complete request budget available to the serialized validation user
+/// message. The remainder is reserved for the system prompt, repository tool schemas, chat
+/// framing, and a schema reminder on retry. The request layer performs the final exact estimate
+/// and rejects a structured request that still does not fit.
+pub fn validation_findings_user_budget(max_input_tokens: Option<u32>) -> usize {
+    let max_input_tokens = max_input_tokens.unwrap_or(crate::config::DEFAULT_MAX_INPUT_TOKENS);
+    let target_tokens = input_budget_target_tokens(max_input_tokens) as usize;
+    let estimated_request_bytes = target_tokens.saturating_mul(INPUT_EST_BYTES_PER_TOKEN_X2) / 2;
+    estimated_request_bytes.saturating_mul(3) / 5
+}
+
+fn validation_findings_user_wire_len(payload: &str) -> usize {
+    serde_json::to_vec(payload)
+        .map(|encoded| encoded.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn validation_findings_user_payload_scaled(
+    commits: &[ValidationFindingsCommit<'_>],
+    scale: usize,
+) -> String {
     let entries: Vec<Value> = commits
         .iter()
         .map(|c| {
-            json!({
+            let commit_message_cap = VALIDATION_COMMIT_MESSAGE_MAX_BYTES.saturating_mul(scale)
+                / VALIDATION_SCALE_DENOMINATOR;
+            let reference_cap =
+                VALIDATION_REFERENCE_MAX_BYTES.saturating_mul(scale) / VALIDATION_SCALE_DENOMINATOR;
+            let diff_cap =
+                VALIDATION_DIFF_MAX_BYTES.saturating_mul(scale) / VALIDATION_SCALE_DENOMINATOR;
+            let mut entry = json!({
                 "sha": c.sha,
                 "subject": c.subject,
-                "diff": cap_utf8(c.diff, 80_000),
+                "commit_message": cap_utf8_middle_exact(c.commit_message, commit_message_cap),
+                "reference_context": cap_utf8_middle_exact(c.reference_context, reference_cap),
+                "diff": cap_utf8_middle_exact(c.diff, diff_cap),
                 "findings": c.findings,
-            })
+            });
+            let commit_message_truncated = c.commit_message.len() > commit_message_cap;
+            let reference_context_truncated = c.reference_context.len() > reference_cap;
+            let diff_truncated = c.diff.len() > diff_cap;
+            if commit_message_truncated || reference_context_truncated || diff_truncated {
+                entry["context_status"] = json!({
+                    "commit_message_truncated": commit_message_truncated,
+                    "reference_context_truncated": reference_context_truncated,
+                    "diff_truncated": diff_truncated,
+                });
+            }
+            entry
         })
         .collect();
     let body = serde_json::to_string_pretty(&json!({ "commits": entries }))
@@ -3087,6 +3229,7 @@ pub fn validation_findings_user_payload(commits: &[ValidationFindingsCommit<'_>]
         "Per-commit findings under review (validate per the system prompt):\n\n```json\n{body}\n```\n\n\
 Return ONLY a JSON object: {{\"commits\":[{{\"sha\":\"<sha12>\",\"findings\":[...]}}]}}. \
 Preserve every kept finding's \"location\" object byte-for-byte from the input. \
+When \"context_status\" reports a truncated field, do not treat absence from that field as evidence; use repository tools when the claim requires the omitted context. \
 No markdown fences, no prose outside the JSON."
     )
 }
@@ -3121,6 +3264,90 @@ in the removed/old code when the reviewed patch fixes it; report only remaining,
 incomplete, or newly introduced bugs.\n\n\
 {USER_JSON_INSTRUCTION}"
     )
+}
+
+/// Build the findings-validation message with valid JSON whose serialized string representation
+/// is no larger than `max_bytes`.
+/// Source fields are reduced together before serialization; SHA, subject, findings, and the
+/// output contract are never truncated. This is intentionally separate from generic request
+/// fitting, which cannot safely cut through an embedded JSON document.
+pub fn validation_findings_user_payload_bounded(
+    commits: &[ValidationFindingsCommit<'_>],
+    max_bytes: usize,
+) -> Result<String> {
+    let full = validation_findings_user_payload_scaled(commits, VALIDATION_SCALE_DENOMINATOR);
+    if validation_findings_user_wire_len(&full) <= max_bytes {
+        return Ok(full);
+    }
+
+    let minimum = validation_findings_user_payload_scaled(commits, 0);
+    let minimum_wire_len = validation_findings_user_wire_len(&minimum);
+    if minimum_wire_len > max_bytes {
+        anyhow::bail!(
+            "validation findings and framing require {} bytes, exceeding the {}-byte structured user-message budget",
+            minimum_wire_len,
+            max_bytes
+        );
+    }
+
+    let mut lo = 0usize;
+    let mut hi = VALIDATION_SCALE_DENOMINATOR;
+    let mut best = minimum;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let candidate = validation_findings_user_payload_scaled(commits, mid);
+        if validation_findings_user_wire_len(&candidate) <= max_bytes {
+            best = candidate;
+            lo = mid.saturating_add(1);
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok(best)
+}
+
+/// Greedily group commits whose full structured payload fits `max_bytes`. An individually
+/// oversized commit remains a one-entry batch and is reduced by
+/// [`validation_findings_user_payload_bounded`] immediately before it is sent.
+pub fn validation_findings_batches(
+    commits: &[ValidationFindingsCommit<'_>],
+    max_bytes: usize,
+) -> Vec<Vec<usize>> {
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    for idx in 0..commits.len() {
+        let mut candidate = current.clone();
+        candidate.push(idx);
+        let candidate_refs: Vec<ValidationFindingsCommit<'_>> = candidate
+            .iter()
+            .map(|&candidate_idx| ValidationFindingsCommit {
+                sha: commits[candidate_idx].sha,
+                subject: commits[candidate_idx].subject,
+                commit_message: commits[candidate_idx].commit_message,
+                reference_context: commits[candidate_idx].reference_context,
+                diff: commits[candidate_idx].diff,
+                findings: commits[candidate_idx].findings,
+            })
+            .collect();
+        if !current.is_empty()
+            && validation_findings_user_wire_len(&validation_findings_user_payload(&candidate_refs))
+                > max_bytes
+        {
+            batches.push(std::mem::take(&mut current));
+        }
+        current.push(idx);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+/// Build the unbatched form used for sizing and small validation requests.
+pub fn validation_findings_user_payload(commits: &[ValidationFindingsCommit<'_>]) -> String {
+    validation_findings_user_payload_scaled(commits, VALIDATION_SCALE_DENOMINATOR)
 }
 
 /// System prompt for the `test` command's "pick a quick test" pre-stage. Assembled at first use
@@ -3773,15 +4000,145 @@ mod tests {
         let commits = vec![ValidationFindingsCommit {
             sha: "abc123def456",
             subject: "fix loop",
+            commit_message: "commit abc123def456\n\n    Explain why the loop bound changes.",
+            reference_context: "x.c: helper() guarantees count is positive",
             diff: "diff --git a/x.c b/x.c\n--- a/x.c\n+++ b/x.c",
             findings: &findings,
         }];
         let s = validation_findings_user_payload(&commits);
         assert!(s.contains("\"sha\": \"abc123def456\""));
         assert!(s.contains("\"subject\": \"fix loop\""));
+        assert!(s.contains("Explain why the loop bound changes"));
+        assert!(s.contains("helper() guarantees count is positive"));
         assert!(s.contains("\"problem\": \"off-by-one\""));
         // The closing instruction mentioning the strict output shape must be present.
         assert!(s.contains("Return ONLY a JSON object"));
+    }
+
+    #[test]
+    fn bounded_validation_payload_stays_valid_and_preserves_findings() {
+        let findings = json!([{
+            "problem": "off-by-one",
+            "severity": "Medium",
+            "severity_explanation": "loop bound",
+            "location": {"file": "x.c", "line": 42, "side": "RIGHT"}
+        }]);
+        let commit_message = "message é\n".repeat(4_000);
+        let reference_context = "reference helper context\n".repeat(4_000);
+        let diff = "+ changed source line\n".repeat(4_000);
+        let commits = vec![ValidationFindingsCommit {
+            sha: "abc123def456",
+            subject: "fix loop",
+            commit_message: &commit_message,
+            reference_context: &reference_context,
+            diff: &diff,
+            findings: &findings,
+        }];
+
+        let payload = validation_findings_user_payload_bounded(&commits, 8_000).unwrap();
+        assert!(payload.len() <= 8_000);
+        assert!(validation_findings_user_wire_len(&payload) <= 8_000);
+        let json_body = payload
+            .split_once("```json\n")
+            .unwrap()
+            .1
+            .split_once("\n```")
+            .unwrap()
+            .0;
+        let parsed: Value = serde_json::from_str(json_body).unwrap();
+        assert_eq!(parsed["commits"][0]["sha"], "abc123def456");
+        assert_eq!(parsed["commits"][0]["findings"], findings);
+        assert_eq!(
+            parsed["commits"][0]["context_status"]["reference_context_truncated"],
+            true
+        );
+    }
+
+    #[test]
+    fn validation_user_budget_reserves_default_request_framing() {
+        let max_input_tokens = crate::config::DEFAULT_MAX_INPUT_TOKENS;
+        let user_budget = validation_findings_user_budget(Some(max_input_tokens));
+        let user = format!(
+            "{}{}",
+            "x".repeat(user_budget),
+            RETRY_REMINDER_FINDINGS_VALIDATION
+        );
+        let messages = json!([
+            {
+                "role": "system",
+                "content": format!(
+                    "{}{}",
+                    SYSTEM_REVIEW_VALIDATION_FINDINGS,
+                    SYSTEM_REPO_TOOLS_SUFFIX
+                )
+            },
+            {"role": "user", "content": user}
+        ]);
+        let body = json!({
+            "model": "validator",
+            "messages": messages,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "tools": tools::openai_tools_json(false),
+            "tool_choice": "auto",
+        });
+        assert!(
+            estimate_request_input_tokens(&body) <= input_budget_target_tokens(max_input_tokens)
+        );
+    }
+
+    #[test]
+    fn validation_payload_batches_oversized_commits_without_losing_order() {
+        let findings = json!([{
+            "problem": "problem",
+            "severity": "Low",
+            "severity_explanation": "proof"
+        }]);
+        let context = "source context\n".repeat(2_000);
+        let commits = vec![
+            ValidationFindingsCommit {
+                sha: "111111111111",
+                subject: "one",
+                commit_message: "message one",
+                reference_context: &context,
+                diff: "diff one",
+                findings: &findings,
+            },
+            ValidationFindingsCommit {
+                sha: "222222222222",
+                subject: "two",
+                commit_message: "message two",
+                reference_context: &context,
+                diff: "diff two",
+                findings: &findings,
+            },
+            ValidationFindingsCommit {
+                sha: "333333333333",
+                subject: "three",
+                commit_message: "message three",
+                reference_context: &context,
+                diff: "diff three",
+                findings: &findings,
+            },
+        ];
+
+        let batches = validation_findings_batches(&commits, 20_000);
+        assert_eq!(batches, vec![vec![0], vec![1], vec![2]]);
+        for batch in batches {
+            let refs: Vec<ValidationFindingsCommit<'_>> = batch
+                .iter()
+                .map(|&idx| ValidationFindingsCommit {
+                    sha: commits[idx].sha,
+                    subject: commits[idx].subject,
+                    commit_message: commits[idx].commit_message,
+                    reference_context: commits[idx].reference_context,
+                    diff: commits[idx].diff,
+                    findings: commits[idx].findings,
+                })
+                .collect();
+            let payload = validation_findings_user_payload_bounded(&refs, 20_000).unwrap();
+            assert!(validation_findings_user_wire_len(&payload) <= 20_000);
+        }
     }
 
     #[test]
