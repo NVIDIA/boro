@@ -360,6 +360,51 @@ isn't in the commit's changed paths). The finding's prose is preserved;
 only the bad anchor is removed, so the viewer falls back to rendering it
 as a commit-level comment.
 
+### Structured review highlights
+
+Review JSON keeps `summary.text` and `summary.counts` and adds
+`summary.highlights`. The additive field is optional because older producers
+omit it, but current Boro emits an array, which may be empty. The
+`schema_version` therefore remains `1`, and existing consumers can continue to
+read only `text` and `counts`.
+
+Each `finding_ref` is
+`<full-commit-sha>:<zero-based-effective-finding-index>`. The effective array is
+`validated_findings` when present (including when empty), otherwise `findings`.
+Boro copies the authoritative `commit`, `severity`, and optional `location`
+from that finding; `title` and `question` are editorial strings. Unknown,
+duplicate, or malformed references are omitted, and at most three highlights
+are emitted. Unknown response-object keys are ignored rather than copied into
+the public highlight.
+
+Treat `summary.text`, `title`, and `question` as untrusted plain text. After
+whitespace normalization, Boro rejects remaining Unicode control characters
+and bidirectional-formatting controls. URL-like editorial text remains
+untrusted and is never an authoritative link target; Boro accepts no
+model-authored authoritative URL field. This parser check is not
+output-context escaping: every GitHub, GitLab, HTML, or chat consumer must
+still centrally escape or sanitize the strings for its output context,
+including links, HTML, and mentions. Build source links only from the
+authoritative `commit` and `location` fields.
+
+```json
+{
+  "schema_version": 1,
+  "summary": {
+    "text": "One medium-risk issue needs attention.",
+    "counts": {"Critical": 0, "High": 0, "Medium": 1, "Low": 0},
+    "highlights": [{
+      "finding_ref": "a64709a4a613d3008b63c1c7d20c295bdd1cad49:0",
+      "commit": "a64709a4a613d3008b63c1c7d20c295bdd1cad49",
+      "severity": "Medium",
+      "title": "Notifier callbacks can self-deadlock",
+      "question": "Can callbacks re-enter notifier registration while dpll_lock is held?",
+      "location": {"file": "drivers/dpll/dpll_core.c", "line": 51, "line_end": 54, "side": "RIGHT"}
+    }]
+  }
+}
+```
+
 For terminal viewing, `scripts/boro-json-view` consumes that JSON and
 renders a GitHub-style "Files changed" view: per-file diff with old/new
 line-number gutters, ANSI-colored diff body, and severity-colored inline

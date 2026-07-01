@@ -1395,6 +1395,61 @@ async fn render_commit_lkml_phase(
     }
 }
 
+fn resolve_quick_summary_highlights(
+    response: &api::QuickSummaryResponse,
+    commits_data: &[(String, String, Value)],
+) -> Vec<Value> {
+    let mut seen = std::collections::HashSet::new();
+    let mut resolved = Vec::new();
+
+    for highlight in &response.highlights {
+        if resolved.len() == api::QUICK_SUMMARY_MAX_HIGHLIGHTS {
+            break;
+        }
+        if seen.contains(&highlight.finding_ref) {
+            continue;
+        }
+
+        let authoritative = commits_data.iter().find_map(|(sha, _, findings)| {
+            findings
+                .as_array()?
+                .iter()
+                .enumerate()
+                .find_map(|(index, finding)| {
+                    let finding_ref = format!("{sha}:{index}");
+                    (highlight.finding_ref == finding_ref).then_some((
+                        finding_ref,
+                        sha.as_str(),
+                        finding,
+                    ))
+                })
+        });
+        let Some((finding_ref, sha, finding)) = authoritative else {
+            continue;
+        };
+        let Some(severity @ ("Critical" | "High" | "Medium" | "Low")) =
+            finding.get("severity").and_then(Value::as_str)
+        else {
+            continue;
+        };
+
+        seen.insert(finding_ref.clone());
+        let mut resolved_highlight = json!({
+            "finding_ref": finding_ref,
+            "commit": sha,
+            "severity": severity,
+            "title": highlight.title,
+            "question": highlight.question,
+        });
+        if let Some(location) = finding.get("location") {
+            resolved_highlight["location"] = location.clone();
+        }
+        resolved.push(resolved_highlight);
+    }
+
+    resolved
+}
+
 /// Run-wide quick summary. Counts severities locally over the chosen findings array
 /// (validated_findings when present, raw findings otherwise) for every non-dry-run commit, then
 /// asks the validation model for a 1-3 sentence prose summary that highlights the most important
@@ -1416,7 +1471,7 @@ async fn run_quick_summary(
     repo: &Path,
     progress_ui: Option<&MultiPatchSpinner>,
 ) {
-    // Gather per-commit (sha12, subject, chosen findings) tuples. Skip dry-run rows and rows
+    // Gather per-commit (full sha, subject, chosen findings) tuples. Skip dry-run rows and rows
     // with no sha (defensive - real commits always have one).
     let mut commits_data: Vec<(String, String, Value)> = Vec::new();
     if let Some(commits) = out["commits"].as_array() {
@@ -1428,7 +1483,6 @@ async fn run_quick_summary(
             if sha_full.is_empty() {
                 continue;
             }
-            let sha12 = sha_full.get(..12).unwrap_or(sha_full).to_string();
             let subject = c
                 .get("subject")
                 .and_then(|s| s.as_str())
@@ -1439,7 +1493,7 @@ async fn run_quick_summary(
                 .cloned()
                 .or_else(|| c.get("findings").cloned())
                 .unwrap_or_else(|| json!([]));
-            commits_data.push((sha12, subject, findings_val));
+            commits_data.push((sha_full.to_string(), subject, findings_val));
         }
     }
 
@@ -1466,10 +1520,13 @@ async fn run_quick_summary(
         }
     }
 
-    let summary_text = if commits_data.is_empty() {
-        "No commits reviewed.".to_string()
+    let (summary_text, summary_highlights) = if commits_data.is_empty() {
+        ("No commits reviewed.".to_string(), Vec::new())
     } else if total_findings == 0 {
-        "No issues found across the reviewed commits.".to_string()
+        (
+            "No issues found across the reviewed commits.".to_string(),
+            Vec::new(),
+        )
     } else {
         // Build refs for payload from owned tuples.
         let payload_refs: Vec<api::QuickSummaryCommit<'_>> = commits_data
@@ -1502,7 +1559,7 @@ async fn run_quick_summary(
         let mut stage_tot = api::CumulativeTokenUsage::default();
         let t = Instant::now();
         // Tools are off: the model has every finding in the payload; nothing to look up.
-        let (text, usage, error) = match api::chat_completion_stage_timeout(
+        let (response, usage, error) = match api::chat_completion_stage_timeout(
             client,
             cfg,
             crate::target::quick_summary_system_prompt(target),
@@ -1517,17 +1574,30 @@ async fn run_quick_summary(
         )
         .await
         {
-            Ok((raw, u)) => {
-                let cleaned = api::strip_json_fences(&raw);
-                (cleaned.trim().to_string(), u, None)
-            }
+            Ok((raw, u)) => match api::parse_quick_summary_response(&raw) {
+                Ok(response) => (Some(response), u, None),
+                Err(e) => {
+                    let reason = api::short_error_reason(&e);
+                    v(
+                        vdest,
+                        format!(
+                            "quick-summary response parse failed (using deterministic fallback): {e:#}"
+                        ),
+                    );
+                    (
+                        None,
+                        u,
+                        Some(format!("invalid quick-summary response: {reason}")),
+                    )
+                }
+            },
             Err(e) => {
                 let reason = api::short_error_reason(&e);
                 v(
                     vdest,
                     format!("quick-summary failed (continuing without text): {e:#}"),
                 );
-                (String::new(), TokenUsage::default(), Some(reason))
+                (None, TokenUsage::default(), Some(reason))
             }
         };
         let wall_ms = t.elapsed().as_millis() as u64;
@@ -1549,15 +1619,19 @@ async fn run_quick_summary(
                 usage.completion.unwrap_or(0)
             ),
         );
-        if text.is_empty() {
-            // Fall back to a deterministic stub so downstream consumers always see prose.
-            format!(
-                "Reviewed {} commit(s); {} finding(s) recorded.",
-                commits_data.len(),
-                total_findings
-            )
-        } else {
-            text
+        match response {
+            Some(response) => {
+                let highlights = resolve_quick_summary_highlights(&response, &commits_data);
+                (response.text, highlights)
+            }
+            None => (
+                format!(
+                    "Reviewed {} commit(s); {} finding(s) recorded.",
+                    commits_data.len(),
+                    total_findings
+                ),
+                Vec::new(),
+            ),
         }
     };
 
@@ -1569,6 +1643,7 @@ async fn run_quick_summary(
             "Medium": medium,
             "Low": low,
         },
+        "highlights": summary_highlights,
     });
 }
 
@@ -3685,6 +3760,123 @@ diff --git a/foo.c b/foo.c
         assert_eq!(usage["completion_tokens"], 7);
         assert_eq!(usage["cache_creation_tokens"], 1);
         assert_eq!(usage["cache_read_tokens"], 3);
+    }
+
+    #[test]
+    fn quick_summary_resolver_uses_authoritative_metadata_and_filters_refs() {
+        let full_sha = "a64709a4a613d3008b63c1c7d20c295bdd1cad49";
+        let response = api::parse_quick_summary_response(
+            &json!({
+                "text": "One issue needs attention.",
+                "highlights": [{
+                    "finding_ref": format!("{full_sha}:0"),
+                    "title": "Notifier callbacks can self-deadlock",
+                    "question": "Can callbacks re-enter registration?",
+                    "commit": "model-authored-commit",
+                    "severity": "Critical",
+                    "location": {"file": "invented.c", "line": 999, "side": "LEFT"}
+                }, {
+                    "finding_ref": format!("{full_sha}:0"),
+                    "title": "Later duplicate",
+                    "question": "Should this duplicate be dropped?"
+                }, {
+                    "finding_ref": "unknown:0",
+                    "title": "Unknown reference",
+                    "question": "Should this unknown reference be dropped?"
+                }]
+            })
+            .to_string(),
+        )
+        .expect("parse response");
+        let commits_data = vec![(
+            full_sha.to_string(),
+            "dpll: fix notifier locking".to_string(),
+            json!([{
+                "problem": "callback re-entry deadlocks",
+                "severity": "Medium",
+                "severity_explanation": "lock is held across callbacks",
+                "location": {
+                    "file": "drivers/dpll/dpll_core.c",
+                    "line": 51,
+                    "line_end": 54,
+                    "side": "RIGHT"
+                }
+            }]),
+        )];
+
+        let resolved = resolve_quick_summary_highlights(&response, &commits_data);
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0]["finding_ref"], format!("{full_sha}:0"));
+        assert_eq!(resolved[0]["commit"], full_sha);
+        assert_eq!(resolved[0]["severity"], "Medium");
+        assert_eq!(resolved[0]["location"]["file"], "drivers/dpll/dpll_core.c");
+        assert_eq!(resolved[0]["location"]["line"], 51);
+        assert_eq!(resolved[0]["title"], "Notifier callbacks can self-deadlock");
+        assert_eq!(
+            resolved[0]["question"],
+            "Can callbacks re-enter registration?"
+        );
+    }
+
+    #[test]
+    fn quick_summary_resolver_publishes_at_most_three_known_refs() {
+        let full_sha = "0123456789abcdef0123456789abcdef01234567";
+        let response = api::QuickSummaryResponse {
+            text: "Several issues need attention.".to_string(),
+            highlights: (0..4)
+                .map(|index| api::QuickSummaryHighlight {
+                    finding_ref: format!("{full_sha}:{index}"),
+                    title: format!("Issue {index}"),
+                    question: format!("Question {index}?"),
+                })
+                .collect(),
+        };
+        let commits_data = vec![(
+            full_sha.to_string(),
+            "subject".to_string(),
+            json!([
+                {"severity": "Critical"},
+                {"severity": "High"},
+                {"severity": "Medium"},
+                {"severity": "Low"}
+            ]),
+        )];
+
+        let resolved = resolve_quick_summary_highlights(&response, &commits_data);
+
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved[0]["finding_ref"], format!("{full_sha}:0"));
+        assert_eq!(resolved[1]["finding_ref"], format!("{full_sha}:1"));
+        assert_eq!(resolved[2]["finding_ref"], format!("{full_sha}:2"));
+    }
+
+    #[test]
+    fn quick_summary_resolver_drops_findings_without_canonical_severity() {
+        let full_sha = "fedcba9876543210fedcba9876543210fedcba98";
+        let response = api::QuickSummaryResponse {
+            text: "Malformed findings must not become highlights.".to_string(),
+            highlights: (0..3)
+                .map(|index| api::QuickSummaryHighlight {
+                    finding_ref: format!("{full_sha}:{index}"),
+                    title: format!("Issue {index}"),
+                    question: format!("Question {index}?"),
+                })
+                .collect(),
+        };
+        let commits_data = vec![(
+            full_sha.to_string(),
+            "subject".to_string(),
+            json!([
+                {"problem": "missing severity"},
+                {"problem": "non-string severity", "severity": 2},
+                {"problem": "noncanonical severity", "severity": "medium"}
+            ]),
+        )];
+
+        let resolved = resolve_quick_summary_highlights(&response, &commits_data);
+
+        assert!(resolved.is_empty());
     }
 
     #[test]
