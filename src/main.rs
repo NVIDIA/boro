@@ -932,6 +932,29 @@ fn drop_unanchored_locations(
                 }
             }
         }
+
+        let identifiers = obj
+            .get("problem")
+            .and_then(Value::as_str)
+            .map(backticked_c_identifiers)
+            .unwrap_or_default();
+        if !identifiers.is_empty() {
+            let end = obj
+                .get("location")
+                .and_then(|l| l.get("line_end"))
+                .and_then(Value::as_u64)
+                .unwrap_or(line);
+            if !idx.range_contains_identifier(file, line, end, side, &identifiers) {
+                v(
+                    vd,
+                    format!(
+                        "dropping semantically mismatched location for finding (anchor does not contain any named identifier: {})",
+                        identifiers.join(", ")
+                    ),
+                );
+                obj.remove("location");
+            }
+        }
     }
 }
 
@@ -955,6 +978,29 @@ fn cleanup_repair_and_validate_findings(
     drop_unanchored_locations(findings_val, &diff_idx, vd);
     repaired
 }
+
+fn backticked_c_identifiers(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('`') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('`') else {
+            break;
+        };
+        let token = rest[..end].trim().trim_end_matches("()");
+        if !token.is_empty()
+            && token.chars().enumerate().all(|(i, c)| {
+                c == '_' || c.is_ascii_alphanumeric() && (i > 0 || !c.is_ascii_digit())
+            })
+            && !out.iter().any(|existing| existing == token)
+        {
+            out.push(token.to_string());
+        }
+        rest = &rest[end + 1..];
+    }
+    out
+}
+
 /// Merge per-commit metadata (subject/author/date/parents, raw diff, changed paths) onto the
 /// commit's result `Value`. Inserted by [`execute_commit_task`] so every subcommand
 /// (review/build/test) and every error path (worktree failure, inner error) carries the same
@@ -1078,6 +1124,17 @@ fn append_validation_usage_step(out: &mut Value, model_id: &str, step: Value) {
     out["validation_usage"] = validation_usage_json_from_steps(model_id, steps);
 }
 
+fn without_unverified_sensitive_findings(findings: &Value) -> (Vec<Value>, usize) {
+    let raw = findings.as_array().cloned().unwrap_or_default();
+    let before = raw.len();
+    let retained: Vec<Value> = raw
+        .into_iter()
+        .filter(|finding| !api::finding_requires_repository_verification(finding))
+        .collect();
+    let withheld = before.saturating_sub(retained.len());
+    (retained, withheld)
+}
+
 /// Findings-mode validation: takes per-commit `findings[]` JSON and produces
 /// per-commit `out["commits"][i]["validated_findings"]`. Skips commits with
 /// empty findings; commits absent from the validator's response keep their
@@ -1173,8 +1230,12 @@ async fn run_findings_validation(
         ),
     );
     let mut stage_tot = api::CumulativeTokenUsage::default();
-    let tool_cfg = (!no_tools).then(|| api::ToolLoopConfig::new(repo));
+    let tool_cfg = (!no_tools).then(|| {
+        api::ToolLoopConfig::new(repo).requiring(api::ToolVerification::SensitiveFindings)
+    });
     let mut by_sha: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    let mut verification_failed_shas: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let mut successful_batches = 0usize;
     for (batch_idx, indices) in batches.iter().enumerate() {
         let batch_num = batch_idx + 1;
@@ -1234,6 +1295,9 @@ async fn run_findings_validation(
         }
         totals.add_usage(summed);
         let wall_ms = t_val.elapsed().as_millis() as u64;
+        let mandatory_verification_failed = last_err
+            .as_ref()
+            .is_some_and(api::is_required_tool_verification_error);
         let validation_error = last_err.as_ref().map(api::short_error_reason);
         append_validation_usage_step(
             out,
@@ -1246,15 +1310,27 @@ async fn run_findings_validation(
             ),
         );
         let Some(parsed) = parsed_opt else {
+            if mandatory_verification_failed {
+                for &idx in indices {
+                    verification_failed_shas.insert(payload_owned[idx].0.clone());
+                }
+            }
             let msg = last_err
                 .map(|e| format!("{e:#}"))
                 .unwrap_or_else(|| "no response".to_string());
             v(
                 vdest,
-                format!(
-                    "validation batch {batch_num}/{} failed (continuing with raw findings for that batch): {msg}",
-                    batches.len()
-                ),
+                if mandatory_verification_failed {
+                    format!(
+                        "validation batch {batch_num}/{} failed mandatory repository verification (withholding sensitive raw findings): {msg}",
+                        batches.len()
+                    )
+                } else {
+                    format!(
+                        "validation batch {batch_num}/{} failed (continuing with raw findings for that batch): {msg}",
+                        batches.len()
+                    )
+                },
             );
             continue;
         };
@@ -1282,7 +1358,7 @@ async fn run_findings_validation(
             }
         }
     }
-    if successful_batches == 0 {
+    if successful_batches == 0 && verification_failed_shas.is_empty() {
         return;
     }
 
@@ -1316,6 +1392,19 @@ async fn run_findings_validation(
                     .get_mut("findings")
                     .map(|f| f.take())
                     .unwrap_or(Value::Array(Vec::new()));
+            } else if verification_failed_shas.contains(sha12) {
+                let (retained, withheld) = without_unverified_sensitive_findings(
+                    c.get("findings").unwrap_or(&Value::Null),
+                );
+                v(
+                    vdest,
+                    format!(
+                        "validation commit {sha12}: withheld {} sensitive unverified finding(s), retained {} unrelated finding(s)",
+                        withheld,
+                        retained.len()
+                    ),
+                );
+                c["validated_findings"] = Value::Array(retained);
             }
         }
     }
@@ -2164,7 +2253,7 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
                 (CommitAction::Review { .. }, config::Backend::OpenAi) if action.review_no_tools() =>
                     "disabled (--no-tools)",
                 (CommitAction::Review { .. }, config::Backend::OpenAi) =>
-                    "enabled (read_files, git_blame, git_diff, git_show - broad pass, specialists, consolidation, LKML; not phase 0)",
+                    "enabled (grep_repo, read_files, read_symbol, git history/diff/show, run_git, rg - review, specialists, validation, LKML; not phase 0 or consolidation)",
             }
         ),
     );
@@ -3461,6 +3550,10 @@ async fn run_two_pass(
             stages::short_description(st),
         );
         let t_st = Instant::now();
+        let required_tool_cfg = (st == 7 && tool_cfg.is_some()).then(|| {
+            api::ToolLoopConfig::new(effective_repo).requiring(api::ToolVerification::Stage7Linkage)
+        });
+        let stage_tool_cfg = required_tool_cfg.as_ref().or(tool_cfg);
         let (parsed_stage, _raw_s, u_s, stage_error, _attempts) =
             api::chat_completion_with_retry_stage_timeout(
                 client,
@@ -3471,11 +3564,21 @@ async fn run_two_pass(
                 Some(&spinner),
                 Some(&mut stage_tot),
                 vd,
-                tool_cfg,
+                stage_tool_cfg,
                 worker_ctx,
                 effective_repo,
-                api::parse_concerns_strict,
-                api::RETRY_REMINDER_CONCERNS,
+                |raw| {
+                    if st == 7 {
+                        api::parse_stage7_concerns_strict(raw)
+                    } else {
+                        api::parse_concerns_strict(raw)
+                    }
+                },
+                if st == 7 {
+                    api::RETRY_REMINDER_STAGE7_CONCERNS
+                } else {
+                    api::RETRY_REMINDER_CONCERNS
+                },
                 api::STAGE_RETRY_MAX_ATTEMPTS,
             )
             .await;
@@ -3902,6 +4005,24 @@ diff --git a/foo.c b/foo.c
     }
 
     #[test]
+    fn mandatory_verification_failure_withholds_only_sensitive_findings() {
+        let findings = json!([{
+            "problem": "helper has no caller",
+            "severity": "Medium",
+            "severity_explanation": "repository lookup required"
+        }, {
+            "problem": "lock is released twice",
+            "severity": "High",
+            "severity_explanation": "double unlock on the error path"
+        }]);
+
+        let (retained, withheld) = without_unverified_sensitive_findings(&findings);
+        assert_eq!(withheld, 1);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0]["problem"], "lock is released twice");
+    }
+
+    #[test]
     fn quick_summary_resolver_uses_authoritative_metadata_and_filters_refs() {
         let full_sha = "a64709a4a613d3008b63c1c7d20c295bdd1cad49";
         let response = api::parse_quick_summary_response(
@@ -4068,6 +4189,34 @@ diff --git a/foo.c b/foo.c
         assert!(arr[0].get("location").is_none());
         // Finding itself survives.
         assert_eq!(arr[0]["problem"], "x");
+    }
+
+    #[test]
+    fn drops_location_that_does_not_contain_named_symbol() {
+        let diff = "--- a/foo.c\n+++ b/foo.c\n@@ -1,3 +1,4 @@\n int unrelated;\n+int still_unrelated;\n+void target_helper(void);\n int tail;\n";
+        let idx = diff_index::DiffIndex::from_unified_diff(diff);
+        let mut findings = json!({"findings":[{
+            "problem":"`target_helper()` has broken linkage",
+            "severity":"High",
+            "severity_explanation":"x",
+            "location":{"file":"foo.c","line":2,"side":"RIGHT"}
+        }]});
+        drop_unanchored_locations(&mut findings, &idx, &vd());
+        assert!(findings["findings"][0].get("location").is_none());
+    }
+
+    #[test]
+    fn keeps_location_containing_named_symbol() {
+        let diff = "--- a/foo.c\n+++ b/foo.c\n@@ -1,1 +1,1 @@\n+void target_helper(void);\n";
+        let idx = diff_index::DiffIndex::from_unified_diff(diff);
+        let mut findings = json!({"findings":[{
+            "problem":"`target_helper()` has broken linkage",
+            "severity":"High",
+            "severity_explanation":"x",
+            "location":{"file":"foo.c","line":1,"side":"RIGHT"}
+        }]});
+        drop_unanchored_locations(&mut findings, &idx, &vd());
+        assert!(findings["findings"][0].get("location").is_some());
     }
 
     #[test]

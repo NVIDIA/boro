@@ -133,6 +133,34 @@ pub struct ToolLoopConfig<'a> {
     /// If true, `tools::openai_tools_json` advertises `edit_file` and `tools::execute_tool`
     /// will run it. All other tools remain read-only.
     pub allow_edit_file: bool,
+    /// Output-dependent verification requirement. This turns prompt guidance into a runtime
+    /// postcondition: selected findings cannot be returned before at least one repository tool
+    /// has actually executed.
+    pub verification: ToolVerification,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolVerification {
+    Optional,
+    Stage7Linkage,
+    SensitiveFindings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage7ConcernCategory {
+    ConfigurationLinkage,
+    HardwareArchitecture,
+}
+
+fn stage7_concern_category(concern: &Value) -> Result<Stage7ConcernCategory> {
+    match concern.get("category").and_then(Value::as_str) {
+        Some("configuration-linkage") => Ok(Stage7ConcernCategory::ConfigurationLinkage),
+        Some("hardware-architecture") => Ok(Stage7ConcernCategory::HardwareArchitecture),
+        Some(other) => anyhow::bail!(
+            "stage 7 concern has unknown category {other:?}; expected \"configuration-linkage\" or \"hardware-architecture\""
+        ),
+        None => anyhow::bail!("stage 7 concern missing required string category"),
+    }
 }
 
 impl<'a> ToolLoopConfig<'a> {
@@ -141,7 +169,13 @@ impl<'a> ToolLoopConfig<'a> {
             repo,
             max_tool_iterations: 24,
             allow_edit_file: false,
+            verification: ToolVerification::Optional,
         }
+    }
+
+    pub fn requiring(mut self, verification: ToolVerification) -> Self {
+        self.verification = verification;
+        self
     }
 
     /// Construct a tool-loop config with the write-capable `edit_file` tool enabled. Use only
@@ -205,6 +239,108 @@ For git_show, pass `object` to `git show`: a commit hash, `HEAD`, a tag, or `<re
 If `HEAD:path` fails, try the patch commit before the colon; if that still fails, the path may be wrong for that commit: use paths from the patch text, or parent revision syntax such as `rev^:path`. \
 Prior tool results may appear in your context as a short `<tool_result elided ...>` stub - that's an intentional token-saving step (boro replaces consumed tool results with a placeholder once you've incorporated them into a later turn). Do not retry those calls; the information you extracted from them is already in your next assistant message. \
 When finished, respond with ONLY the JSON structure the user message requires (no markdown fences, no prose outside JSON).";
+
+const REQUIRED_TOOL_REMINDER: &str = "Your proposed output contains a repository-verifiable \
+linkage, declaration, definition, export, stub, symbol, or caller claim, but you did not execute \
+any repository tool. Before returning non-empty JSON, use grep_repo/read_files/read_symbol and, \
+when relevant, inspect Kbuild/Makefile or textual .c inclusion ownership. If the claim cannot be \
+verified from tool results, return an empty concerns/findings array.";
+
+#[derive(Debug)]
+struct RequiredToolVerificationError;
+
+impl std::fmt::Display for RequiredToolVerificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "model returned a repository-verifiable finding twice without executing a required repository tool",
+        )
+    }
+}
+
+impl std::error::Error for RequiredToolVerificationError {}
+
+pub fn is_required_tool_verification_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<RequiredToolVerificationError>()
+            .is_some()
+    })
+}
+
+const SENSITIVE_FINDING_TERMS: &[&str] = &[
+    "not declared",
+    "missing declaration",
+    "not defined",
+    "missing definition",
+    "not exported",
+    "export_symbol",
+    "unresolved symbol",
+    "linkage error",
+    "missing stub",
+    "no caller",
+];
+
+pub fn finding_requires_repository_verification(finding: &Value) -> bool {
+    let lower = finding.to_string().to_ascii_lowercase();
+    SENSITIVE_FINDING_TERMS
+        .iter()
+        .any(|term| lower.contains(term))
+}
+
+fn output_requires_tool_verification(policy: ToolVerification, raw: &str) -> bool {
+    if policy == ToolVerification::Optional {
+        return false;
+    }
+    let parsed = match policy {
+        ToolVerification::Stage7Linkage => parse_model_json_with_key(raw, "concerns"),
+        ToolVerification::SensitiveFindings => parse_model_json_with_key(raw, "commits")
+            .or_else(|_| parse_model_json_with_key(raw, "findings")),
+        ToolVerification::Optional => return false,
+    };
+    let Ok(value) = parsed else {
+        return false; // The outer schema retry owns malformed output.
+    };
+
+    match policy {
+        ToolVerification::Stage7Linkage => value
+            .get("concerns")
+            .and_then(Value::as_array)
+            .is_some_and(|concerns| {
+                concerns.iter().any(|concern| {
+                    matches!(
+                        stage7_concern_category(concern),
+                        Ok(Stage7ConcernCategory::ConfigurationLinkage)
+                    )
+                })
+            }),
+        ToolVerification::SensitiveFindings => {
+            value
+                .get("findings")
+                .and_then(Value::as_array)
+                .is_some_and(|findings| {
+                    findings
+                        .iter()
+                        .any(finding_requires_repository_verification)
+                })
+                || value
+                    .get("commits")
+                    .and_then(Value::as_array)
+                    .is_some_and(|commits| {
+                        commits.iter().any(|commit| {
+                            commit
+                                .get("findings")
+                                .and_then(Value::as_array)
+                                .is_some_and(|findings| {
+                                    findings
+                                        .iter()
+                                        .any(finding_requires_repository_verification)
+                                })
+                        })
+                    })
+        }
+        ToolVerification::Optional => false,
+    }
+}
 
 /// Replacement text for tool-result `content` after a later assistant turn has consumed it.
 /// Kept short to maximize input-token savings on the next POST.
@@ -1029,6 +1165,15 @@ Return ONLY a JSON object with a 'concerns' array (each item: \
 If you have no concerns, return `{\"concerns\": []}`. \
 No markdown fences, no prose outside the JSON.";
 
+pub const RETRY_REMINDER_STAGE7_CONCERNS: &str =
+    "Your previous Stage 7 response was rejected because it did not match the required JSON shape. \
+Return ONLY a JSON object with a 'concerns' array. Every item must contain \
+{\"category\": \"configuration-linkage\"|\"hardware-architecture\", \"type\": string, \
+\"description\": string, \"reasoning\": string}. A configuration-linkage concern MUST also \
+contain exactly {\"proof\":{\"failing_config\":string,\"caller_condition\":string,\"provider_condition\":string,\"failure\":string}}. \
+A hardware-architecture concern MUST omit 'proof'. If you have no concerns, return \
+`{\"concerns\": []}`. No markdown fences, no prose outside the JSON.";
+
 pub const RETRY_REMINDER_FINDINGS: &str =
     "Your previous response was rejected because it did not match the required JSON shape. \
 Return ONLY a JSON object with a 'findings' array (each item: \
@@ -1695,6 +1840,7 @@ async fn chat_completion_inner(
 
     let mut usages_acc: Vec<TokenUsage> = Vec::new();
     let mut tool_iterations = 0u32;
+    let mut successful_tool_calls = 0u32;
     let mut effective_max_input_tokens = model.max_input_tokens;
     let mut context_budget_retries = 0u32;
     let mut use_stream_options = true;
@@ -1702,6 +1848,7 @@ async fn chat_completion_inner(
     // require an explicit `tools=` parameter (e.g. some Bedrock adapters) don't reject requests.
     let mut disable_tools = false;
     let mut stream_stage_header_printed = false;
+    let mut verification_reminded = false;
 
     loop {
         // Drop consumed tool-result payloads from prior iterations. Each tool result whose content
@@ -2067,6 +2214,13 @@ async fn chat_completion_inner(
                 let join_out = await_with_stage_deadline(join, stage_deadline, &label).await?;
                 // Never abort the review on tool failure: send structured error back so the model can retry.
                 let out = tool_message_content_for_join_result(&tool_name, join_out);
+                let failed = serde_json::from_str::<Value>(&out)
+                    .ok()
+                    .and_then(|value| value.get("tool_error").and_then(Value::as_bool))
+                    .unwrap_or(false);
+                if !failed {
+                    successful_tool_calls += 1;
+                }
                 if dest.active() {
                     verbose_section(
                         dest,
@@ -2087,6 +2241,22 @@ async fn chat_completion_inner(
         }
 
         let content = message_content_to_string(&message);
+        if let Some(cfg) = tool_loop {
+            if successful_tool_calls == 0
+                && output_requires_tool_verification(cfg.verification, &content)
+            {
+                if verification_reminded {
+                    return Err(RequiredToolVerificationError.into());
+                }
+                verification_reminded = true;
+                dest.line(
+                    "required-tool verification: rejecting non-empty unverified output and asking the model to inspect the repository",
+                );
+                messages.push(message);
+                messages.push(json!({"role": "user", "content": REQUIRED_TOOL_REMINDER}));
+                continue;
+            }
+        }
         if dest.active() {
             v_chat(
                 dest,
@@ -2322,6 +2492,13 @@ augmenting prompt with schema reminder and retrying",
                 }
             }
             Err(e) => {
+                if is_required_tool_verification_error(&e) {
+                    dest.line(format!(
+                        "stage retry: mandatory repository verification was not satisfied: {e:#}; withholding unverified sensitive findings",
+                    ));
+                    last_err = Some(e);
+                    return (None, last_raw, summed, last_err, attempt);
+                }
                 if model_timeout::is(&e) {
                     dest.line(format!(
                         "stage retry: API attempt {attempt}/{max} timed out: {e:#}; skipping stage",
@@ -3130,6 +3307,62 @@ pub fn parse_concerns_strict(raw: &str) -> Result<Value> {
     Ok(v)
 }
 
+/// Stage 7's structured proof is a machine contract, not merely prompt advice. Reject generic
+/// placeholders so the retry loop gets a chance to demand checked-out-tree evidence.
+pub fn parse_stage7_concerns_strict(raw: &str) -> Result<Value> {
+    let v = parse_concerns_strict(raw)?;
+    let concerns = v["concerns"].as_array().expect("validated above");
+    for concern in concerns {
+        match stage7_concern_category(concern)? {
+            Stage7ConcernCategory::HardwareArchitecture => {
+                if concern.get("proof").is_some() {
+                    anyhow::bail!(
+                        "stage 7 hardware-architecture concern must omit the configuration/linkage proof object"
+                    );
+                }
+                continue;
+            }
+            Stage7ConcernCategory::ConfigurationLinkage => {}
+        }
+        let proof = concern
+            .get("proof")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("stage 7 configuration/linkage concern missing proof object"))?;
+        const FIELDS: &[&str] = &[
+            "failing_config",
+            "caller_condition",
+            "provider_condition",
+            "failure",
+        ];
+        if proof.len() != FIELDS.len() || FIELDS.iter().any(|field| !proof.contains_key(*field)) {
+            anyhow::bail!("stage 7 proof must contain exactly the four required fields");
+        }
+        for field in FIELDS {
+            let text = proof[*field]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow!("stage 7 proof.{field} must be a non-empty string"))?;
+            let lower = text.to_ascii_lowercase();
+            if [
+                "any config",
+                "all config",
+                "every config",
+                "any file",
+                "if another file",
+            ]
+            .iter()
+            .any(|placeholder| lower.contains(placeholder))
+            {
+                anyhow::bail!(
+                    "stage 7 proof.{field} is hypothetical/generic rather than a concrete checked-out-tree condition"
+                );
+            }
+        }
+    }
+    Ok(v)
+}
+
 /// Parse `{"summary": "...", "findings": [...]}` from the test-review stage. Returns the summary
 /// string (empty when missing - the caller decides whether to substitute a placeholder) and a
 /// `Value` with the validated `findings` array (top-level shape `{"findings":[...]}` to match the
@@ -3242,12 +3475,12 @@ pub fn specialist_stage_user_payload(
         format!("{prefetched_context_block}\n")
     };
     let concern_schema = if stage == 7 {
-        r#"{"type":"s7:string","description":"string","reasoning":"string","location":{"file":"path/in/diff","line":N,"line_end":N,"side":"LEFT|RIGHT"}}"#
+        r#"{"category":"configuration-linkage|hardware-architecture","type":"s7:string","description":"string","reasoning":"string","location":{"file":"path/in/diff","line":N,"line_end":N,"side":"LEFT|RIGHT"}}"#
     } else {
         r#"{"type":"string","description":"string","reasoning":"string","location":{"file":"path/in/diff","line":N,"line_end":N,"side":"LEFT|RIGHT"}}"#
     };
     let proof_contract = if stage == 7 {
-        r#"For stage 7, the "proof" object is conditional. For every configuration/linkage concern it is REQUIRED with exactly these four non-empty string fields: "proof":{"failing_config":"string","caller_condition":"string","provider_condition":"string","failure":"string"}. For hardware/architecture concerns, OMIT "proof" and do not invent configuration or linkage values. "#
+        r#"For stage 7, "category" is REQUIRED and must be exactly "configuration-linkage" or "hardware-architecture". For every "configuration-linkage" concern, "proof" is REQUIRED with exactly these four non-empty string fields: "proof":{"failing_config":"string","caller_condition":"string","provider_condition":"string","failure":"string"}. For "hardware-architecture" concerns, OMIT "proof" and do not invent configuration or linkage values. "#
     } else {
         ""
     };
@@ -4375,9 +4608,13 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
         ] {
             assert!(stage7.contains(field), "stage 7 schema missing {field}");
         }
-        assert!(stage7.contains("configuration/linkage concern it is REQUIRED"));
+        assert!(stage7.contains("\"category\" is REQUIRED"));
+        assert!(stage7.contains("\"configuration-linkage\""));
+        assert!(stage7.contains("\"hardware-architecture\""));
         assert!(stage7.contains("exactly these four non-empty string fields"));
-        assert!(stage7.contains(r#""reasoning":"string","location":{"file":"path/in/diff""#));
+        assert!(stage7.contains(
+            r#""category":"configuration-linkage|hardware-architecture","type":"s7:string""#
+        ));
 
         let stage6 = specialist_stage_user_payload("", "", "diff", "", 6, "", "");
         assert!(!stage6.contains("failing_config"));
@@ -4406,7 +4643,7 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
         let stage7 = specialist_stage_user_payload(instruction, "", "diff", "", 7, "", "");
 
         assert!(stage7.contains("missing `dma_wmb()`/`dma_rmb()` barriers"));
-        assert!(stage7.contains("For hardware/architecture concerns, OMIT \"proof\""));
+        assert!(stage7.contains("For \"hardware-architecture\" concerns, OMIT \"proof\""));
         assert!(stage7.contains("do not invent configuration or linkage values"));
     }
 
@@ -5424,6 +5661,88 @@ index 111..222 100644
         )
         .expect("parses");
         assert_eq!(v["concerns"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stage7_parser_rejects_hypothetical_generic_proof() {
+        let raw = r#"{"concerns":[{"category":"configuration-linkage","type":"s7:linkage","description":"d","reasoning":"r","proof":{"failing_config":"Any config where another file calls it","caller_condition":"Any file including the header","provider_condition":"not exported","failure":"unresolved symbol"}}]}"#;
+        assert!(parse_stage7_concerns_strict(raw).is_err());
+    }
+
+    #[test]
+    fn stage7_parser_accepts_concrete_four_field_proof() {
+        let raw = r#"{"concerns":[{"category":"configuration-linkage","type":"s7:undefined-symbol","description":"d","reasoning":"r","proof":{"failing_config":"CONFIG_FOO=m with CONFIG_BAR=y","caller_condition":"foo.o is selected by obj-$(CONFIG_FOO)","provider_condition":"bar.o is built into vmlinux by obj-y","failure":"foo.ko has an undefined reference to bar"}}]}"#;
+        assert!(parse_stage7_concerns_strict(raw).is_ok());
+        assert!(output_requires_tool_verification(
+            ToolVerification::Stage7Linkage,
+            raw
+        ));
+    }
+
+    #[test]
+    fn stage7_parser_rejects_missing_or_unknown_category() {
+        let missing =
+            r#"{"concerns":[{"type":"s7:undefined-symbol","description":"d","reasoning":"r"}]}"#;
+        let unknown = r#"{"concerns":[{"category":"linkage","type":"s7:undefined-symbol","description":"d","reasoning":"r"}]}"#;
+        assert!(parse_stage7_concerns_strict(missing).is_err());
+        assert!(parse_stage7_concerns_strict(unknown).is_err());
+    }
+
+    #[test]
+    fn stage7_linkage_category_requires_proof_independent_of_type_label() {
+        let raw = r#"{"concerns":[{"category":"configuration-linkage","type":"s7:declaration","description":"d","reasoning":"r"}]}"#;
+        assert!(parse_stage7_concerns_strict(raw).is_err());
+        assert!(output_requires_tool_verification(
+            ToolVerification::Stage7Linkage,
+            raw
+        ));
+    }
+
+    #[test]
+    fn stage7_hardware_category_accepts_no_proof_and_does_not_require_linkage_tool() {
+        let raw = r#"{"concerns":[{"category":"hardware-architecture","type":"s7:dma-ordering","description":"d","reasoning":"r"}]}"#;
+        assert!(parse_stage7_concerns_strict(raw).is_ok());
+        assert!(!output_requires_tool_verification(
+            ToolVerification::Stage7Linkage,
+            raw
+        ));
+    }
+
+    #[test]
+    fn stage7_hardware_category_rejects_linkage_proof() {
+        let raw = r#"{"concerns":[{"category":"hardware-architecture","type":"s7:dma-ordering","description":"d","reasoning":"r","proof":{"failing_config":"CONFIG_FOO=n","caller_condition":"caller","provider_condition":"provider","failure":"failure"}}]}"#;
+        assert!(parse_stage7_concerns_strict(raw).is_err());
+    }
+
+    #[test]
+    fn sensitive_finding_requires_tool_verification() {
+        let raw = r#"{"commits":[{"sha":"abc","findings":[{"problem":"helper is not exported","severity":"High"}]}]}"#;
+        assert!(output_requires_tool_verification(
+            ToolVerification::SensitiveFindings,
+            raw
+        ));
+        assert!(!output_requires_tool_verification(
+            ToolVerification::SensitiveFindings,
+            r#"{"commits":[{"sha":"abc","findings":[]}]}"#
+        ));
+        assert!(finding_requires_repository_verification(&json!({
+            "problem": "helper has no caller",
+            "severity": "Medium"
+        })));
+        assert!(!finding_requires_repository_verification(&json!({
+            "problem": "double unlock on the error path",
+            "severity": "High"
+        })));
+    }
+
+    #[test]
+    fn required_tool_verification_error_survives_context() {
+        let error =
+            anyhow::Error::new(RequiredToolVerificationError).context("validation request failed");
+        assert!(is_required_tool_verification_error(&error));
+        assert!(!is_required_tool_verification_error(&anyhow!(
+            "ordinary validation failure"
+        )));
     }
 
     #[test]
