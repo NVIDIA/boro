@@ -3,6 +3,7 @@
 
 mod api;
 mod apply;
+mod checkpatch;
 mod claude_cli;
 mod cluster;
 mod codex_cli;
@@ -431,7 +432,7 @@ async fn commit_review_inner(
         ),
     );
     let reference =
-        prompts::build_reference_context(target, &changed, max_context_size, None, None)?;
+        prompts::build_reference_context(target, &changed, max_context_size, None, None, None)?;
     let ref_hint =
         rough_token_hint(crate::target::reviewer_system_prompt(target).len() + reference.len());
     let patch_hint = rough_token_hint(patch.len());
@@ -3069,6 +3070,20 @@ async fn run_two_pass(
              (install public-inbox to enable lore.kernel.org retrieval)",
         );
     }
+    // checkpatch ground-truth stage: opt-in, kernel-only, degrades to a no-op when the tree
+    // has no `scripts/checkpatch.pl`. Detection is per-tree, so it is re-checked here rather
+    // than cached like `lei_available()`.
+    let checkpatch_cfg = checkpatch::CheckpatchConfig::from_env();
+    let checkpatch_target = matches!(target, config::ReviewTarget::Kernel);
+    let checkpatch_active =
+        checkpatch::is_active(&checkpatch_cfg, checkpatch_target, effective_repo);
+    if checkpatch_cfg.enabled && checkpatch_target && !checkpatch_active {
+        v(
+            vd,
+            "checkpatch stage skipped for this run: `scripts/checkpatch.pl` not found in the \
+             reviewed tree",
+        );
+    }
     // Display total = highest per-commit table index. Run-wide validation and LKML rendering use
     // their own progress rows after per-commit workers finish. Stages that don't run for a given
     // commit (subsystem skipped when no index, lore skipped when `lei` is missing, second-opinion
@@ -3164,12 +3179,32 @@ async fn run_two_pass(
             phase0_selected_prompts.is_some()
         ),
     );
+    let checkpatch_summary: Option<String> = if checkpatch_active {
+        match checkpatch::run_checkpatch(effective_repo, patch, checkpatch_cfg.max_bytes).await {
+            checkpatch::CheckpatchOutcome::Findings(summary) => Some(summary),
+            checkpatch::CheckpatchOutcome::Clean => None,
+            checkpatch::CheckpatchOutcome::Failed(reason) => {
+                // Never abort the review; surface the failure so an opted-in user can tell a
+                // broken checkpatch integration apart from a genuinely clean commit.
+                v(
+                    vd,
+                    format!(
+                        "checkpatch stage failed for this commit (continuing without): {reason}"
+                    ),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let reference = prompts::build_reference_context(
         target,
         changed_paths,
         max_context_size,
         phase0_selected_prompts.as_deref(),
         followup_summary.as_ref().map(|f| f.summary.as_str()),
+        checkpatch_summary.as_deref(),
     )?;
     let prefetch_block = prefetch_context_block(effective_repo, patch_diff, vd).await;
     let reference_with_prefetch = if prefetch_block.is_empty() {
