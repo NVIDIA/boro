@@ -44,12 +44,39 @@ conditions. Do not dismiss a failure merely because the configuration is not
 the default or because normal test configuration generation would enable the
 feature.
 
+For every configuration or linkage concern, the `reasoning` field MUST contain
+a proof with all of the following:
+
+1. `failing_config`: at least one valid failing configuration, such as
+   `CONFIG_SCHED_SMT=n`;
+2. `caller_condition`: the exact preprocessor, Kconfig, or Kbuild condition
+   under which the new caller is compiled;
+3. `provider_condition`: the exact condition guarding the declaration,
+   definition, export, or fallback stub in the checked-out tree;
+4. `failure`: the concrete consequence, such as an undeclared identifier,
+   incompatible stub semantics, or an unresolved symbol.
+
+Verify these facts with repository tools before emitting the concern. Also add
+them as a structured `proof` object with the four string fields above. Do not
+use “may”, “might”, “not guaranteed”, or “could be absent” as a substitute for
+the proof. If you cannot complete the proof from the checked-out tree, do not
+emit the configuration/linkage concern. This structured object applies only to
+configuration/linkage concerns. Omit it for hardware/architecture concerns and
+do not invent configuration or linkage values for those findings.
+
 Example pattern: new unconditional code calls `foo()` but the checked-out
 header declares `foo()` only under `CONFIG_BAR`. Unless the caller is also
 guarded or a `!CONFIG_BAR` stub is present in this tree, report that
 `CONFIG_BAR=n` fails to build.
 
 ## Hardware and architecture audit
+
+When generic code relies on an architecture-overridable predicate or helper,
+inspect representative non-stub implementations in the checked-out tree. Do
+not infer that two predicates are equivalent merely because one architecture's
+default implementation is a constant or no-op. If the patch validates one
+object and returns a related object, verify that the returned object still
+satisfies every architecture-dependent part of the original predicate.
 
 If the patch touches driver or hardware-specific code, rigorously review
 register accesses, IRQ handling, DMA mapping/unmapping, memory barriers, and

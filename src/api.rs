@@ -27,6 +27,12 @@ use crate::verbose::VerboseDest;
 const USER_JSON_INSTRUCTION: &str = r#"Return ONLY a JSON object (no markdown fences) with this shape:
 {"findings":[{"problem":"string","severity":"Low|Medium|High|Critical","severity_explanation":"string","location":{"file":"path/in/diff","line":N,"line_end":N,"side":"LEFT|RIGHT"}}]}
 Required fields per finding: "problem", "severity", "severity_explanation".
+For every finding, make "severity_explanation" carry concrete proof appropriate
+to the issue type: identify the relevant code or text facts, a reachable trigger
+or witness when applicable, the violated invariant or contradiction, and the
+concrete failure or user-visible defect. Exact contradictory text is sufficient
+proof for comment and commit-message findings. Do not use "may", "might",
+"could", or "not guaranteed" as a substitute for missing evidence.
 "location" is OPTIONAL - include it ONLY when you can anchor the finding to a specific hunk in the diff:
   - "file": path EXACTLY as it appears in the diff (post-image path for RIGHT, pre-image for LEFT)
   - "line": 1-based line number in that file
@@ -2845,6 +2851,16 @@ pub fn specialist_stage_user_payload(
     } else {
         format!("{prefetched_context_block}\n")
     };
+    let concern_schema = if stage == 7 {
+        r#"{"type":"s7:string","description":"string","reasoning":"string","location":{"file":"path/in/diff","line":N,"line_end":N,"side":"LEFT|RIGHT"}}"#
+    } else {
+        r#"{"type":"string","description":"string","reasoning":"string","location":{"file":"path/in/diff","line":N,"line_end":N,"side":"LEFT|RIGHT"}}"#
+    };
+    let proof_contract = if stage == 7 {
+        r#"For stage 7, the "proof" object is conditional. For every configuration/linkage concern it is REQUIRED with exactly these four non-empty string fields: "proof":{"failing_config":"string","caller_condition":"string","provider_condition":"string","failure":"string"}. For hardware/architecture concerns, OMIT "proof" and do not invent configuration or linkage values. "#
+    } else {
+        ""
+    };
     format!(
         "# Patch (diff-only; full commit message omitted on purpose)\n\n```\n{patch_slim}\n```\n\n\
 {prefetch_section}\
@@ -2853,9 +2869,11 @@ pub fn specialist_stage_user_payload(
 # boro specialist stage {stage}\n\n{instruction_body}\n\n\
 # Reference excerpts for this stage\n\n{reference_addon_md}\n\n\
 Return ONLY JSON (no markdown fences): \
-{{\"concerns\":[{{\"type\":\"string\",\"description\":\"string\",\"reasoning\":\"string\",\"location\":{{\"file\":\"path/in/diff\",\"line\":N,\"line_end\":N,\"side\":\"LEFT|RIGHT\"}}}}]}}. \
+{{\"concerns\":[{concern_schema}]}}. \
 Top-level key must be \"concerns\" (not \"findings\"). \
 Use a short \"type\" label prefixed with \"s{stage}:\" (e.g. \"s{stage}:uaf\"). \
+{proof_contract}\
+For every concern, make \"reasoning\" carry concrete proof appropriate to the issue type: the relevant code or text facts, a reachable trigger or witness when applicable, the violated invariant or contradiction, and the concrete failure or user-visible defect. Examples include a witness state and path for execution flow, an interleaving or lock-order cycle for concurrency, an acquisition/handoff/cleanup path for resources, an attacker-controlled input path for security, or exact contradictory text for comment consistency. Do not use \"may\", \"might\", \"could\", or \"not guaranteed\" as a substitute for missing evidence. \
 Do not emit a concern merely because the old/removed code was buggy when the new/right-side diff fixes that behavior; report only remaining, incomplete, or newly introduced bugs. \
 The \"location\" field is OPTIONAL - include it only when you can anchor the concern to a specific hunk in the diff: \
 \"file\" must match the diff path exactly (post-image for RIGHT, pre-image for LEFT), \"line\" is 1-based, \"line_end\" optional for a range, \"side\" is \"RIGHT\" for added/modified lines or \"LEFT\" for removed/context lines in the old file. \
@@ -2915,6 +2933,7 @@ Add `concerns` for substantive problems; use `type` values such as `msg:typo`, `
 Return ONLY JSON (no markdown fences): \
 {{\"concerns\":[{{\"type\":\"string\",\"description\":\"string\",\"reasoning\":\"string\",\"location\":{{\"file\":\"path/in/diff\",\"line\":N,\"line_end\":N,\"side\":\"LEFT|RIGHT\"}}}}]}}. \
 Top-level key must be \"concerns\" (not \"findings\"). \
+For every concern, make \"reasoning\" carry concrete proof appropriate to the issue type: the relevant code or text facts, a reachable trigger or witness when applicable, the violated invariant or contradiction, and the concrete failure or user-visible defect. Exact contradictory text is sufficient proof for comment and commit-message concerns. Do not use \"may\", \"might\", \"could\", or \"not guaranteed\" as a substitute for missing evidence. \
 Do not emit a concern merely because the old/removed code was buggy when the new/right-side diff fixes that behavior; report only remaining, incomplete, or newly introduced bugs. \
 The \"location\" field is OPTIONAL - include it only when you can anchor the concern to a specific hunk in the diff (\"file\" matches the diff path exactly; \"line\" is 1-based in that file; \"side\" is \"RIGHT\" for the new file or \"LEFT\" for the old file). \
 Do NOT invent locations - omit when unsure. \
@@ -2954,6 +2973,8 @@ pub fn consolidation_user_payload(
 You are the lead reviewer. Deduplicate and assign severity. \
 Include a finding only if the evidence is concrete and anchored to a location in the diff; that evidence may come from the diff itself or from the pre-fetched source context around touched code. \
 Discard anything based on generic assumptions or on code paths unrelated to the touched lines. \
+Apply the proof rule to every concern, not only configuration/linkage concerns. Treat a concern as proven when its reasoning identifies the relevant code or text facts, a reachable trigger or witness when applicable, the violated invariant or direct contradiction, and the concrete failure or user-visible defect. Proof is domain-specific: for example, use a witness state and path for execution flow, an interleaving or lock-order cycle for concurrency, an acquisition/handoff/cleanup path for resources, an attacker-controlled input path for security, and exact quoted text for comment or commit-message inconsistencies. Do not discard a proven concern merely because its description uses cautious wording. Conversely, discard claims using “may”, “might”, “could”, or “not guaranteed” when they lack concrete supporting evidence. \
+For configuration/linkage concerns, treat a complete proof containing a valid `failing_config`, the checked-out tree's exact `caller_condition` and `provider_condition`, and a concrete `failure` as sufficient evidence. Preserve such a finding even when the failing configuration is non-default. Do not discard it merely because the description uses cautious wording when the structured `proof` and reasoning establish all four facts. Conversely, discard claims that a declaration, definition, export, or stub “may” or “might” be absent, is “not guaranteed”, or “could be absent” when they do not provide that complete proof. \
 Respect introduced vs pre-existing issues: drop pre-existing issues when the reviewed diff fixes them. A finding must identify a bug that remains in the new/right-side code, an incomplete fix, or a different bug introduced by the patch. High/critical pre-existing issues in an enclosing function or directly referenced definition may be kept only when they still exist after the patch and this patch touches or revalidates that path; low/medium pre-existing issues should be dropped unless introduced or made worse by this patch. \
 Keep valid concerns about commit-message English/grammar/typos or misleading changelog text (often `msg:*` types) when they are user-visible issues.\n\
 If the series context lists patches **after** the one under review, you may discard a concern only when a later subject (or clear evidence) shows the issue was actually addressed; do not dismiss based on vague promises in commit messages alone.\n\
@@ -3468,6 +3489,74 @@ mod tests {
         assert!(s.contains("drop pre-existing issues when the reviewed diff fixes them"));
         assert!(s.contains("bug that remains in the new/right-side code"));
         assert!(s.contains("incomplete fix"));
+    }
+
+    #[test]
+    fn concern_and_finding_prompts_require_domain_specific_proof() {
+        let broad = broad_concerns_user_payload("", "subject", "diff");
+        assert!(broad.contains("For every concern"));
+        assert!(broad.contains("reachable trigger or witness"));
+        assert!(broad.contains("substitute for missing evidence"));
+
+        let specialist = specialist_stage_user_payload("", "", "diff", "", 5, "", "");
+        assert!(specialist.contains("For every concern"));
+        assert!(specialist.contains("interleaving or lock-order cycle"));
+        assert!(specialist.contains("acquisition/handoff/cleanup path"));
+
+        let single = single_pass_user_payload("", "subject", "diff");
+        assert!(single.contains("For every finding"));
+        assert!(single.contains("violated invariant or contradiction"));
+
+        let consolidation = consolidation_user_payload("", &json!({}), "", "");
+        assert!(consolidation.contains("proof rule to every concern"));
+        assert!(consolidation.contains("Proof is domain-specific"));
+        assert!(consolidation.contains("Do not discard a proven concern"));
+    }
+
+    #[test]
+    fn stage7_and_consolidation_share_linkage_proof_contract() {
+        let stage7 = specialist_stage_user_payload("", "", "diff", "", 7, "", "");
+        for field in [
+            "failing_config",
+            "caller_condition",
+            "provider_condition",
+            "failure",
+        ] {
+            assert!(stage7.contains(field), "stage 7 schema missing {field}");
+        }
+        assert!(stage7.contains("configuration/linkage concern it is REQUIRED"));
+        assert!(stage7.contains("exactly these four non-empty string fields"));
+        assert!(stage7.contains(r#""reasoning":"string","location":{"file":"path/in/diff""#));
+
+        let stage6 = specialist_stage_user_payload("", "", "diff", "", 6, "", "");
+        assert!(!stage6.contains("failing_config"));
+
+        let prior = json!({"concerns": [{
+            "type": "s7:linkage",
+            "description": "missing helper",
+            "reasoning": "verified",
+            "proof": {
+                "failing_config": "CONFIG_FOO=n",
+                "caller_condition": "always built",
+                "provider_condition": "CONFIG_FOO",
+                "failure": "undeclared identifier"
+            }
+        }]});
+        let consolidation = consolidation_user_payload("", &prior, "Not applicable", "");
+        assert!(consolidation.contains("complete proof"));
+        assert!(consolidation.contains("non-default"));
+        assert!(consolidation.contains("not guaranteed"));
+        assert!(consolidation.contains("CONFIG_FOO=n"));
+    }
+
+    #[test]
+    fn stage7_hardware_concerns_omit_linkage_proof() {
+        let instruction = crate::stages::instruction_body(7).expect("stage 7 instruction");
+        let stage7 = specialist_stage_user_payload(instruction, "", "diff", "", 7, "", "");
+
+        assert!(stage7.contains("missing `dma_wmb()`/`dma_rmb()` barriers"));
+        assert!(stage7.contains("For hardware/architecture concerns, OMIT \"proof\""));
+        assert!(stage7.contains("do not invent configuration or linkage values"));
     }
 
     #[test]
