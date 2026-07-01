@@ -3385,11 +3385,52 @@ fn apply_accepted_resolutions(repo: &Path, accepted: &[AcceptedSuggestion]) -> R
                     suggestion.start_line
                 );
             }
-            let replacement: Vec<String> = suggestion
+            let mut replacement: Vec<String> = suggestion
                 .resolved_code
                 .split_inclusive('\n')
                 .map(ToString::to_string)
                 .collect();
+            // Pick the file's EOL *style* for re-terminating replacement lines.
+            // A surrounding unchanged line is the most reliable source, since it
+            // is verbatim from the file; scan outward from the conflict (nearest
+            // preceding line first, then following lines) for one that is newline
+            // terminated. Fall back to the >>>>>>> marker line, which git renders
+            // in the file's style, for a conflict that spans the whole file and
+            // has no surrounding content. None of these tell us whether a final
+            // newline exists (git always terminates the marker even when the EOF
+            // blob had none), so terminators are only ever added mid-file; at EOF
+            // resolved_code's own "no newline at end" convention is preserved.
+            let eol_sample = lines[..start]
+                .iter()
+                .rev()
+                .chain(lines[end..].iter())
+                .find(|line| line.ends_with('\n'))
+                .map_or(lines[end - 1].as_str(), String::as_str);
+            let eol = if eol_sample.ends_with("\r\n") {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            let at_eof = end == lines.len();
+            let last_idx = replacement.len().saturating_sub(1);
+            for (i, line) in replacement.iter_mut().enumerate() {
+                if let Some(body) = line.strip_suffix('\n') {
+                    // A real line terminator (LF, optionally preceded by CR):
+                    // normalize it to the file's style so a CRLF file never gets a
+                    // lone \n. This covers interior lines, which split_inclusive
+                    // always leaves \n-terminated regardless of the file's
+                    // convention. A bare trailing \r is content, not a terminator,
+                    // so it is deliberately not matched here.
+                    let body = body.strip_suffix('\r').unwrap_or(body);
+                    *line = format!("{body}{eol}");
+                } else if i != last_idx || !at_eof {
+                    // An unterminated interior line, or an unterminated final line
+                    // that is not at EOF, would fuse onto the following line. Only
+                    // a final line at EOF is left bare, preserving resolved_code's
+                    // own "no newline at end of file" convention.
+                    line.push_str(eol);
+                }
+            }
             lines.splice(start..end, replacement);
         }
 
@@ -4146,6 +4187,215 @@ Body mentioning cherry picked from commit in prose.
             fs::read_to_string(file).unwrap(),
             "before\nresolved\nafter\n"
         );
+    }
+
+    #[test]
+    fn apply_accepted_resolution_preserves_newline_when_resolved_code_lacks_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.c");
+        fs::write(
+            &file,
+            "before\n<<<<<<< HEAD\nlocal\n||||||| base\nbase\n=======\nremote\n>>>>>>> commit\nafter\n",
+        )
+        .unwrap();
+
+        apply_accepted_resolutions(
+            dir.path(),
+            &[AcceptedSuggestion {
+                file_path: "x.c".to_string(),
+                start_line: 2,
+                end_line: 8,
+                resolved_code: "resolved".to_string(),
+                explanation: "applied remote intent".to_string(),
+                validation_reason: "preserves both sides".to_string(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(file).unwrap(),
+            "before\nresolved\nafter\n"
+        );
+    }
+
+    #[test]
+    fn apply_accepted_resolution_preserves_missing_final_newline_at_eof() {
+        // git renders the >>>>>>> marker with a trailing \n even when the
+        // conflicting blobs had no newline at EOF, so the marker must not be used
+        // to fabricate a final newline. A resolution with no trailing newline for
+        // an EOF conflict must leave the file without one.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.c");
+        fs::write(
+            &file,
+            "<<<<<<< HEAD\nlocal\n||||||| base\nbase\n=======\nremote\n>>>>>>> commit\n",
+        )
+        .unwrap();
+
+        apply_accepted_resolutions(
+            dir.path(),
+            &[AcceptedSuggestion {
+                file_path: "x.c".to_string(),
+                start_line: 1,
+                end_line: 7,
+                resolved_code: "resolved".to_string(),
+                explanation: "applied remote intent".to_string(),
+                validation_reason: "preserves both sides".to_string(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(file).unwrap(), "resolved");
+    }
+
+    #[test]
+    fn apply_accepted_resolution_preserves_crlf_line_endings() {
+        // A CRLF file must never acquire a lone \n: the terminator re-added around
+        // the resolution has to match the file's \r\n style.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.c");
+        fs::write(
+            &file,
+            "before\r\n<<<<<<< HEAD\r\nlocal\r\n||||||| base\r\nbase\r\n=======\r\nremote\r\n>>>>>>> commit\r\nafter\r\n",
+        )
+        .unwrap();
+
+        apply_accepted_resolutions(
+            dir.path(),
+            &[AcceptedSuggestion {
+                file_path: "x.c".to_string(),
+                start_line: 2,
+                end_line: 8,
+                resolved_code: "resolved".to_string(),
+                explanation: "applied remote intent".to_string(),
+                validation_reason: "preserves both sides".to_string(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(file).unwrap(),
+            "before\r\nresolved\r\nafter\r\n"
+        );
+    }
+
+    #[test]
+    fn apply_accepted_resolution_normalizes_multiline_crlf_resolution() {
+        // resolved_code arrives \n-delimited from JSON, so every interior line
+        // must also be re-terminated to the file's \r\n style, not just the last.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.c");
+        fs::write(
+            &file,
+            "before\r\n<<<<<<< HEAD\r\nlocal\r\n||||||| base\r\nbase\r\n=======\r\nremote\r\n>>>>>>> commit\r\nafter\r\n",
+        )
+        .unwrap();
+
+        apply_accepted_resolutions(
+            dir.path(),
+            &[AcceptedSuggestion {
+                file_path: "x.c".to_string(),
+                start_line: 2,
+                end_line: 8,
+                resolved_code: "line1\nline2".to_string(),
+                explanation: "applied remote intent".to_string(),
+                validation_reason: "preserves both sides".to_string(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(file).unwrap(),
+            "before\r\nline1\r\nline2\r\nafter\r\n"
+        );
+    }
+
+    #[test]
+    fn apply_accepted_resolution_derives_crlf_from_surrounding_lines() {
+        // EOL style is taken from surrounding unchanged file content, not just the
+        // marker. Even with conflict markers rendered using bare \n, a CRLF file
+        // (shown by its surrounding \r\n lines) must still get \r\n re-added.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.c");
+        fs::write(
+            &file,
+            "before\r\n<<<<<<< HEAD\nlocal\n||||||| base\nbase\n=======\nremote\n>>>>>>> commit\nafter\r\n",
+        )
+        .unwrap();
+
+        apply_accepted_resolutions(
+            dir.path(),
+            &[AcceptedSuggestion {
+                file_path: "x.c".to_string(),
+                start_line: 2,
+                end_line: 8,
+                resolved_code: "resolved".to_string(),
+                explanation: "applied remote intent".to_string(),
+                validation_reason: "preserves both sides".to_string(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(file).unwrap(),
+            "before\r\nresolved\r\nafter\r\n"
+        );
+    }
+
+    #[test]
+    fn apply_accepted_resolution_treats_bare_cr_as_content_at_eof() {
+        // A bare trailing \r (no \n) is content, not a line terminator, so an EOF
+        // resolution ending in \r must not gain a fabricated final newline.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.c");
+        fs::write(
+            &file,
+            "<<<<<<< HEAD\nlocal\n||||||| base\nbase\n=======\nremote\n>>>>>>> commit\n",
+        )
+        .unwrap();
+
+        apply_accepted_resolutions(
+            dir.path(),
+            &[AcceptedSuggestion {
+                file_path: "x.c".to_string(),
+                start_line: 1,
+                end_line: 7,
+                resolved_code: "foo\r".to_string(),
+                explanation: "applied remote intent".to_string(),
+                validation_reason: "preserves both sides".to_string(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(file).unwrap(), "foo\r");
+    }
+
+    #[test]
+    fn apply_accepted_resolution_deletes_block_for_empty_resolved_code() {
+        // Empty resolved_code means "resolve by deletion": the whole conflict
+        // block is removed and the surrounding lines keep their own terminators.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.c");
+        fs::write(
+            &file,
+            "before\n<<<<<<< HEAD\nlocal\n||||||| base\nbase\n=======\nremote\n>>>>>>> commit\nafter\n",
+        )
+        .unwrap();
+
+        apply_accepted_resolutions(
+            dir.path(),
+            &[AcceptedSuggestion {
+                file_path: "x.c".to_string(),
+                start_line: 2,
+                end_line: 8,
+                resolved_code: String::new(),
+                explanation: "dropped both sides".to_string(),
+                validation_reason: "conflict resolved by deletion".to_string(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(file).unwrap(), "before\nafter\n");
     }
 
     #[test]
