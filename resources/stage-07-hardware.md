@@ -33,6 +33,12 @@ symbol newly referenced by added code:
 4. Check that header stubs and architecture fallbacks have compatible types
    and semantics. Check that built-in code does not depend on a module-only
    symbol and that module boundaries have the required exports.
+   `EXPORT_SYMBOL*()` is required only when a loadable module references a
+   symbol. It is NOT required for a call between ordinary translation units
+   linked into the same built-in vmlinux component, and it is irrelevant when
+   the provider and caller are textually included into the same translation
+   unit. Inspect Kbuild/Makefile ownership and aggregator `#include "*.c"`
+   files before reporting a missing export.
 5. If the patch relies on a prerequisite commit, verify that it is an ancestor
    of the reviewed tree or included earlier in the reviewed series. Otherwise
    report the missing prerequisite as a regression in the patch as applied to
@@ -63,6 +69,11 @@ the proof. If you cannot complete the proof from the checked-out tree, do not
 emit the configuration/linkage concern. This structured object applies only to
 configuration/linkage concerns. Omit it for hardware/architecture concerns and
 do not invent configuration or linkage values for those findings.
+
+Tool use is an enforced postcondition for configuration/linkage concerns. A
+generic statement such as "any config", "any file including this header", or
+"if another compilation unit calls it" is hypothetical, not a valid proof.
+Name an actual caller and its checked-out-tree build condition.
 
 Example pattern: new unconditional code calls `foo()` but the checked-out
 header declares `foo()` only under `CONFIG_BAR`. Unless the caller is also
