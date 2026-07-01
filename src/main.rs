@@ -541,6 +541,17 @@ async fn commit_review_inner(
     };
 
     let mut findings_val = review.findings_val.clone();
+    let repaired =
+        api::repair_misattributed_message_findings(&mut findings_val, &commit_headers, &patch_diff);
+    if repaired.relocated > 0 || repaired.dropped > 0 {
+        v(
+            vd,
+            format!(
+                "final source repair: relocated {} patch-text finding(s), dropped {} ambiguous finding(s)",
+                repaired.relocated, repaired.dropped
+            ),
+        );
+    }
     drop_hallucinated_locations(&mut findings_val, &changed, vd);
     let diff_idx = diff_index::DiffIndex::from_unified_diff(&patch_diff);
     drop_unanchored_locations(&mut findings_val, &diff_idx, vd);
@@ -3265,7 +3276,7 @@ async fn run_two_pass(
         ),
     );
 
-    let concerns = match parsed_pass1 {
+    let mut concerns = match parsed_pass1 {
         Some(v1) => v1.get("concerns").cloned().unwrap_or_else(|| json!([])),
         None => {
             v(
@@ -3275,6 +3286,17 @@ async fn run_two_pass(
             json!([])
         }
     };
+    let repaired =
+        api::repair_misattributed_message_concerns(&mut concerns, commit_headers, patch_diff);
+    if repaired.relocated > 0 || repaired.dropped > 0 {
+        v(
+            vd,
+            format!(
+                "pass 1 source repair: relocated {} patch-text concern(s), dropped {} ambiguous concern(s)",
+                repaired.relocated, repaired.dropped
+            ),
+        );
+    }
 
     let patch_slim = api::cap_utf8(patch_diff, 400_000);
     v(
