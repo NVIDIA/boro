@@ -3061,6 +3061,8 @@ pub const SYSTEM_REVIEW_VALIDATION_FINDINGS: &str =
 pub struct ValidationFindingsCommit<'a> {
     pub sha: &'a str,
     pub subject: &'a str,
+    pub commit_message: &'a str,
+    pub reference_context: &'a str,
     pub diff: &'a str,
     /// The per-commit `findings[]` array exactly as it appears in `out`.
     pub findings: &'a Value,
@@ -3076,6 +3078,8 @@ pub fn validation_findings_user_payload(commits: &[ValidationFindingsCommit<'_>]
             json!({
                 "sha": c.sha,
                 "subject": c.subject,
+                "commit_message": cap_utf8(c.commit_message, 48_000),
+                "reference_context": cap_utf8(c.reference_context, 80_000),
                 "diff": cap_utf8(c.diff, 80_000),
                 "findings": c.findings,
             })
@@ -3773,12 +3777,16 @@ mod tests {
         let commits = vec![ValidationFindingsCommit {
             sha: "abc123def456",
             subject: "fix loop",
+            commit_message: "commit abc123def456\n\n    Explain why the loop bound changes.",
+            reference_context: "x.c: helper() guarantees count is positive",
             diff: "diff --git a/x.c b/x.c\n--- a/x.c\n+++ b/x.c",
             findings: &findings,
         }];
         let s = validation_findings_user_payload(&commits);
         assert!(s.contains("\"sha\": \"abc123def456\""));
         assert!(s.contains("\"subject\": \"fix loop\""));
+        assert!(s.contains("Explain why the loop bound changes"));
+        assert!(s.contains("helper() guarantees count is positive"));
         assert!(s.contains("\"problem\": \"off-by-one\""));
         // The closing instruction mentioning the strict output shape must be present.
         assert!(s.contains("Return ONLY a JSON object"));

@@ -115,6 +115,7 @@ struct CommitReviewResult {
     usage_commit: Value,
     usage_steps: Option<Value>,
     phase0_selected_prompts: Option<Vec<String>>,
+    validation_context: String,
 }
 
 struct UpstreamFollowupResult {
@@ -497,6 +498,7 @@ async fn commit_review_inner(
             model,
             target,
             &reference_with_prefetch,
+            &prefetch_block,
             &commit_headers,
             &patch_diff,
             vd,
@@ -548,6 +550,10 @@ async fn commit_review_inner(
         "findings": findings_val.get("findings").cloned().unwrap_or(json!([])),
         "usage": review.usage_commit,
     });
+    if !review.validation_context.is_empty() {
+        // Internal hand-off to the global validation stage. Removed before output.
+        commit_obj["_validation_context"] = json!(review.validation_context);
+    }
     if let Some(st) = &review.usage_steps {
         commit_obj["usage_steps"] = st.clone();
     }
@@ -1060,7 +1066,7 @@ async fn run_findings_validation(
     // Snapshot the commits we need to send. We only validate commits that
     // have at least one finding; commits with empty findings are passed
     // through unchanged.
-    let mut payload_owned: Vec<(String, String, String, Value)> = Vec::new();
+    let mut payload_owned: Vec<(String, String, String, String, String, Value)> = Vec::new();
     if let Some(commits) = out["commits"].as_array() {
         for c in commits {
             let findings = match c.get("findings").and_then(|f| f.as_array()) {
@@ -1082,7 +1088,20 @@ async fn run_findings_validation(
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
-            payload_owned.push((sha12, subject, diff, Value::Array(findings.clone())));
+            let commit_message = git::show_commit_headers(repo, sha_full).unwrap_or_default();
+            let reference_context = c
+                .get("_validation_context")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            payload_owned.push((
+                sha12,
+                subject,
+                commit_message,
+                reference_context,
+                diff,
+                Value::Array(findings.clone()),
+            ));
         }
     }
     if payload_owned.is_empty() {
@@ -1092,11 +1111,15 @@ async fn run_findings_validation(
     let payload_refs: Vec<api::ValidationFindingsCommit<'_>> = payload_owned
         .iter()
         .map(
-            |(sha, subject, diff, findings)| api::ValidationFindingsCommit {
-                sha: sha.as_str(),
-                subject: subject.as_str(),
-                diff: diff.as_str(),
-                findings,
+            |(sha, subject, commit_message, reference_context, diff, findings)| {
+                api::ValidationFindingsCommit {
+                    sha: sha.as_str(),
+                    subject: subject.as_str(),
+                    commit_message: commit_message.as_str(),
+                    reference_context: reference_context.as_str(),
+                    diff: diff.as_str(),
+                    findings,
+                }
             },
         )
         .collect();
@@ -2315,6 +2338,15 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
         .await;
     }
 
+    // The prefetched source block is an internal validation hand-off, not report data.
+    if let Some(commits) = out["commits"].as_array_mut() {
+        for commit in commits {
+            if let Some(obj) = commit.as_object_mut() {
+                obj.remove("_validation_context");
+            }
+        }
+    }
+
     // Phase 3: render per-commit LKML from validated_findings (or raw
     // findings when validation was off / failed). Skipped in findings mode
     // (structured findings replace the narrative) and on dry-run / Ctrl-C.
@@ -2422,6 +2454,7 @@ async fn run_single_pass(
     model: &config::ResolvedModel,
     target: config::ReviewTarget,
     reference: &str,
+    validation_context: &str,
     commit_headers: &str,
     patch_diff: &str,
     vd: &VerboseDest,
@@ -2543,6 +2576,7 @@ async fn run_single_pass(
         usage_commit: usage_json,
         usage_steps: Some(steps),
         phase0_selected_prompts: None,
+        validation_context: validation_context.to_string(),
     })
 }
 
@@ -3429,6 +3463,7 @@ async fn run_two_pass(
             usage_commit: usage_json,
             usage_steps: Some(steps),
             phase0_selected_prompts,
+            validation_context: prefetch_block.clone(),
         });
     }
 
@@ -3610,6 +3645,7 @@ async fn run_two_pass(
         usage_commit: usage_json,
         usage_steps: Some(steps),
         phase0_selected_prompts,
+        validation_context: prefetch_block,
     })
 }
 
