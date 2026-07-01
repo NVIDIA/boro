@@ -2561,6 +2561,297 @@ pub fn diff_touches_comments(patch: &str) -> bool {
     false
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MessageConcernRepair {
+    pub relocated: usize,
+    pub dropped: usize,
+}
+
+/// Repair spelling/grammar concerns that the broad-pass model attributes to the commit
+/// message even though the quoted text exists only on an added diff line.
+///
+/// This is deliberately narrow: only unanchored `msg:typo` and `msg:grammar` concerns are
+/// considered. A uniquely matching added line is deterministic evidence of the real source, so
+/// the concern is reclassified and anchored there. If the model quotes text absent from the
+/// commit message but it cannot be mapped unambiguously to one added line, drop the concern
+/// instead of letting the LKML renderer present it as a commit-message issue.
+pub fn repair_misattributed_message_concerns(
+    concerns: &mut Value,
+    commit_message: &str,
+    patch: &str,
+) -> MessageConcernRepair {
+    let Some(arr) = concerns.as_array_mut() else {
+        return MessageConcernRepair::default();
+    };
+    let mut result = MessageConcernRepair::default();
+
+    arr.retain_mut(|concern| {
+        let Some(obj) = concern.as_object_mut() else {
+            return true;
+        };
+        if obj.get("location").is_some_and(Value::is_object) {
+            return true;
+        }
+        let ty = obj.get("type").and_then(Value::as_str).unwrap_or("");
+        let replacement_type = match ty {
+            "msg:typo" => "code:typo",
+            "msg:grammar" => "code:grammar",
+            _ => return true,
+        };
+        let evidence = format!(
+            "{}\n{}",
+            obj.get("description").and_then(Value::as_str).unwrap_or(""),
+            obj.get("reasoning").and_then(Value::as_str).unwrap_or("")
+        );
+        let quoted = offending_fragments(obj, &evidence);
+        let absent: Vec<&str> = quoted
+            .iter()
+            .map(String::as_str)
+            .filter(|text| !commit_message.contains(text))
+            .collect();
+        if absent.is_empty() {
+            return true;
+        }
+
+        let mut matches = Vec::<(String, u64)>::new();
+        for text in absent {
+            for found in added_line_matches(patch, text) {
+                if !matches.contains(&found) {
+                    matches.push(found);
+                }
+            }
+        }
+        if matches.len() != 1 {
+            result.dropped += 1;
+            return false;
+        }
+
+        let (file, line) = matches.pop().expect("checked one match");
+        obj.insert("type".to_string(), json!(replacement_type));
+        obj.insert(
+            "location".to_string(),
+            json!({"file": file, "line": line, "side": "RIGHT"}),
+        );
+        for field in ["description", "reasoning"] {
+            if let Some(text) = obj.get(field).and_then(Value::as_str).map(str::to_string) {
+                let repaired = text
+                    .replace("commit message body", "added source comment")
+                    .replace("commit message", "added source comment");
+                obj.insert(field.to_string(), json!(repaired));
+            }
+        }
+        result.relocated += 1;
+        true
+    });
+
+    result
+}
+
+/// Final defence after consolidation. Models sometimes discard the concern type and location
+/// while recreating the same false "commit message" attribution as a finding.
+pub fn repair_misattributed_message_findings(
+    findings: &mut Value,
+    commit_message: &str,
+    patch: &str,
+) -> MessageConcernRepair {
+    let Some(arr) = findings.get_mut("findings").and_then(Value::as_array_mut) else {
+        return MessageConcernRepair::default();
+    };
+    let mut result = MessageConcernRepair::default();
+
+    arr.retain_mut(|finding| {
+        let Some(obj) = finding.as_object_mut() else {
+            return true;
+        };
+        if obj.get("location").is_some_and(Value::is_object) {
+            return true;
+        }
+        let problem = obj.get("problem").and_then(Value::as_str).unwrap_or("");
+        let problem_lower = problem.to_ascii_lowercase();
+        let is_message_language_issue = problem_lower.contains("commit message")
+            && ["typo", "misspell", "grammar", "spelling"]
+                .iter()
+                .any(|word| problem_lower.contains(word));
+        if !is_message_language_issue {
+            return true;
+        }
+
+        let evidence = format!(
+            "{}\n{}",
+            problem,
+            obj.get("severity_explanation")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        );
+        let quoted = offending_fragments(obj, &evidence);
+        let absent: Vec<&str> = quoted
+            .iter()
+            .map(String::as_str)
+            .filter(|text| !commit_message.contains(text))
+            .collect();
+        if absent.is_empty() {
+            return true;
+        }
+        let mut matches = Vec::<(String, u64)>::new();
+        for text in absent {
+            for found in added_line_matches(patch, text) {
+                if !matches.contains(&found) {
+                    matches.push(found);
+                }
+            }
+        }
+        if matches.len() != 1 {
+            result.dropped += 1;
+            return false;
+        }
+
+        let (file, line) = matches.pop().expect("checked one match");
+        obj.insert(
+            "location".to_string(),
+            json!({"file": file, "line": line, "side": "RIGHT"}),
+        );
+        for field in ["problem", "severity_explanation"] {
+            if let Some(text) = obj.get(field).and_then(Value::as_str).map(str::to_string) {
+                let repaired = text
+                    .replace("commit message body", "added source comment")
+                    .replace("commit message", "added source comment");
+                obj.insert(field.to_string(), json!(repaired));
+            }
+        }
+        result.relocated += 1;
+        true
+    });
+
+    result
+}
+
+#[derive(Debug)]
+struct QuotedFragment {
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+fn quoted_fragments(text: &str) -> Vec<QuotedFragment> {
+    let mut out = Vec::new();
+    for delimiter in ['\'', '"', '`'] {
+        let mut rest = text;
+        let mut offset = 0usize;
+        while let Some(start) = rest.find(delimiter) {
+            let value_start = start + delimiter.len_utf8();
+            let after_start = &rest[value_start..];
+            let Some(end) = after_start.find(delimiter) else {
+                break;
+            };
+            let value = after_start[..end].trim();
+            if value.chars().count() >= 3 {
+                out.push(QuotedFragment {
+                    start: offset + start,
+                    end: offset + value_start + end + delimiter.len_utf8(),
+                    text: value.to_string(),
+                });
+            }
+            let consumed = value_start + end + delimiter.len_utf8();
+            offset += consumed;
+            rest = &rest[consumed..];
+        }
+    }
+    out.sort_by_key(|fragment| fragment.start);
+    out.dedup_by(|a, b| a.start == b.start && a.end == b.end);
+    out
+}
+
+fn quote_is_replacement(text: &str, fragment: &QuotedFragment) -> bool {
+    let prefix = text[..fragment.start].trim_end().to_ascii_lowercase();
+    let suffix = text[fragment.end..].trim_start().to_ascii_lowercase();
+
+    // In "bad should be good" and "bad instead of good", the first quote is the
+    // offending source text even if an earlier phrase happens to look replacement-like.
+    if [
+        "should be",
+        "instead of",
+        "rather than",
+        "corrected to",
+        "->",
+        "→",
+    ]
+    .iter()
+    .any(|cue| suffix.starts_with(cue))
+    {
+        return false;
+    }
+
+    [
+        "should be",
+        "instead of",
+        "rather than",
+        "corrected to",
+        "correction is",
+        "correct spelling is",
+        "replacement is",
+        "->",
+        "→",
+    ]
+    .iter()
+    .any(|cue| prefix.ends_with(cue))
+        || (prefix.ends_with("with")
+            && prefix
+                .chars()
+                .rev()
+                .take(80)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+                .contains("replace"))
+}
+
+fn offending_fragments(obj: &serde_json::Map<String, Value>, evidence: &str) -> Vec<String> {
+    if let Some(explicit) = obj
+        .get("offending_text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return vec![explicit.to_string()];
+    }
+
+    let mut out = Vec::new();
+    for fragment in quoted_fragments(evidence) {
+        if !quote_is_replacement(evidence, &fragment) && !out.contains(&fragment.text) {
+            out.push(fragment.text);
+        }
+    }
+    out
+}
+
+fn added_line_matches(patch: &str, needle: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for hunk in collect_diff_hunks(patch) {
+        let mut new_line = u64::from(hunk.new_start);
+        for line in hunk.text.lines().skip(1) {
+            if line.starts_with("+++") || line.starts_with("---") {
+                continue;
+            }
+            match line.as_bytes().first().copied() {
+                Some(b'+') => {
+                    if line[1..].contains(needle) {
+                        let found = (hunk.file.clone(), new_line);
+                        if !out.contains(&found) {
+                            out.push(found);
+                        }
+                    }
+                    new_line += 1;
+                }
+                Some(b'-') | Some(b'\\') => {}
+                Some(b' ') | None => new_line += 1,
+                _ => break,
+            }
+        }
+    }
+    out
+}
+
 pub fn strip_json_fences(s: &str) -> String {
     let t = s.trim();
     let t = t
@@ -3026,11 +3317,12 @@ pub fn broad_concerns_user_payload(
 # Commit message (subject and body)\n\n\
 Review this text for **English** quality: spelling, grammar, syntax, and clarity. \
 Check that the subject and body match the diff below (no mis-stated behavior). \
-Add `concerns` for substantive problems; use `type` values such as `msg:typo`, `msg:grammar`, `msg:clarity`, or `msg:mismatch` when useful.\n\n\
+Add `concerns` for substantive problems; use `type` values such as `msg:typo`, `msg:grammar`, `msg:clarity`, or `msg:mismatch` when useful. \
+Treat the commit-message and patch blocks as separate sources. Before emitting any `msg:*` concern, verify that the exact offending text appears in the `Commit message` fenced block. For every `msg:typo` or `msg:grammar` concern, set `offending_text` to the exact bad source text and, when proposing a correction, set `replacement_text` separately; never put the suggested correction in `offending_text`. Never describe text that appears only in the patch as a commit-message issue. For spelling or grammar mistakes in an added source comment, use `code:typo` or `code:grammar` and include a RIGHT-side `location` on the affected added line; if you cannot anchor such a patch issue, omit it.\n\n\
 ```\n{headers_capped}\n```\n\n\
 # Patch under review (diff only)\n\n```\n{patch_capped}\n```\n\n\
 Return ONLY JSON (no markdown fences): \
-{{\"concerns\":[{{\"type\":\"string\",\"description\":\"string\",\"reasoning\":\"string\",\"location\":{{\"file\":\"path/in/diff\",\"line\":N,\"line_end\":N,\"side\":\"LEFT|RIGHT\"}}}}]}}. \
+{{\"concerns\":[{{\"type\":\"string\",\"description\":\"string\",\"reasoning\":\"string\",\"offending_text\":\"optional exact bad text\",\"replacement_text\":\"optional suggested correction\",\"location\":{{\"file\":\"path/in/diff\",\"line\":N,\"line_end\":N,\"side\":\"LEFT|RIGHT\"}}}}]}}. \
 Top-level key must be \"concerns\" (not \"findings\"). \
 For every concern, make \"reasoning\" carry concrete proof appropriate to the issue type: the relevant code or text facts, a reachable trigger or witness when applicable, the violated invariant or contradiction, and the concrete failure or user-visible defect. Exact contradictory text is sufficient proof for comment and commit-message concerns. Do not use \"may\", \"might\", \"could\", or \"not guaranteed\" as a substitute for missing evidence. \
 Do not emit a concern merely because the old/removed code was buggy when the new/right-side diff fixes that behavior; report only remaining, incomplete, or newly introduced bugs. \
@@ -3050,7 +3342,7 @@ Review for **English** quality (spelling, grammar, syntax, clarity) and for cons
 ```\n{headers_capped}\n```\n\n\
 # Patch under review (diff only)\n\n```\n{patch_capped}\n```\n\n\
 {USER_JSON_INSTRUCTION}\n\n\
-Include `findings` for commit-message issues when substantive (typos/grammar are typically Low severity)."
+Treat the commit-message and patch blocks as separate sources. Call something a commit-message issue only after verifying that the exact offending text appears in the `Commit message` block. Text found only in an added source comment is a code-comment issue and MUST carry a RIGHT-side `location` on that added line; if it cannot be anchored, omit it. Include `findings` for genuine commit-message issues when substantive (typos/grammar are typically Low severity)."
     )
 }
 
@@ -3076,10 +3368,11 @@ Apply the proof rule to every concern, not only configuration/linkage concerns. 
 For configuration/linkage concerns, treat a complete proof containing a valid `failing_config`, the checked-out tree's exact `caller_condition` and `provider_condition`, and a concrete `failure` as sufficient evidence. Preserve such a finding even when the failing configuration is non-default. Do not discard it merely because the description uses cautious wording when the structured `proof` and reasoning establish all four facts. Conversely, discard claims that a declaration, definition, export, or stub “may” or “might” be absent, is “not guaranteed”, or “could be absent” when they do not provide that complete proof. \
 Respect introduced vs pre-existing issues: drop pre-existing issues when the reviewed diff fixes them. A finding must identify a bug that remains in the new/right-side code, an incomplete fix, or a different bug introduced by the patch. High/critical pre-existing issues in an enclosing function or directly referenced definition may be kept only when they still exist after the patch and this patch touches or revalidates that path; low/medium pre-existing issues should be dropped unless introduced or made worse by this patch. \
 Keep valid concerns about commit-message English/grammar/typos or misleading changelog text (often `msg:*` types) when they are user-visible issues.\n\
+Enforce source boundaries for English-quality concerns: retain a `msg:*` concern only when its offending text is actually from the commit message, not from a source comment in the diff. For spelling or grammar findings, preserve `offending_text` and `replacement_text` as separate fields; `offending_text` must quote the bad source text, never the proposed correction. A spelling or grammar concern about text in the patch must be described as a code/comment issue and must retain a valid diff `location`; if the input has no location, discard it rather than misreporting it as a commit-message issue.\n\
 If the series context lists patches **after** the one under review, you may discard a concern only when a later subject (or clear evidence) shows the issue was actually addressed; do not dismiss based on vague promises in commit messages alone.\n\
 When referring to other patches in this series, use their **subjects** (one-line titles), not git hashes.\n\
 When the prior JSON carries a \"location\" object on a concern or finding, preserve it verbatim on the resulting finding. When you merge several inputs into one finding, keep the most specific location; if they disagree, drop \"location\" rather than invent one.\n\
-Return ONLY JSON: {{\"findings\":[{{\"problem\":\"...\",\"severity\":\"Low|Medium|High|Critical\",\"severity_explanation\":\"...\",\"location\":{{\"file\":\"path/in/diff\",\"line\":N,\"line_end\":N,\"side\":\"LEFT|RIGHT\"}}}}]}}. \
+Return ONLY JSON: {{\"findings\":[{{\"problem\":\"...\",\"severity\":\"Low|Medium|High|Critical\",\"severity_explanation\":\"...\",\"offending_text\":\"optional exact bad text\",\"replacement_text\":\"optional suggested correction\",\"location\":{{\"file\":\"path/in/diff\",\"line\":N,\"line_end\":N,\"side\":\"LEFT|RIGHT\"}}}}]}}. \
 The \"location\" field is optional - include it on a finding only when at least one merged input had one.",
         serde_json::to_string_pretty(prior_json).unwrap_or_default()
     )
@@ -3842,6 +4135,233 @@ mod tests {
         assert!(consolidation.contains("proof rule to every concern"));
         assert!(consolidation.contains("Proof is domain-specific"));
         assert!(consolidation.contains("Do not discard a proven concern"));
+    }
+
+    #[test]
+    fn english_quality_prompts_keep_commit_and_patch_sources_distinct() {
+        let broad = broad_concerns_user_payload("", "commit marker", "patch marker");
+        assert!(broad.contains("Treat the commit-message and patch blocks as separate sources"));
+        assert!(broad.contains("verify that the exact offending text appears"));
+        assert!(broad.contains("Never describe text that appears only in the patch"));
+        assert!(broad.contains("use `code:typo` or `code:grammar`"));
+        assert!(broad.contains("include a RIGHT-side `location`"));
+        assert!(broad.contains("set `offending_text` to the exact bad source text"));
+        assert!(broad.contains("set `replacement_text` separately"));
+
+        let single = single_pass_user_payload("", "commit marker", "patch marker");
+        assert!(single.contains("Call something a commit-message issue only after verifying"));
+        assert!(single.contains("Text found only in an added source comment"));
+        assert!(single.contains("MUST carry a RIGHT-side `location`"));
+
+        let consolidation = consolidation_user_payload("", &json!({}), "", "");
+        assert!(consolidation.contains("Enforce source boundaries"));
+        assert!(consolidation.contains("retain a `msg:*` concern only when"));
+        assert!(consolidation.contains("discard it rather than misreporting it"));
+        assert!(consolidation.contains("preserve `offending_text` and `replacement_text`"));
+    }
+
+    #[test]
+    fn misattributed_message_typo_is_relocated_to_unique_added_line() {
+        let mut concerns = json!([{
+            "type": "msg:typo",
+            "description": "Misspelling of 'available' in commit message body.",
+            "reasoning": "The commit message contains 'avaialable' instead of 'available'.",
+            "location": null
+        }]);
+        let patch = "\
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -100,2 +100,3 @@
+ context
++ * CPU in the span if none are avaialable.
+ context
+";
+        let result = repair_misattributed_message_concerns(
+            &mut concerns,
+            "The allocator chooses the next available CPU.",
+            patch,
+        );
+
+        assert_eq!(
+            result,
+            MessageConcernRepair {
+                relocated: 1,
+                dropped: 0
+            }
+        );
+        assert_eq!(concerns[0]["type"], "code:typo");
+        assert_eq!(concerns[0]["location"]["file"], "kernel/sched/topology.c");
+        assert_eq!(concerns[0]["location"]["line"], 101);
+        assert_eq!(concerns[0]["location"]["side"], "RIGHT");
+        assert!(concerns[0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("added source comment"));
+    }
+
+    #[test]
+    fn genuine_message_typo_is_not_relocated() {
+        let mut concerns = json!([{
+            "type": "msg:typo",
+            "description": "Commit message says 'avaialable'.",
+            "reasoning": "The exact misspelling is 'avaialable'."
+        }]);
+        let result = repair_misattributed_message_concerns(
+            &mut concerns,
+            "Use the first avaialable CPU.",
+            "",
+        );
+
+        assert_eq!(result, MessageConcernRepair::default());
+        assert_eq!(concerns[0]["type"], "msg:typo");
+        assert!(concerns[0].get("location").is_none());
+    }
+
+    #[test]
+    fn correction_quote_is_not_used_as_the_offending_text() {
+        let mut concerns = json!([{
+            "type": "msg:typo",
+            "description": "`avaialable` should be `available` in the commit message.",
+            "reasoning": "The correction is `available`."
+        }]);
+        let patch = "\
+diff --git a/a.c b/a.c
+--- a/a.c
++++ b/a.c
+@@ -1 +1,2 @@
++/* Keep available CPUs here. */
+";
+
+        let result = repair_misattributed_message_concerns(
+            &mut concerns,
+            "Use the first avaialable CPU.",
+            patch,
+        );
+
+        assert_eq!(result, MessageConcernRepair::default());
+        assert_eq!(concerns[0]["type"], "msg:typo");
+        assert!(concerns[0].get("location").is_none());
+    }
+
+    #[test]
+    fn replacement_match_does_not_make_patch_typo_ambiguous() {
+        let mut concerns = json!([{
+            "type": "msg:typo",
+            "description": "`avaialable` should be `available` in the commit message.",
+            "reasoning": "The source uses the misspelling."
+        }]);
+        let patch = "\
+diff --git a/a.c b/a.c
+--- a/a.c
++++ b/a.c
+@@ -1 +1,3 @@
++/* CPU is avaialable. */
++/* Keep available CPUs here. */
+";
+
+        let result = repair_misattributed_message_concerns(&mut concerns, "Clean message.", patch);
+
+        assert_eq!(
+            result,
+            MessageConcernRepair {
+                relocated: 1,
+                dropped: 0
+            }
+        );
+        assert_eq!(concerns[0]["type"], "code:typo");
+        assert_eq!(concerns[0]["location"]["line"], 1);
+    }
+
+    #[test]
+    fn explicit_offending_text_wins_over_quoted_replacement() {
+        let mut concerns = json!([{
+            "type": "msg:typo",
+            "description": "Use `available` instead.",
+            "reasoning": "The commit message is misspelled.",
+            "offending_text": "avaialable",
+            "replacement_text": "available"
+        }]);
+        let patch = "\
+diff --git a/a.c b/a.c
+--- a/a.c
++++ b/a.c
+@@ -1 +1,2 @@
++/* CPU is avaialable. */
+";
+
+        let result = repair_misattributed_message_concerns(&mut concerns, "Clean message.", patch);
+        assert_eq!(result.relocated, 1);
+        assert_eq!(concerns[0]["location"]["line"], 1);
+    }
+
+    #[test]
+    fn ambiguous_misattributed_message_typo_is_dropped() {
+        let mut concerns = json!([{
+            "type": "msg:typo",
+            "description": "Commit message contains 'teh'.",
+            "reasoning": "The typo is 'teh'."
+        }]);
+        let patch = "\
+diff --git a/a.c b/a.c
+--- a/a.c
++++ b/a.c
+@@ -1 +1,2 @@
++/* teh first */
++/* teh second */
+";
+        let result = repair_misattributed_message_concerns(&mut concerns, "clean message", patch);
+
+        assert_eq!(
+            result,
+            MessageConcernRepair {
+                relocated: 0,
+                dropped: 1
+            }
+        );
+        assert_eq!(concerns, json!([]));
+    }
+
+    #[test]
+    fn consolidated_message_typo_is_relocated_before_lkml_rendering() {
+        let mut findings = json!({"findings": [{
+            "problem": "Misspelling of 'available' in commit message body.",
+            "severity": "Low",
+            "severity_explanation": "This is a simple typo ('avaialable') in the commit message."
+        }]});
+        let patch = "\
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -2963,2 +2963,3 @@
+ context
++ * CPU in the span if none are avaialable.
+ context
+";
+        let result = repair_misattributed_message_findings(
+            &mut findings,
+            "The first available CPU is selected.",
+            patch,
+        );
+
+        assert_eq!(
+            result,
+            MessageConcernRepair {
+                relocated: 1,
+                dropped: 0
+            }
+        );
+        let finding = &findings["findings"][0];
+        assert_eq!(finding["location"]["file"], "kernel/sched/topology.c");
+        assert_eq!(finding["location"]["line"], 2964);
+        assert!(finding["problem"]
+            .as_str()
+            .unwrap()
+            .contains("added source comment"));
+        assert!(!finding["severity_explanation"]
+            .as_str()
+            .unwrap()
+            .contains("commit message"));
     }
 
     #[test]

@@ -541,10 +541,22 @@ async fn commit_review_inner(
     };
 
     let mut findings_val = review.findings_val.clone();
-    drop_hallucinated_locations(&mut findings_val, &changed, vd);
-    let diff_idx = diff_index::DiffIndex::from_unified_diff(&patch_diff);
-    drop_unanchored_locations(&mut findings_val, &diff_idx, vd);
-
+    let repaired = cleanup_repair_and_validate_findings(
+        &mut findings_val,
+        &commit_headers,
+        &patch_diff,
+        &changed,
+        vd,
+    );
+    if repaired.relocated > 0 || repaired.dropped > 0 {
+        v(
+            vd,
+            format!(
+                "final source repair: relocated {} patch-text finding(s), dropped {} ambiguous finding(s)",
+                repaired.relocated, repaired.dropped
+            ),
+        );
+    }
     let mut commit_obj = json!({
         "sha": sha,
         "findings": findings_val.get("findings").cloned().unwrap_or(json!([])),
@@ -923,6 +935,26 @@ fn drop_unanchored_locations(
     }
 }
 
+/// Validate model-authored anchors before using their presence to decide whether deterministic
+/// source repair is needed. Repair may create a new anchor, so validate once more afterward.
+fn cleanup_repair_and_validate_findings(
+    findings_val: &mut Value,
+    commit_message: &str,
+    patch: &str,
+    changed: &[String],
+    vd: &VerboseDest,
+) -> api::MessageConcernRepair {
+    drop_hallucinated_locations(findings_val, changed, vd);
+    let diff_idx = diff_index::DiffIndex::from_unified_diff(patch);
+    drop_unanchored_locations(findings_val, &diff_idx, vd);
+
+    let repaired = api::repair_misattributed_message_findings(findings_val, commit_message, patch);
+
+    // `added_line_matches()` should only create real RIGHT-side hunk anchors. Keep this final
+    // check as a postcondition so a future repair strategy cannot leak an invalid location.
+    drop_unanchored_locations(findings_val, &diff_idx, vd);
+    repaired
+}
 /// Merge per-commit metadata (subject/author/date/parents, raw diff, changed paths) onto the
 /// commit's result `Value`. Inserted by [`execute_commit_task`] so every subcommand
 /// (review/build/test) and every error path (worktree failure, inner error) carries the same
@@ -3325,7 +3357,7 @@ async fn run_two_pass(
         ),
     );
 
-    let concerns = match parsed_pass1 {
+    let mut concerns = match parsed_pass1 {
         Some(v1) => v1.get("concerns").cloned().unwrap_or_else(|| json!([])),
         None => {
             v(
@@ -3335,6 +3367,17 @@ async fn run_two_pass(
             json!([])
         }
     };
+    let repaired =
+        api::repair_misattributed_message_concerns(&mut concerns, commit_headers, patch_diff);
+    if repaired.relocated > 0 || repaired.dropped > 0 {
+        v(
+            vd,
+            format!(
+                "pass 1 source repair: relocated {} patch-text concern(s), dropped {} ambiguous concern(s)",
+                repaired.relocated, repaired.dropped
+            ),
+        );
+    }
 
     let patch_slim = api::cap_utf8(patch_diff, 400_000);
     v(
@@ -4067,5 +4110,43 @@ diff --git a/foo.c b/foo.c
         });
         drop_unanchored_locations(&mut findings, &idx, &vd());
         assert!(findings["findings"][0].get("location").is_none());
+    }
+
+    #[test]
+    fn invalid_location_is_cleaned_before_message_typo_repair() {
+        let patch = "\
+diff --git a/foo.c b/foo.c
+--- a/foo.c
++++ b/foo.c
+@@ -10 +10,2 @@
+ context
++/* CPU is avaialable. */
+";
+        let mut findings = json!({"findings": [{
+            "problem": "commit message typo: `avaialable` should be `available`.",
+            "severity": "Low",
+            "severity_explanation": "The misspelling is in the commit message.",
+            "offending_text": "avaialable",
+            "replacement_text": "available",
+            "location": {"file": "foo.c", "line": 999, "side": "RIGHT"}
+        }]});
+
+        let repaired = cleanup_repair_and_validate_findings(
+            &mut findings,
+            "Clean commit message.",
+            patch,
+            &["foo.c".to_string()],
+            &vd(),
+        );
+
+        assert_eq!(repaired.relocated, 1);
+        assert_eq!(repaired.dropped, 0);
+        assert_eq!(findings["findings"][0]["location"]["file"], "foo.c");
+        assert_eq!(findings["findings"][0]["location"]["line"], 11);
+        assert_eq!(findings["findings"][0]["location"]["side"], "RIGHT");
+        assert!(findings["findings"][0]["problem"]
+            .as_str()
+            .unwrap()
+            .contains("added source comment"));
     }
 }
