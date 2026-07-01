@@ -74,6 +74,13 @@ pub fn build_reference_context(
     parts.push(format!("# boro instructions\n{one_shot}\n"));
     used += parts.last().map(|s| s.len()).unwrap_or(0);
 
+    let local_reference = target::local_reference(target);
+    if !local_reference.is_empty() {
+        let block = format!("\n\n# boro target instructions\n{local_reference}\n");
+        used += block.len();
+        parts.push(block);
+    }
+
     for rel in target::core_files(target) {
         let chunk = read_prompt_rel(target, rel, max_total / 4).context("core prompt read")?;
         if let Some(text) = chunk {
@@ -228,6 +235,22 @@ mod tests {
             t.map(|s| s.len() > 500).unwrap_or(false),
             "kernel technical-patterns.md must be embedded from resources/prompts/kernel/"
         );
+    }
+
+    #[test]
+    fn reference_context_checks_ubuntu_annotations_justification() {
+        let context = build_reference_context(ReviewTarget::Kernel, &[], 100_000, None, None)
+            .expect("build context");
+        assert!(context.contains("Ubuntu kernel annotations policy"));
+        assert!(context.contains("note<...>"));
+        assert!(context.contains("global mechanical update"));
+    }
+
+    #[test]
+    fn ubuntu_annotations_policy_is_kernel_target_only() {
+        let qemu_context = build_reference_context(ReviewTarget::Qemu, &[], 100_000, None, None)
+            .expect("build QEMU context");
+        assert!(!qemu_context.contains("Ubuntu kernel annotations policy"));
     }
 
     #[test]
