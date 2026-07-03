@@ -105,13 +105,17 @@ impl ChildTimeoutGuard {
             if done_rx.recv_timeout(timeout).is_ok() {
                 return;
             }
-            timed_out_for_thread.store(true, Ordering::SeqCst);
             let Ok(mut child) = child.lock() else {
                 return;
             };
             if matches!(child.try_wait(), Ok(Some(_))) {
                 return;
             }
+            // Only flag a timeout once we have confirmed the child is still
+            // running and are about to kill it. Setting this before the
+            // try_wait check would falsely flag a child that completed normally
+            // at almost exactly the moment the timeout elapsed.
+            timed_out_for_thread.store(true, Ordering::SeqCst);
             let _ = child.kill();
         });
         Self {
@@ -140,6 +144,7 @@ impl Drop for ChildTimeoutGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn timeout_error_is_classified() {
@@ -148,5 +153,62 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("10m"));
         assert!(msg.contains("stage label"));
+    }
+
+    #[test]
+    fn child_that_exits_before_timeout_is_not_flagged() {
+        let child = Command::new("true").spawn().expect("spawn `true`");
+        let child = Arc::new(Mutex::new(child));
+
+        // Guarantee the child has fully exited before the watchdog can fire,
+        // so the watchdog deterministically takes the already-exited branch of
+        // `try_wait`. This reproduces the race where a normally-completing child
+        // exits at almost exactly the moment the timeout elapses.
+        loop {
+            let exited = {
+                let mut c = child.lock().unwrap();
+                matches!(c.try_wait(), Ok(Some(_)))
+            };
+            if exited {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let guard = ChildTimeoutGuard::spawn(Arc::clone(&child), Duration::from_millis(30));
+
+        // Wait well past the timeout so the watchdog thread has woken from
+        // recv_timeout, observed the already-exited child, and finished.
+        thread::sleep(Duration::from_millis(200));
+
+        assert!(
+            !guard.timed_out(),
+            "child exited normally but was falsely flagged as timed out"
+        );
+    }
+
+    #[test]
+    fn child_that_overruns_timeout_is_killed_and_flagged() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn `sleep 30`");
+        let child = Arc::new(Mutex::new(child));
+
+        let guard = ChildTimeoutGuard::spawn(Arc::clone(&child), Duration::from_millis(50));
+
+        // The watchdog should kill the still-running child once the timeout
+        // elapses; reaping it here confirms the kill happened.
+        let status =
+            wait_child_poll(&child, "test: wait for killed child").expect("child should be reaped");
+
+        assert!(
+            guard.timed_out(),
+            "overrunning child should be flagged as timed out"
+        );
+        assert!(
+            !status.success(),
+            "child killed by the watchdog should not report success"
+        );
     }
 }
