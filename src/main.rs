@@ -3412,14 +3412,9 @@ async fn run_two_pass(
         followup_summary.as_ref().map(|f| f.summary.as_str()),
     )?;
     let prefetch_block = prefetch_context_block(effective_repo, patch_diff, vd).await;
-    let reference_with_prefetch = if prefetch_block.is_empty() {
-        reference.clone()
-    } else {
-        format!("{reference}{prefetch_block}")
-    };
-
-    let pass1_user =
-        api::broad_concerns_user_payload(&reference_with_prefetch, commit_headers, patch_diff);
+    // Broad review already has the complete diff and repository tools. Keep the much
+    // larger source/linkage bundle for the stage that explicitly verifies linkage.
+    let pass1_user = api::broad_concerns_user_payload(&reference, commit_headers, patch_diff);
     v(
         vd,
         format!(
@@ -3549,11 +3544,12 @@ async fn run_two_pass(
         } else {
             (prior_block.as_str(), fp_digest.as_str())
         };
+        let stage_prefetch = if st == 7 { prefetch_block.as_str() } else { "" };
         let user = api::specialist_stage_user_payload(
             instr,
             &addon,
             &patch_slim,
-            &prefetch_block,
+            stage_prefetch,
             st,
             prior_for_stage,
             fp_for_stage,
@@ -3658,7 +3654,7 @@ async fn run_two_pass(
                 client,
                 cfg,
                 target,
-                &reference_with_prefetch,
+                &reference,
                 commit_headers,
                 patch_diff,
                 patch_tag,
@@ -3724,11 +3720,19 @@ async fn run_two_pass(
     }
     let clustered_value = Value::Array(clustered_concerns);
 
+    let consolidation_prefetch = if merged
+        .as_array()
+        .is_some_and(|concerns| concerns.iter().any(concern_requires_linkage_context))
+    {
+        prefetch_block.as_str()
+    } else {
+        ""
+    };
     let pass2_user = api::consolidation_user_payload(
         &extras,
         &json!({ "concerns": clustered_value }),
         series_context,
-        &prefetch_block,
+        consolidation_prefetch,
     );
     v(
         vd,
@@ -3839,7 +3843,7 @@ async fn run_two_pass(
             client,
             cfg,
             target,
-            &reference_with_prefetch,
+            &reference,
             commit_headers,
             patch_diff,
             patch_tag,
@@ -3876,6 +3880,11 @@ async fn run_two_pass(
         phase0_selected_prompts,
         validation_context: prefetch_block,
     })
+}
+
+fn concern_requires_linkage_context(concern: &Value) -> bool {
+    concern.get("category").and_then(Value::as_str) == Some("configuration-linkage")
+        || concern.get("proof").is_some()
 }
 
 /// Update the snapshot's findings to a fallback derived from the merged concerns
@@ -4025,6 +4034,29 @@ diff --git a/foo.c b/foo.c
         assert_eq!(usage["completion_tokens"], 7);
         assert_eq!(usage["cache_creation_tokens"], 1);
         assert_eq!(usage["cache_read_tokens"], 3);
+    }
+
+    #[test]
+    fn only_configuration_linkage_concerns_request_prefetch_for_consolidation() {
+        assert!(concern_requires_linkage_context(&json!({
+            "category": "configuration-linkage",
+            "proof": {
+                "failing_config": "CONFIG_FOO=n",
+                "caller_condition": "CONFIG_BAR=y",
+                "provider_condition": "CONFIG_FOO=y",
+                "failure": "undefined reference"
+            }
+        })));
+        assert!(concern_requires_linkage_context(&json!({
+            "proof": { "failure": "undefined reference" }
+        })));
+        assert!(!concern_requires_linkage_context(&json!({
+            "category": "hardware-architecture",
+            "type": "s7:barrier"
+        })));
+        assert!(!concern_requires_linkage_context(&json!({
+            "type": "s5:race"
+        })));
     }
 
     #[test]

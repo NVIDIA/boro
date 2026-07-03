@@ -3439,15 +3439,13 @@ pub fn findings_from_merged_concerns(merged: &Value) -> Value {
 /// section so specialists refine Pass 1's output within their domain instead of rediscovering it.
 /// `fp_digest` (the short distilled false-positive guide) is injected before the reference excerpts
 /// so the specialist sees "what NOT to flag" guidance before generating concerns.
-/// `prefetched_context_block` carries source definitions around touched lines and referenced
-/// definitions, matching Sashiko's automatic prefetch path.
+/// When supplied, `prefetched_context_block` carries source definitions around touched lines and
+/// referenced definitions. The multi-pass caller reserves this larger block for the linkage
+/// specialist instead of resending it to every specialist.
 ///
-/// Layout is ordered to maximize prompt-cache hits across the five specialist calls:
-/// content that is byte-identical across stages (patch, prefetched source context, FP digest,
-/// prior concerns) goes at the front; per-stage variation (instruction body, stage-specific reference addon, trailing
-/// JSON schema mentioning the stage number) goes at the back. Anthropic-compat gateways cache
-/// the user block by exact-prefix match, so this turns the patch (capped 400k) into a cache
-/// hit on stages 4–7 instead of a fresh prompt every call.
+/// Layout is ordered to maximize prompt-cache hits across specialist calls: common content goes
+/// at the front and per-stage variation goes at the back. The linkage stage's prefetched context
+/// is also placed before stage-specific instructions.
 pub fn specialist_stage_user_payload(
     instruction_body: &str,
     reference_addon_md: &str,

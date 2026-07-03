@@ -607,6 +607,7 @@ fn add_build_ownership_context(
     let mut needles = HashSet::new();
     let mut local_includes: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     let mut local_objects: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    let mut search_dirs = HashSet::new();
     for path in paths {
         let parts: Vec<_> = path.components().collect();
         // A basename such as internal.h or core.c is far too broad and can flood the context.
@@ -622,6 +623,18 @@ fn add_build_ownership_context(
             continue;
         };
         let parent = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+        // Textual aggregation and Kbuild ownership are normally declared next to the
+        // source or in one of its parent directories. Search those directories only;
+        // walking and reading every C/Kbuild file in a large worktree is both slow and
+        // likely to find unrelated basename matches.
+        let mut dir = Some(parent.as_path());
+        while let Some(candidate) = dir {
+            search_dirs.insert(candidate.to_path_buf());
+            if candidate.as_os_str().is_empty() {
+                break;
+            }
+            dir = candidate.parent();
+        }
         if path.extension().and_then(|ext| ext.to_str()) == Some("c")
             || path.extension().and_then(|ext| ext.to_str()) == Some("h")
         {
@@ -643,28 +656,32 @@ fn add_build_ownership_context(
         return;
     }
 
-    for entry in WalkBuilder::new(worktree_path)
-        .hidden(false)
-        .ignore(true)
-        .git_ignore(true)
-        .build()
-        .filter_map(Result::ok)
-    {
-        if !entry.file_type().is_some_and(|ty| ty.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let eligible = path.extension().and_then(|e| e.to_str()) == Some("c")
-            || name == "Makefile"
-            || name == "Kbuild";
-        if !eligible {
-            continue;
-        }
-        let Ok(content) = fs::read_to_string(path) else {
+    let mut candidates = BTreeSet::new();
+    for dir in search_dirs {
+        let Ok(entries) = fs::read_dir(worktree_path.join(&dir)) else {
             continue;
         };
-        let rel = path.strip_prefix(worktree_path).unwrap_or(path);
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if path.extension().and_then(|e| e.to_str()) == Some("c")
+                || name == "Makefile"
+                || name == "Kbuild"
+            {
+                candidates.insert(path);
+            }
+        }
+    }
+
+    for path in candidates {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let rel = path.strip_prefix(worktree_path).unwrap_or(&path);
         let parent = rel.parent().unwrap_or_else(|| Path::new(""));
         let include_names = local_includes.get(parent);
         let object_names = local_objects.get(parent);
@@ -684,7 +701,7 @@ fn add_build_ownership_context(
             if global_suffix_match || same_dir_include_match || same_dir_object_match {
                 add_range(
                     range_map,
-                    path.to_path_buf(),
+                    path.clone(),
                     line_no.saturating_sub(3),
                     (line_no + 3).min(line_count.saturating_sub(1)),
                 );
