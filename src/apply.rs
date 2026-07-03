@@ -1460,12 +1460,27 @@ fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
     }
 }
 
+fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
+    strip_prefix_ignore_ascii_case(haystack, prefix).is_some()
+}
+
+/// Strip `prefix` from the start of `s`, matching the prefix case-insensitively
+/// (ASCII) while returning the remainder verbatim.
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
+}
+
 fn referenced_commit_ids(message: &str) -> Vec<String> {
     let mut out = Vec::new();
     for raw in message.lines() {
         let line = raw.trim();
-        if line.starts_with("(cherry picked from commit ")
-            || line.starts_with("(backported from commit ")
+        if starts_with_ignore_ascii_case(line, "(cherry picked from commit ")
+            || starts_with_ignore_ascii_case(line, "(backported from commit ")
         {
             continue;
         }
@@ -1521,7 +1536,7 @@ fn backport_commit_message(message: &str) -> (String, bool) {
             .strip_suffix('\n')
             .map(|body| (body, "\n"))
             .unwrap_or((line, ""));
-        if let Some(rest) = body.strip_prefix("(cherry picked from commit ") {
+        if let Some(rest) = strip_prefix_ignore_ascii_case(body, "(cherry picked from commit ") {
             out.push_str("(backported from commit ");
             out.push_str(rest);
             changed = true;
@@ -1559,13 +1574,29 @@ fn find_already_applied_in_log(
 }
 
 fn sanitize_subject(subject: &str) -> String {
-    let mut s = subject.trim().to_string();
-    for prefix in ["UBUNTU", "SAUCE"] {
-        if let Some(rest) = s.strip_prefix(prefix) {
-            s = rest.trim_start_matches([':', ' ']).to_string();
+    let mut s = subject.trim();
+    loop {
+        let mut stripped = None;
+        for prefix in ["UBUNTU", "SAUCE"] {
+            if let Some(rest) = s.strip_prefix(prefix) {
+                // Only treat the prefix as a tag when a delimiter (`:` or
+                // whitespace) or end-of-string follows. Otherwise "UBUNTUFS"
+                // would be stripped to "FS", making an unrelated subject compare
+                // equal and letting find_already_applied_in_log skip a real
+                // cherry-pick.
+                if rest.is_empty() || rest.starts_with(|c: char| c == ':' || c.is_whitespace()) {
+                    stripped =
+                        Some(rest.trim_start_matches(|c: char| c == ':' || c.is_whitespace()));
+                    break;
+                }
+            }
+        }
+        match stripped {
+            Some(rest) => s = rest,
+            None => break,
         }
     }
-    s
+    s.to_string()
 }
 
 pub(crate) fn parse_conflicts_in_file(file_path: &str, content: &str) -> Result<Vec<ConflictHunk>> {
@@ -3808,6 +3839,39 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_subject_handles_any_order_and_repetition() {
+        assert_eq!(
+            sanitize_subject("SAUCE: UBUNTU: net: fix foo"),
+            "net: fix foo"
+        );
+        assert_eq!(sanitize_subject("UBUNTU: SAUCE: x"), "x");
+        assert_eq!(sanitize_subject("UBUNTU: UBUNTU: y"), "y");
+        assert_eq!(sanitize_subject("net: fix thing"), "net: fix thing");
+    }
+
+    #[test]
+    fn sanitize_subject_requires_delimiter_after_tag() {
+        // A tag is only a tag when followed by a delimiter or end-of-string. A
+        // prefix that merely begins a longer word must be left intact, otherwise
+        // "SAUCE: UBUNTUFS: fix lookup" would collapse to "FS: fix lookup" and
+        // compare equal to an unrelated subject.
+        assert_eq!(
+            sanitize_subject("SAUCE: UBUNTUFS: fix lookup"),
+            "UBUNTUFS: fix lookup"
+        );
+        assert_eq!(
+            sanitize_subject("UBUNTUFS: fix lookup"),
+            "UBUNTUFS: fix lookup"
+        );
+        assert_eq!(sanitize_subject("SAUCEY change"), "SAUCEY change");
+        // A bare tag with only a delimiter (or nothing) after it still sanitizes.
+        assert_eq!(sanitize_subject("UBUNTU:"), "");
+        assert_eq!(sanitize_subject("SAUCE"), "");
+        // Whitespace delimiters other than a plain space (e.g. a tab) also count.
+        assert_eq!(sanitize_subject("UBUNTU:\tfix"), "fix");
+    }
+
+    #[test]
     fn already_applied_match_requires_exact_sanitized_subject() {
         let log = "abc1234\0UBUNTU: target subject\nbad9999\0target subject extra\n";
         let m = find_already_applied_in_log("target subject", "kernel/foo.c", log).unwrap();
@@ -3821,6 +3885,15 @@ mod tests {
     fn already_applied_match_rejects_substring_only() {
         let log = "bad9999\0target subject extra\n";
         assert!(find_already_applied_in_log("target subject", "kernel/foo.c", log).is_none());
+    }
+
+    #[test]
+    fn already_applied_match_does_not_skip_tag_prefixed_word() {
+        // Regression for the over-strip bug: "UBUNTUFS" must not be sanitized to
+        // "FS", or an unrelated log commit would be reported as already-applied
+        // and a real cherry-pick silently skipped.
+        let log = "abc1234\0UBUNTUFS: fix lookup\n";
+        assert!(find_already_applied_in_log("FS: fix lookup", "kernel/foo.c", log).is_none());
     }
 
     #[test]
@@ -3864,6 +3937,45 @@ Body mentioning cherry picked from commit in prose.
     }
 
     #[test]
+    fn backport_commit_message_rewrites_mixed_case_cherry_pick_trailer() {
+        let (message, changed) =
+            backport_commit_message("subject\n\n(Cherry picked from commit abcdef1)\n");
+
+        assert!(changed);
+        assert!(message.contains("(backported from commit abcdef1)"));
+        assert!(!message
+            .to_ascii_lowercase()
+            .contains("(cherry picked from commit "));
+    }
+
+    #[test]
+    fn backport_commit_message_rewrites_canonical_lowercase_cherry_pick_trailer() {
+        let (message, changed) =
+            backport_commit_message("subject\n\n(cherry picked from commit abcdef1)\n");
+
+        assert!(changed);
+        assert!(message.contains("(backported from commit abcdef1)"));
+    }
+
+    #[test]
+    fn backport_commit_message_noops_on_message_without_trailer() {
+        let input = "subject\n\nbody text only\n";
+        let (message, changed) = backport_commit_message(input);
+
+        assert!(!changed);
+        assert_eq!(message, input);
+    }
+
+    #[test]
+    fn referenced_commit_ids_skips_mixed_case_cherry_pick_trailer() {
+        let msg = "\
+This depends on abcdef1234567890 before the target can apply.
+(Cherry picked from commit 1111111222222233333334444444555555566666)
+";
+        assert_eq!(referenced_commit_ids(msg), vec!["abcdef1234567890"]);
+    }
+
+    #[test]
     fn rewrite_cherry_pick_trailer_as_backport_amends_head_message() {
         let dir = tempfile::tempdir().unwrap();
         run_git_test(dir.path(), &["init"]).unwrap();
@@ -3894,6 +4006,40 @@ Body mentioning cherry picked from commit in prose.
         assert!(rewrite_cherry_pick_trailer_as_backport(dir.path())
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn rewrite_cherry_pick_trailer_as_backport_amends_mixed_case_trailer() {
+        // The trailer prefix must match case-insensitively while the commit hash
+        // is preserved verbatim.
+        let dir = tempfile::tempdir().unwrap();
+        run_git_test(dir.path(), &["init"]).unwrap();
+        run_git_test(dir.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        run_git_test(dir.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(dir.path().join("x.c"), "int x;\n").unwrap();
+        run_git_test(dir.path(), &["add", "x.c"]).unwrap();
+        run_git_test(
+            dir.path(),
+            &[
+                "commit",
+                "-m",
+                "subject",
+                "-m",
+                "(Cherry picked from commit 1111111222222233333334444444555555566666)",
+            ],
+        )
+        .unwrap();
+
+        assert!(rewrite_cherry_pick_trailer_as_backport(dir.path())
+            .unwrap()
+            .is_some());
+        let message = commit_message(dir.path(), "HEAD").unwrap();
+        assert!(
+            message.contains("(backported from commit 1111111222222233333334444444555555566666)")
+        );
+        assert!(!message
+            .to_ascii_lowercase()
+            .contains("(cherry picked from commit "));
     }
 
     #[test]
