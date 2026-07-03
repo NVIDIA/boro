@@ -55,11 +55,13 @@ shows per-worker state and per-stage token counts as work happens.
 
 Boro separates the bulk-of-work model from the strong-validator model.
 
-`BORO_MODEL` drives the main pipeline; `BORO_VALIDATION_MODEL` drives the
-per-commit second-opinion pass and the global review-validation stage.
+`BORO_MODEL` drives regular broad and specialist discovery. In a normal
+review, `BORO_VALIDATION_MODEL` drives the initial complete-context fast
+review, validates only new regular-stage candidates, and renders the report.
+With `--fast`, the fast review instead uses `BORO_MODEL`.
 
 The intended workflow is to keep the broad and specialist passes cheap while
-using a stronger model for second-opinion review, validation, and reporting.
+using a stronger model for the immutable baseline, validation, and reporting.
 
 For example, run a local model on the broad and specialist stages and point the
 validation stages at a stronger remote model. Token usage is broken out per
@@ -167,8 +169,8 @@ For real API runs, set the following OpenAI-compatible environment variables:
 | `BORO_KEY`   | API key                        |
 | `BORO_MODEL` | Model name                     |
 
-Optionally, the global **review-validation** stage, per-commit
-**second-opinion** stage, and `boro apply` conflict validator can be pointed
+Optionally, the initial **fast review**, regular-addition validation stage,
+report renderer, and `boro apply` conflict validator can be pointed
 at a different (often stronger) model:
 
 | Variable                | Meaning                                                    |
@@ -218,35 +220,40 @@ context locally, then runs the ordered stages below.
 | ---: | --- | --- |
 | 0 | Identify kernel subsystem | Select subsystem guide prompts for the shared reference bundle |
 | 1 | Upstream follow-up | Query lore.kernel.org and summarize relevant follow-ups |
-| 2 | Broad concerns | First pass over reference context + patch, collects concerns |
-| 3 | Execution flow verification | Control flow, logic, errors, branches, macros, linker/LTO risks |
-| 4 | Resource management | Lifetimes, leaks, UAF, refcounts, teardown vs. async handoffs |
-| 5 | Locking and concurrency | Sleep/atomic rules, ordering, races, RCU, barriers, IRQ context |
-| 6 | Security | Bounds, overflow, privesc, TOCTOU, user/kernel data boundaries |
-| 7 | Hardware & portability | Drivers/HW: DMA, IRQ, barriers, endianness |
-| 8 | Comment / code consistency | Audit comments touched by the patch against the actual code |
-| 9 | Consolidation pass | Merges concerns into findings and applies severity guidance |
-| 10 | Second-opinion check | Fast-style independent review; findings merge into the main findings |
-| 11 | Findings validation | Drops false positives and tightens surviving findings |
-| 12 | LKML-style report | Narrative reply text plus run-wide findings summary |
+| 2 | Fast complete-context review | Establish the immutable baseline findings |
+| 3 | Broad concerns | Independent regular pass over reference context + patch |
+| 4 | Execution flow verification | Control flow, logic, errors, branches, macros, linker/LTO risks |
+| 5 | Resource management | Lifetimes, leaks, UAF, refcounts, teardown vs. async handoffs |
+| 6 | Locking and concurrency | Sleep/atomic rules, ordering, races, RCU, barriers, IRQ context |
+| 7 | Security | Bounds, overflow, privesc, TOCTOU, user/kernel data boundaries |
+| 8 | Hardware & portability | Drivers/HW: DMA, IRQ, barriers, endianness |
+| 9 | Comment / code consistency | Audit comments touched by the patch against the actual code |
+| 10 | Consolidation pass | Turns regular concerns into candidate additions |
+| 11 | Addition validation | Drops false-positive additions; never changes the fast baseline |
+| 12 | Additive merge and LKML report | Union survivors into the baseline and render the report |
 
-`BORO_MODEL` is used for steps 0-9. `BORO_VALIDATION_MODEL` is used for
-steps 10-12 and falls back to `BORO_MODEL` when unset.
+`BORO_MODEL` is used for regular discovery and consolidation. In normal
+reviews, `BORO_VALIDATION_MODEL` is used for steps 2, 11, and 12 and
+falls back to `BORO_MODEL` when unset.
 
-The second-opinion check uses the same prompt and inputs as the single-pass
-check performed by `--fast`: the normal reviewer system prompt, the
+The initial fast review uses the same prompt and inputs as `--fast`:
+the normal reviewer system prompt, the
 `fast-review.md` instructions, reference and prefetched source context,
 the subsystem guides selected by step 0, upstream-follow-up summary, commit
-message, and diff. It does not receive the main pipeline's findings. In the full
-pipeline this independent check uses `BORO_VALIDATION_MODEL`; under `--fast` it
-uses `BORO_MODEL`.
+message, and diff. In a normal review it uses `BORO_VALIDATION_MODEL`;
+under `--fast` it uses `BORO_MODEL`. Regular discovery is independent
+and can only contribute novel findings; it cannot replace or remove baseline
+findings or their lore provenance. Validation receives the baseline as
+read-only comparison context and drops only regular candidates that clearly
+report the same underlying problem. Local merging removes exact identities
+only, so distinct findings at the same location are retained.
 
 `--validation-mode` changes only the post-discovery stages:
 
-- `filter` (default): run findings validation, then render LKML prose from
-  `validated_findings[]`.
-- `findings`: run findings validation and skip LKML rendering.
-- `off`: skip findings validation and render LKML prose from raw `findings[]`.
+- `filter` (default): validate regular additions, union survivors into the
+  fast baseline, then render LKML prose.
+- `findings`: perform the same additive merge and skip LKML rendering.
+- `off`: add raw regular candidates to the baseline without validation.
 
 `boro review --upstream-repo URI --upstream-branch BRANCH COMMIT_RANGE`
 selects the Git repository and branch checked for follow-up fixes. It defaults to
@@ -254,8 +261,8 @@ selects the Git repository and branch checked for follow-up fixes. It defaults t
 local path or `file://` URI to inspect a local Linux repository instead.
 `--upstream-branch` defaults to `master`.
 
-With `--fast`, each commit gets the same independent second-opinion check as
-step 10, but using `BORO_MODEL`. That response is passed through the normal
+With `--fast`, each commit gets only the fast complete-context review,
+using `BORO_MODEL`. That response is passed through the normal
 per-commit LKML renderer to produce the final report. The upstream follow-up
 stage runs after subsystem identification, and both stages feed the reference
 bundle. Specialist passes, validation, and the run-wide model summary are
@@ -331,36 +338,46 @@ Skipped on `--fast` (single-pass collapse).
 ### Extra options
 
 The option `--fast` identifies the subsystem, runs the upstream follow-up stage,
-performs the independent second-opinion check in one `BORO_MODEL` step per
+performs the complete-context fast review in one `BORO_MODEL` step per
 commit, then runs the normal LKML report pass over that result. It skips
 specialists, validation, and the run-wide summary.
 
-The option `--validation-mode` selects whether (and how) the global
-findings-validation stage runs:
+The option `--validation-mode` selects whether (and how) regular-stage
+candidate additions are validated:
 
-- `filter` (default): runs findings validation, then renders the per-
-  commit LKML prose from the surviving findings only. The viewer / human
+- `filter` (default): validates regular additions, unions survivors with
+  the immutable fast baseline, then renders per-commit LKML prose. The viewer / human
   report's Findings section shows `validated_findings`; the LKML section
   shows prose built from those survivors.
-- `findings`: runs findings validation, **skips** the per-commit LKML
+- `findings`: performs the same additive validation and merge, **skips** the per-commit LKML
   pass entirely (saves one LLM call per commit; the human report's LKML
   section is empty in this mode). `scripts/boro-json-view` auto-detects
   this mode (and `filter`) and anchors `validated_findings` inline
   beside the diff at each finding's `location.file:line` - use
   `--use-validated=auto|always|never` to override.
-- `off`: skip validation entirely. Per-commit LKML is rendered from raw
-  `findings[]` after the second-opinion findings have been merged in.
+- `off`: skip validation entirely. Raw regular candidates are added to
+  the fast baseline before per-commit LKML rendering.
 
 The global flag `--json` emits a single pretty-printed JSON document on
 stdout instead of the human report - the same shape consumed internally,
 with per-commit `findings[]`, `lkml_report` (filter/off modes only),
 `validated_findings[]` (filter/findings modes when validation
-succeeded), and a `usage_summary`. Each finding may carry an optional
-`location` object:
+succeeded), and a `usage_summary`. In filter/findings modes,
+`findings[]` is the immutable fast baseline and
+`validated_findings[]` is the baseline plus accepted regular additions.
+Each finding may carry optional `location` and `references` fields:
 
 ```json
 {"file": "path/in/diff", "line": 42, "line_end": 45, "side": "RIGHT"}
 ```
+
+`references` records provenance such as lore discussions:
+
+```json
+{"kind": "lore", "url": "https://lore.kernel.org/all/<message-id>/", "claim": "What the thread supports"}
+```
+
+Merge, validation, and LKML rendering preserve reference URLs verbatim.
 
 `side` defaults to `RIGHT` (post-image / additions / context) when missing;
 `LEFT` anchors against the pre-image (deletions). `line_end` is optional

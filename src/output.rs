@@ -63,8 +63,8 @@ fn use_color_stderr() -> bool {
     io::stderr().is_terminal()
 }
 
-/// Emit the run header (range + model, plus validation model when set and
-/// distinct from the main model) to stderr at startup so it's visible
+/// Emit the run header (range + regular model, plus strong fast/validation model
+/// when set and distinct from the main model) to stderr at startup so it's visible
 /// before any review work.
 pub fn eprint_run_header(range: &str, model: &str, validation_model: Option<&str>) {
     let c = use_color_stderr();
@@ -91,7 +91,7 @@ pub fn eprint_run_header(range: &str, model: &str, validation_model: Option<&str
         };
         eprintln!(
             "  {} {}",
-            paint!("Validation:", c, |s| s.bold().dimmed()),
+            paint!("Fast/validation:", c, |s| s.bold().dimmed()),
             paint!(validation_disp, c, |s| s.bright_white())
         );
     }

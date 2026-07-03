@@ -117,6 +117,7 @@ impl ValidationMode {
 
 struct CommitReviewResult {
     findings_val: Value,
+    additional_findings_val: Value,
     usage_commit: Value,
     usage_steps: Option<Value>,
     phase0_selected_prompts: Option<Vec<String>>,
@@ -124,8 +125,22 @@ struct CommitReviewResult {
 }
 
 struct UpstreamFollowupResult {
+    /// Model-authored lore summary. Safe to include in every discovery pass.
     summary: String,
+    /// Deterministic configured-branch fixes. Normal review appends these as
+    /// structured findings instead of asking the one-shot model to rediscover them.
+    master_summary: String,
     master_fixes: Vec<lore::MasterFix>,
+}
+
+impl UpstreamFollowupResult {
+    fn review_context(&self, include_master_fixes: bool) -> String {
+        if include_master_fixes {
+            format!("{}{}", self.summary, self.master_summary)
+        } else {
+            self.summary.clone()
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -274,10 +289,10 @@ enum CommitAction {
         max_context_size: usize,
         upstream: String,
         upstream_branch: String,
-        /// Model config for the per-commit second-opinion call. Carries the resolved
+        /// Model config for the initial fast review. Carries the resolved
         /// `BORO_VALIDATION_*` config (which falls back to the main model when those
         /// env vars are unset).
-        second_opinion: Option<config::ResolvedModel>,
+        fast_review_model: Option<config::ResolvedModel>,
     },
     TestBuild,
     TestBoot {
@@ -414,7 +429,7 @@ async fn commit_review_inner(
     fast: bool,
     no_tools: bool,
     max_context_size: usize,
-    second_opinion: Option<&config::ResolvedModel>,
+    fast_review_model: Option<&config::ResolvedModel>,
     vd: &VerboseDest,
     dry_run: bool,
     totals: &mut RunTotals,
@@ -535,7 +550,10 @@ async fn commit_review_inner(
             &changed,
             max_context_size,
             phase0_selected_prompts.as_deref(),
-            followup.as_ref().map(|result| result.summary.as_str()),
+            followup
+                .as_ref()
+                .map(|result| result.review_context(true))
+                .as_deref(),
         )?;
         let prefetch_block = prefetch_context_block(effective_repo, &patch_diff, vd).await;
         let reference_with_prefetch = if prefetch_block.is_empty() {
@@ -545,7 +563,8 @@ async fn commit_review_inner(
         };
         let user =
             api::single_pass_user_payload(&reference_with_prefetch, &commit_headers, &patch_diff);
-        let spinner = stage_progress_line(&patch_tag, &sha_short, 2, 2, "Second-opinion check");
+        let spinner =
+            stage_progress_line(&patch_tag, &sha_short, 2, 2, "Fast complete-context review");
         let tool_cfg = fast_review_tool_config(effective_repo, no_tools);
         let started = Instant::now();
         let (raw, usage) = api::chat_completion_stage_timeout(
@@ -564,7 +583,7 @@ async fn commit_review_inner(
         .await?;
         totals.add_usage(usage);
         let stage = StageUsage {
-            step: "2nd-opinion",
+            step: "fast-review",
             usage,
             wall: started.elapsed(),
             error: None,
@@ -665,7 +684,7 @@ async fn commit_review_inner(
         worker_ctx,
         publisher,
         effective_repo,
-        second_opinion,
+        fast_review_model,
         master_repo,
     )
     .await?;
@@ -687,9 +706,18 @@ async fn commit_review_inner(
             ),
         );
     }
+    let mut additional_findings_val = review.additional_findings_val.clone();
+    cleanup_repair_and_validate_findings(
+        &mut additional_findings_val,
+        &commit_headers,
+        &patch_diff,
+        &changed,
+        vd,
+    );
     let mut commit_obj = json!({
         "sha": sha,
         "findings": findings_val.get("findings").cloned().unwrap_or(json!([])),
+        "_additional_findings": additional_findings_val.get("findings").cloned().unwrap_or(json!([])),
         "usage": review.usage_commit,
     });
     if !review.validation_context.is_empty() {
@@ -837,7 +865,7 @@ async fn execute_commit_task(
             fast,
             no_tools,
             max_context_size,
-            second_opinion,
+            fast_review_model,
             ..
         } => {
             commit_review_inner(
@@ -853,7 +881,7 @@ async fn execute_commit_task(
                 *fast,
                 *no_tools,
                 *max_context_size,
-                second_opinion.as_ref(),
+                fast_review_model.as_ref(),
                 &vd,
                 dry_run,
                 &mut totals,
@@ -970,7 +998,7 @@ async fn execute_commit_task(
 
 /// Drop any `location` entry on a finding whose `file` is not in the patch's changed
 /// paths. Run once at the commit level after consolidation so it covers the full
-/// multi-pass review and merged second-opinion findings uniformly. The finding itself is
+/// fast baseline and regular additive findings uniformly. The finding itself is
 /// preserved (the prose still has review signal); only the suspect anchor is dropped.
 fn drop_hallucinated_locations(findings_val: &mut Value, changed: &[String], vd: &VerboseDest) {
     let Some(arr) = findings_val
@@ -1265,10 +1293,9 @@ fn without_unverified_sensitive_findings(findings: &Value) -> (Vec<Value>, usize
     (retained, withheld)
 }
 
-/// Findings-mode validation: takes per-commit `findings[]` JSON and produces
-/// per-commit `out["commits"][i]["validated_findings"]`. Skips commits with
-/// empty findings; commits absent from the validator's response keep their
-/// raw findings.
+/// Validate only regular-pipeline additions, then union the survivors into the
+/// immutable fast-review baseline. The validator never sees and therefore
+/// cannot remove or rewrite a fast finding.
 #[allow(clippy::too_many_arguments)]
 async fn run_findings_validation(
     client: &reqwest::Client,
@@ -1282,13 +1309,12 @@ async fn run_findings_validation(
     no_tools: bool,
     progress_ui: Option<&MultiPatchSpinner>,
 ) {
-    // Snapshot the commits we need to send. We only validate commits that
-    // have at least one finding; commits with empty findings are passed
-    // through unchanged.
-    let mut payload_owned: Vec<(String, String, String, String, String, Value)> = Vec::new();
+    // Snapshot only regular-stage candidates. `findings[]` is the trusted fast
+    // baseline and is intentionally excluded from this payload.
+    let mut payload_owned: Vec<(String, String, String, String, String, Value, Value)> = Vec::new();
     if let Some(commits) = out["commits"].as_array() {
         for c in commits {
-            let findings = match c.get("findings").and_then(|f| f.as_array()) {
+            let findings = match c.get("_additional_findings").and_then(|f| f.as_array()) {
                 Some(arr) if !arr.is_empty() => arr,
                 _ => continue,
             };
@@ -1313,32 +1339,52 @@ async fn run_findings_validation(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let baseline_findings = c.get("findings").cloned().unwrap_or_else(|| json!([]));
             payload_owned.push((
                 sha12,
                 subject,
                 commit_message,
                 reference_context,
                 diff,
+                baseline_findings,
                 Value::Array(findings.clone()),
             ));
         }
     }
     if payload_owned.is_empty() {
-        v(vdest, "validation skipped (no findings to validate)");
+        v(
+            vdest,
+            "validation skipped (no regular-stage additions to validate)",
+        );
+        if let Some(commits) = out["commits"].as_array_mut() {
+            for commit in commits {
+                commit["validated_findings"] =
+                    commit.get("findings").cloned().unwrap_or_else(|| json!([]));
+            }
+        }
+        out["validation_mode"] = json!(mode.label());
         return;
     }
     let refs_for = |indices: &[usize]| -> Vec<api::ValidationFindingsCommit<'_>> {
         indices
             .iter()
             .map(|&idx| {
-                let (sha, subject, commit_message, reference_context, diff, findings) =
-                    &payload_owned[idx];
+                let (
+                    sha,
+                    subject,
+                    commit_message,
+                    reference_context,
+                    diff,
+                    baseline_findings,
+                    findings,
+                ) = &payload_owned[idx];
                 api::ValidationFindingsCommit {
                     sha: sha.as_str(),
                     subject: subject.as_str(),
                     commit_message: commit_message.as_str(),
                     reference_context: reference_context.as_str(),
                     diff: diff.as_str(),
+                    baseline_findings,
                     findings,
                 }
             })
@@ -1366,7 +1412,6 @@ async fn run_findings_validation(
     let mut by_sha: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
     let mut verification_failed_shas: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    let mut successful_batches = 0usize;
     for (batch_idx, indices) in batches.iter().enumerate() {
         let batch_num = batch_idx + 1;
         let payload_refs = refs_for(indices);
@@ -1464,7 +1509,6 @@ async fn run_findings_validation(
             );
             continue;
         };
-        successful_batches += 1;
         v(
             vdest,
             format!(
@@ -1488,10 +1532,6 @@ async fn run_findings_validation(
             }
         }
     }
-    if successful_batches == 0 && verification_failed_shas.is_empty() {
-        return;
-    }
-
     if let Some(commits) = out["commits"].as_array_mut() {
         for c in commits.iter_mut() {
             let sha_full = c
@@ -1507,7 +1547,7 @@ async fn run_findings_validation(
                 .get(sha12)
                 .or_else(|| by_sha.get(sha_full.as_str()))
                 .cloned();
-            if let Some(findings) = validated {
+            let additions = if let Some(findings) = validated {
                 // Defence-in-depth: even though the prompt says preserve `location`
                 // byte-for-byte (which means anchors we cleaned upstream stay clean),
                 // re-verify against the commit's own diff in case the validator
@@ -1518,13 +1558,13 @@ async fn run_findings_validation(
                     let idx = diff_index::DiffIndex::from_unified_diff(patch);
                     drop_unanchored_locations(&mut wrapped, &idx, vdest);
                 }
-                c["validated_findings"] = wrapped
+                wrapped
                     .get_mut("findings")
                     .map(|f| f.take())
-                    .unwrap_or(Value::Array(Vec::new()));
+                    .unwrap_or(Value::Array(Vec::new()))
             } else if verification_failed_shas.contains(sha12) {
                 let (retained, withheld) = without_unverified_sensitive_findings(
-                    c.get("findings").unwrap_or(&Value::Null),
+                    c.get("_additional_findings").unwrap_or(&Value::Null),
                 );
                 v(
                     vdest,
@@ -1534,8 +1574,21 @@ async fn run_findings_validation(
                         retained.len()
                     ),
                 );
-                c["validated_findings"] = Value::Array(retained);
-            }
+                Value::Array(retained)
+            } else {
+                // Preserve the historical fallback: if a validation batch fails,
+                // keep that batch's raw regular additions rather than losing signal.
+                c.get("_additional_findings")
+                    .cloned()
+                    .unwrap_or_else(|| json!([]))
+            };
+            let baseline = c
+                .get("findings")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let additions = additions.as_array().cloned().unwrap_or_default();
+            c["validated_findings"] = Value::Array(merge_novel_findings(&baseline, &additions));
         }
     }
 
@@ -2162,7 +2215,7 @@ async fn main() -> Result<()> {
     }
 
     // Resolve subcommand into CommitAction + range + per-subcommand defaults.
-    // CommitAction::Review's `second_opinion` is set later once validation_cfg
+    // CommitAction::Review's `fast_review_model` is set later once validation_cfg
     // has been resolved (we need the main model to fall back to).
     let (mut action, range, default_workers) = match &cli.command {
         Command::Review(args) => (
@@ -2173,7 +2226,7 @@ async fn main() -> Result<()> {
                 max_context_size: args.max_context_size,
                 upstream: args.upstream.clone(),
                 upstream_branch: args.upstream_branch.clone(),
-                second_opinion: None,
+                fast_review_model: None,
             },
             args.range.clone(),
             8usize,
@@ -2327,13 +2380,13 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
         }
     }
 
-    // Resolve validation/second-opinion config once at startup. Both stages
-    // (global validation, per-commit second-opinion) draw from the same
+    // Resolve the strong-model config once at startup. The initial fast review,
+    // regular-addition validation, LKML rendering, and summary draw from the same
     // BORO_VALIDATION_* env vars (with main-model fallback). Validating env
     // vars early gives a fast failure for bad input, and lets the header
     // preview the validation model when it differs from the main one. The
-    // global validation stage can still be opted out via --validation-mode=off;
-    // the per-commit second-opinion call is always on for staged review runs.
+    // config. Validation can still be opted out via --validation-mode=off, but
+    // normal reviews always use this model for their immutable fast baseline.
     let validation_cfg = if action.is_review() && !action.review_fast() {
         Some(
             config::resolve_validation_from_env(&model)
@@ -2342,19 +2395,18 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
     } else {
         None
     };
-    // Inject the second-opinion config into the action so commit tasks can use it.
+    // Inject the fast-review config into the action so commit tasks can use it.
     if let CommitAction::Review {
-        ref mut second_opinion,
+        ref mut fast_review_model,
         ..
     } = action
     {
-        *second_opinion = validation_cfg.clone();
+        *fast_review_model = validation_cfg.clone();
     }
-    // The header preview still tracks the global-validation gate (validation
-    // is the stage most users notice in the header).
+    // Normal review uses the strong model for its fast baseline even when
+    // validation of regular additions is disabled, so always show it when distinct.
     let validation_header_model = validation_cfg
         .as_ref()
-        .filter(|_| !validation_disabled)
         .filter(|r| r.model_id != model.model_id)
         .map(|r| r.model_id.as_str());
     output::eprint_run_header(&range, &model.model_id, validation_header_model);
@@ -2636,6 +2688,9 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
         "verbose": cli.global.verbose,
     });
     out["commits"] = Value::Array(commit_values);
+    if action.is_review() {
+        out["validation_mode"] = json!(validation_mode.label());
+    }
     if cancelled {
         out["cancelled"] = json!(true);
     }
@@ -2666,11 +2721,33 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
         .await;
     }
 
-    // The prefetched source block is an internal validation hand-off, not report data.
+    // With validation disabled, regular discoveries are additive without a
+    // filtering pass. The immutable fast baseline remains first and wins any
+    // semantic duplicate.
+    if action.is_review() && validation_disabled {
+        if let Some(commits) = out["commits"].as_array_mut() {
+            for commit in commits {
+                let baseline = commit
+                    .get("findings")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let additions = commit
+                    .get("_additional_findings")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                commit["findings"] = Value::Array(merge_novel_findings(&baseline, &additions));
+            }
+        }
+    }
+
+    // Internal validation hand-offs are not report data.
     if let Some(commits) = out["commits"].as_array_mut() {
         for commit in commits {
             if let Some(obj) = commit.as_object_mut() {
                 obj.remove("_validation_context");
+                obj.remove("_additional_findings");
             }
         }
     }
@@ -2996,7 +3073,8 @@ async fn run_upstream_followup_stage(
         usage_step.push(stage.clone());
         publisher.add_stage(stage);
         return (!master_summary.is_empty()).then_some(UpstreamFollowupResult {
-            summary: master_summary,
+            summary: String::new(),
+            master_summary,
             master_fixes,
         });
     }
@@ -3020,7 +3098,8 @@ async fn run_upstream_followup_stage(
             usage_step.push(stage.clone());
             publisher.add_stage(stage);
             return (!master_summary.is_empty()).then_some(UpstreamFollowupResult {
-                summary: master_summary,
+                summary: String::new(),
+                master_summary,
                 master_fixes,
             });
         }
@@ -3046,11 +3125,8 @@ async fn run_upstream_followup_stage(
         usage_step.push(stage.clone());
         publisher.add_stage(stage);
         return Some(UpstreamFollowupResult {
-            summary: format!(
-                "{}{}",
-                lore::render_followup_summary(&lore::no_activity_json(), &lore_cfg.inbox_url,),
-                master_summary
-            ),
+            summary: lore::render_followup_summary(&lore::no_activity_json(), &lore_cfg.inbox_url),
+            master_summary,
             master_fixes,
         });
     }
@@ -3100,11 +3176,8 @@ async fn run_upstream_followup_stage(
     publisher.add_stage(stage);
     match parsed {
         Some(json) => Some(UpstreamFollowupResult {
-            summary: format!(
-                "{}{}",
-                lore::render_followup_summary(&json, &lore_cfg.inbox_url),
-                master_summary
-            ),
+            summary: lore::render_followup_summary(&json, &lore_cfg.inbox_url),
+            master_summary,
             master_fixes,
         }),
         None => {
@@ -3115,18 +3188,19 @@ async fn run_upstream_followup_stage(
                 );
             }
             (!master_summary.is_empty()).then_some(UpstreamFollowupResult {
-                summary: master_summary,
+                summary: String::new(),
+                master_summary,
                 master_fixes,
             })
         }
     }
 }
 
-/// Run the validation-model second-opinion call on a commit. Returns the parsed
+/// Run the complete-context fast review on a commit. Returns the parsed
 /// `{"findings": [...]}` value (possibly empty). On API or parse failure,
-/// returns an empty findings array so the main pipeline's findings are preserved.
+/// returns an empty findings array so regular additive discovery can continue.
 #[allow(clippy::too_many_arguments)]
-async fn run_second_opinion(
+async fn run_fast_review(
     client: &reqwest::Client,
     cfg: &config::ResolvedModel,
     target: config::ReviewTarget,
@@ -3145,15 +3219,13 @@ async fn run_second_opinion(
     effective_repo: &Path,
     tool_cfg: Option<&api::ToolLoopConfig<'_>>,
 ) -> Value {
-    // Keep this pass identical to `--fast`: the reference bundle already contains
-    // the fast-review instructions and upstream follow-up, and the payload adds the
-    // commit message plus diff. The only intentional difference is the caller's
-    // model (`BORO_VALIDATION_MODEL` here, `BORO_MODEL` under `--fast`).
+    // Keep this pass identical to `--fast`. The caller supplies the complete
+    // reference bundle, including upstream follow-up and prefetched source.
     let user = api::single_pass_user_payload(reference, commit_headers, patch_diff);
     v(
         vd,
         format!(
-            "API: second-opinion - model={} user={} chars",
+            "API: fast review - model={} user={} chars",
             cfg.model_id,
             user.len()
         ),
@@ -3163,7 +3235,7 @@ async fn run_second_opinion(
         sha_short,
         step,
         step_total,
-        "Second-opinion review",
+        "Fast complete-context review",
     );
     let t = Instant::now();
     let mut cum = api::CumulativeTokenUsage::default();
@@ -3187,7 +3259,7 @@ async fn run_second_opinion(
     let elapsed = t.elapsed();
     totals.add_usage(usage);
     let stage = StageUsage {
-        step: "2nd-opinion",
+        step: "fast-review",
         usage,
         wall: elapsed,
         error: err.as_ref().map(api::short_error_reason),
@@ -3201,7 +3273,7 @@ async fn run_second_opinion(
                 v(
                     vd,
                     format!(
-                        "second-opinion failed after retries (continuing without second-opinion findings): {e:#}"
+                        "fast review failed after retries (continuing with regular discovery): {e:#}"
                     ),
                 );
             }
@@ -3210,27 +3282,47 @@ async fn run_second_opinion(
     }
 }
 
-fn append_findings(base: &mut Value, extra: &Value) -> usize {
-    let extra_findings = extra
-        .get("findings")
-        .and_then(|f| f.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let added = extra_findings.len();
-    if added == 0 {
-        return 0;
-    }
+fn normalized_finding_problem(finding: &Value) -> String {
+    finding
+        .get("problem")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
-    if !base.is_object() {
-        *base = json!({ "findings": [] });
+fn findings_have_same_identity(a: &Value, b: &Value) -> bool {
+    let a_upstream_sha = a
+        .get("upstream_fix")
+        .and_then(|fix| fix.get("sha"))
+        .and_then(Value::as_str);
+    let b_upstream_sha = b
+        .get("upstream_fix")
+        .and_then(|fix| fix.get("sha"))
+        .and_then(Value::as_str);
+    if let (Some(a_sha), Some(b_sha)) = (a_upstream_sha, b_upstream_sha) {
+        return a_sha == b_sha;
     }
-    if base.get("findings").and_then(|f| f.as_array()).is_none() {
-        base["findings"] = json!([]);
+    let a_problem = normalized_finding_problem(a);
+    !a_problem.is_empty()
+        && a_problem == normalized_finding_problem(b)
+        && a.get("location") == b.get("location")
+}
+
+fn merge_novel_findings(base: &[Value], additions: &[Value]) -> Vec<Value> {
+    let mut merged = base.to_vec();
+    for candidate in additions {
+        if !merged
+            .iter()
+            .any(|finding| findings_have_same_identity(finding, candidate))
+        {
+            merged.push(candidate.clone());
+        }
     }
-    if let Some(findings) = base.get_mut("findings").and_then(|f| f.as_array_mut()) {
-        findings.extend(extra_findings);
-    }
-    added
+    merged
 }
 
 fn append_upstream_fix_findings(base: &mut Value, fixes: &[lore::MasterFix]) -> usize {
@@ -3293,7 +3385,7 @@ async fn run_two_pass(
     worker_ctx: Option<&WorkerLineCtx>,
     publisher: &SnapshotPublisher,
     effective_repo: &Path,
-    second_opinion: Option<&config::ResolvedModel>,
+    fast_review_model: Option<&config::ResolvedModel>,
     master_repo: Option<&lore::MasterRepo>,
 ) -> Result<CommitReviewResult> {
     let mut usage_step: Vec<StageUsage> = Vec::new();
@@ -3311,9 +3403,9 @@ async fn run_two_pass(
     }
     // Display total = highest per-commit table index. Run-wide validation and LKML rendering use
     // their own progress rows after per-commit workers finish. Stages that don't run for a given
-    // commit (subsystem skipped when no index, lore skipped when `lei` is missing, second-opinion
-    // not configured) simply don't emit a progress line.
-    let display_total: u32 = 9 + second_opinion.is_some() as u32;
+    // commit (subsystem skipped when no index or lore skipped when `lei` is missing) simply
+    // don't emit a progress line.
+    let display_total: u32 = 10;
 
     let phase0_spinner: Option<String> = if subsystem_index.is_some() {
         Some(stage_progress_line(
@@ -3409,9 +3501,55 @@ async fn run_two_pass(
         changed_paths,
         max_context_size,
         phase0_selected_prompts.as_deref(),
-        followup_summary.as_ref().map(|f| f.summary.as_str()),
+        followup_summary
+            .as_ref()
+            .map(|f| f.review_context(false))
+            .as_deref(),
     )?;
     let prefetch_block = prefetch_context_block(effective_repo, patch_diff, vd).await;
+    let reference_with_prefetch = if prefetch_block.is_empty() {
+        reference.clone()
+    } else {
+        format!("{reference}{prefetch_block}")
+    };
+    let fast_tool_cfg = fast_review_tool_config(effective_repo, tool_cfg.is_none());
+    let mut baseline_findings = if let Some(cfg) = fast_review_model {
+        run_fast_review(
+            client,
+            cfg,
+            target,
+            &reference_with_prefetch,
+            commit_headers,
+            patch_diff,
+            patch_tag,
+            sha_short,
+            2,
+            display_total,
+            vd,
+            worker_ctx,
+            totals,
+            publisher,
+            &mut usage_step,
+            effective_repo,
+            fast_tool_cfg.as_ref(),
+        )
+        .await
+    } else {
+        json!({ "findings": [] })
+    };
+    let upstream_added = followup_summary
+        .as_ref()
+        .map(|f| append_upstream_fix_findings(&mut baseline_findings, &f.master_fixes))
+        .unwrap_or(0);
+    if upstream_added > 0 {
+        v(
+            vd,
+            format!(
+                "upstream-followup added {upstream_added} deterministic finding(s) to the fast baseline"
+            ),
+        );
+    }
+    publisher.set_findings(baseline_findings.clone());
     // Broad review already has the complete diff and repository tools. Keep the much
     // larger source/linkage bundle for the stage that explicitly verifies linkage.
     let pass1_user = api::broad_concerns_user_payload(&reference, commit_headers, patch_diff);
@@ -3427,7 +3565,7 @@ async fn run_two_pass(
         ),
     );
 
-    let pass1_line = stage_progress_line(patch_tag, sha_short, 2, display_total, "Broad concerns");
+    let pass1_line = stage_progress_line(patch_tag, sha_short, 3, display_total, "Broad concerns");
     let t_pass1 = Instant::now();
     let (parsed_pass1, _raw1, u1, concerns_error, _attempts) =
         api::chat_completion_with_retry_stage_timeout(
@@ -3501,7 +3639,7 @@ async fn run_two_pass(
     if let Some(a) = concerns.as_array() {
         merged_concerns.extend(a.iter().cloned());
     }
-    publish_fallback_findings(publisher, &merged_concerns);
+    publish_fallback_findings(publisher, &baseline_findings, &merged_concerns);
 
     let prior_block = api::format_prior_concerns_for_specialist(&concerns, 8_000);
     if !prior_block.is_empty() {
@@ -3566,7 +3704,7 @@ async fn run_two_pass(
         let spinner = stage_progress_line(
             patch_tag,
             sha_short,
-            u32::from(st),
+            u32::from(st) + 1,
             display_total,
             stages::short_description(st),
         );
@@ -3623,7 +3761,7 @@ async fn run_two_pass(
                 format!("specialist stage {st} failed after retries (continuing with empty)"),
             );
         }
-        publish_fallback_findings(publisher, &merged_concerns);
+        publish_fallback_findings(publisher, &baseline_findings, &merged_concerns);
     }
 
     let merged = Value::Array(merged_concerns);
@@ -3633,59 +3771,11 @@ async fn run_two_pass(
             "pass 2 skipped (no concerns after broad pass + stages 3-8)",
         );
 
-        // Validation-model second-opinion review. Run even though the main pipeline produced no
-        // findings so the stronger model gets a full independent look at the patch.
-        let mut findings_val = json!({ "findings": [] });
-        let upstream_added = followup_summary
-            .as_ref()
-            .map(|f| append_upstream_fix_findings(&mut findings_val, &f.master_fixes))
-            .unwrap_or(0);
-        if upstream_added > 0 {
-            v(
-                vd,
-                format!(
-                    "upstream-followup added {upstream_added} upstream fix finding(s); merged into commit findings"
-                ),
-            );
-            publisher.set_findings(findings_val.clone());
-        }
-        if let Some(cfg) = second_opinion {
-            let so_findings = run_second_opinion(
-                client,
-                cfg,
-                target,
-                &reference,
-                commit_headers,
-                patch_diff,
-                patch_tag,
-                sha_short,
-                10,
-                display_total,
-                vd,
-                worker_ctx,
-                totals,
-                publisher,
-                &mut usage_step,
-                effective_repo,
-                tool_cfg,
-            )
-            .await;
-            let added = append_findings(&mut findings_val, &so_findings);
-            if added > 0 {
-                v(
-                    vd,
-                    format!("second-opinion added {added} finding(s); merged into commit findings"),
-                );
-                publisher.set_findings(findings_val.clone());
-            } else {
-                v(vd, "second-opinion returned no additional findings");
-            }
-        }
-
         let usage_json = commit_usage_json(&usage_step);
         let steps = usage_steps_array(&usage_step);
         return Ok(CommitReviewResult {
-            findings_val,
+            findings_val: baseline_findings,
+            additional_findings_val: json!({ "findings": [] }),
             usage_commit: usage_json,
             usage_steps: Some(steps),
             phase0_selected_prompts,
@@ -3745,8 +3835,13 @@ async fn run_two_pass(
         ),
     );
 
-    let pass2_line =
-        stage_progress_line(patch_tag, sha_short, 9, display_total, "Consolidation pass");
+    let pass2_line = stage_progress_line(
+        patch_tag,
+        sha_short,
+        10,
+        display_total,
+        "Consolidation pass",
+    );
     let t_p2 = Instant::now();
     let (parsed_pass2, _raw2, u2, pass2_err, _attempts) =
         api::chat_completion_with_retry_stage_timeout(
@@ -3803,7 +3898,7 @@ async fn run_two_pass(
         }
     }
     let mut consolidated_findings = parsed_pass2.unwrap_or_else(|| json!({ "findings": [] }));
-    publisher.set_findings(consolidated_findings.clone());
+    publish_combined_findings(publisher, &baseline_findings, &consolidated_findings);
 
     let findings_empty = consolidated_findings
         .get("findings")
@@ -3818,63 +3913,14 @@ async fn run_two_pass(
             "consolidation did not return usable findings; using merged concerns as fallback findings",
         );
         consolidated_findings = api::findings_from_merged_concerns(&merged);
-        publisher.set_findings(consolidated_findings.clone());
-    }
-
-    let upstream_added = followup_summary
-        .as_ref()
-        .map(|f| append_upstream_fix_findings(&mut consolidated_findings, &f.master_fixes))
-        .unwrap_or(0);
-    if upstream_added > 0 {
-        v(
-            vd,
-            format!(
-                "upstream-followup added {upstream_added} upstream fix finding(s); merged into commit findings"
-            ),
-        );
-        publisher.set_findings(consolidated_findings.clone());
-    }
-
-    // Validation-model second-opinion review. It runs after the main pipeline produced its
-    // current findings, appends any additional findings, and leaves global findings validation
-    // to drop false positives / tighten / merge same-location duplicates.
-    if let Some(cfg) = second_opinion {
-        let so_findings = run_second_opinion(
-            client,
-            cfg,
-            target,
-            &reference,
-            commit_headers,
-            patch_diff,
-            patch_tag,
-            sha_short,
-            10,
-            display_total,
-            vd,
-            worker_ctx,
-            totals,
-            publisher,
-            &mut usage_step,
-            effective_repo,
-            tool_cfg,
-        )
-        .await;
-        let added = append_findings(&mut consolidated_findings, &so_findings);
-        if added > 0 {
-            v(
-                vd,
-                format!("second-opinion added {added} finding(s); merged into commit findings"),
-            );
-            publisher.set_findings(consolidated_findings.clone());
-        } else {
-            v(vd, "second-opinion returned no additional findings");
-        }
+        publish_combined_findings(publisher, &baseline_findings, &consolidated_findings);
     }
 
     let usage_json = commit_usage_json(&usage_step);
     let steps = usage_steps_array(&usage_step);
     Ok(CommitReviewResult {
-        findings_val: consolidated_findings,
+        findings_val: baseline_findings,
+        additional_findings_val: consolidated_findings,
         usage_commit: usage_json,
         usage_steps: Some(steps),
         phase0_selected_prompts,
@@ -3889,12 +3935,26 @@ fn concern_requires_linkage_context(concern: &Value) -> bool {
 
 /// Update the snapshot's findings to a fallback derived from the merged concerns
 /// gathered so far, so a Ctrl-C dump after stage 3–7 still surfaces something.
-fn publish_fallback_findings(publisher: &SnapshotPublisher, merged: &[Value]) {
+fn publish_fallback_findings(publisher: &SnapshotPublisher, baseline: &Value, merged: &[Value]) {
     if merged.is_empty() {
         return;
     }
-    let val = api::findings_from_merged_concerns(&Value::Array(merged.to_vec()));
-    publisher.set_findings(val);
+    let additions = api::findings_from_merged_concerns(&Value::Array(merged.to_vec()));
+    publish_combined_findings(publisher, baseline, &additions);
+}
+
+fn publish_combined_findings(publisher: &SnapshotPublisher, baseline: &Value, additions: &Value) {
+    let base = baseline
+        .get("findings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let extra = additions
+        .get("findings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    publisher.set_findings(json!({ "findings": merge_novel_findings(&base, &extra) }));
 }
 
 fn commit_usage_json(steps: &[StageUsage]) -> Value {
@@ -4393,5 +4453,69 @@ mod fast_cli_tests {
         assert!(payload.contains("headers"));
         assert!(payload.contains("patch"));
         assert!(payload.contains("Return ONLY a JSON object"));
+        assert!(payload.contains("\"references\""));
+    }
+
+    #[test]
+    fn exact_regular_duplicate_cannot_replace_fast_provenance() {
+        let baseline = vec![json!({
+            "problem": "is_core_idle is called unnecessarily when has_idle_core is false",
+            "severity": "Low",
+            "severity_explanation": "The result cannot affect preferred_core.",
+            "references": [{
+                "kind": "lore",
+                "url": "https://lore.kernel.org/all/example/",
+                "claim": "The overhead was discussed upstream."
+            }],
+            "location": {"file": "kernel/sched/fair.c", "line": 8698, "side": "RIGHT"}
+        })];
+        let regular = vec![json!({
+            "problem": "IS_CORE_IDLE is called unnecessarily when HAS_IDLE_CORE is false!",
+            "severity": "Low",
+            "severity_explanation": "preferred_core is true regardless.",
+            "location": {"file": "kernel/sched/fair.c", "line": 8698, "side": "RIGHT"}
+        })];
+
+        let merged = merge_novel_findings(&baseline, &regular);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0]["references"][0]["url"],
+            "https://lore.kernel.org/all/example/"
+        );
+    }
+
+    #[test]
+    fn distinct_same_location_regular_finding_is_appended() {
+        let baseline = vec![json!({
+            "problem": "is_core_idle is called unnecessarily when has_idle_core is false",
+            "severity": "Low",
+            "severity_explanation": "overhead",
+            "location": {"file": "kernel/sched/fair.c", "line": 8698, "side": "RIGHT"}
+        })];
+        let additions = vec![json!({
+            "problem": "idle_core is stale after a concurrent topology update",
+            "severity": "High",
+            "severity_explanation": "the cached state selects an offline sibling",
+            "location": {"file": "kernel/sched/fair.c", "line": 8698, "side": "RIGHT"}
+        })];
+
+        let merged = merge_novel_findings(&baseline, &additions);
+
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn normal_review_hides_deterministic_master_fixes_from_one_shot_input() {
+        let followup = UpstreamFollowupResult {
+            summary: "lore discussion\n".to_string(),
+            master_summary: "deterministic upstream fix\n".to_string(),
+            master_fixes: Vec::new(),
+        };
+
+        assert_eq!(followup.review_context(false), "lore discussion\n");
+        assert_eq!(
+            followup.review_context(true),
+            "lore discussion\ndeterministic upstream fix\n"
+        );
     }
 }
