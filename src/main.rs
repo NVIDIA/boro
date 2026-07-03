@@ -44,6 +44,11 @@ use progress::{phase_tag, MultiPatchSpinner, WorkerLineCtx};
 use snapshot::{snapshot_to_value, CommitSnapshot, SnapshotPublisher};
 use verbose::VerboseDest;
 
+fn fast_review_tool_config(repo: &Path, no_tools: bool) -> Option<api::ToolLoopConfig<'_>> {
+    (!no_tools)
+        .then(|| api::ToolLoopConfig::new(repo).requiring(api::ToolVerification::SensitiveFindings))
+}
+
 /// CLI surface for `--backend`. Maps to [`config::Backend`] before reaching the rest of the code.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum BackendArg {
@@ -115,6 +120,7 @@ struct CommitReviewResult {
     usage_commit: Value,
     usage_steps: Option<Value>,
     phase0_selected_prompts: Option<Vec<String>>,
+    validation_context: String,
 }
 
 struct UpstreamFollowupResult {
@@ -188,7 +194,7 @@ struct ReviewArgs {
     #[arg(long, value_name = "SECONDS", default_value_t = 600)]
     timeout: u64,
 
-    /// Skip concerns + consolidation; one review call + LKML pass per commit.
+    /// Run upstream follow-up, one review call, and the LKML report pass per commit.
     #[arg(short = 'x', long)]
     fast: bool,
 
@@ -298,6 +304,10 @@ impl CommitAction {
         matches!(self, CommitAction::Review { no_tools: true, .. })
     }
 
+    fn review_fast(&self) -> bool {
+        matches!(self, CommitAction::Review { fast: true, .. })
+    }
+
     fn is_review(&self) -> bool {
         matches!(self, CommitAction::Review { .. })
     }
@@ -383,7 +393,7 @@ fn stage_progress_line(
     format!("{patch_tag} {sha_short} [step {step}/{total}] {description}")
 }
 
-/// One commit: git + reference bundle + single-pass or full multi-pass review.
+/// One commit: git + reference bundle + fast single-pass or full multi-pass review.
 /// Per-commit consolidation (concerns -> findings) and LKML generation run inside this task.
 ///
 /// `repo` is the main repo root (used for SHA-based `git show`/`diff-tree` lookups, which work
@@ -422,6 +432,159 @@ async fn commit_review_inner(
         vd,
         format!("{} file(s) touched: {}", changed.len(), changed.join(", ")),
     );
+
+    if fast {
+        if dry_run {
+            if !vd.stderr {
+                eprintln!("commit {sha}: patch_chars={}", patch.len());
+            }
+            return Ok(json!({
+                "sha": sha,
+                "dry_run": true,
+                "patch_chars": patch.len(),
+                "fast": true,
+            }));
+        }
+
+        let commit_headers = git::show_commit_headers(repo, sha)?;
+        let patch_diff = git::show_patch_diff_only(repo, sha)?;
+        let patch_tag = patch_series_tag(idx + 1, num_commits);
+        let sha_short = short_sha10(sha);
+        let mut stage_tot = api::CumulativeTokenUsage::default();
+        let mut usage_steps = Vec::new();
+        let subsystem_index = prompts::load_subsystem_index(target, 120_000)?;
+        let phase0_spinner = subsystem_index
+            .as_ref()
+            .map(|_| stage_progress_line(&patch_tag, &sha_short, 0, 2, "Identify subsystem"));
+        let phase0_selected_prompts = match run_phase0_selection(
+            client,
+            model,
+            target,
+            subsystem_index.as_deref(),
+            &patch,
+            vd,
+            totals,
+            phase0_spinner.as_deref(),
+            Some(&mut stage_tot),
+            worker_ctx,
+            effective_repo,
+        )
+        .await
+        {
+            Ok(Some((guides, _raw, usage, wall))) => {
+                let stage = StageUsage {
+                    step: "subsystem",
+                    usage,
+                    wall,
+                    error: None,
+                };
+                usage_steps.push(stage.clone());
+                publisher.add_stage(stage);
+                publisher.set_phase0(Some(guides.clone()));
+                Some(guides)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                v(vd, format!("phase 0 failed (continuing without): {e:#}"));
+                let stage = StageUsage {
+                    step: "subsystem",
+                    usage: TokenUsage::default(),
+                    wall: Duration::from_millis(0),
+                    error: Some(api::short_error_reason(&e)),
+                };
+                usage_steps.push(stage.clone());
+                publisher.add_stage(stage);
+                None
+            }
+        };
+        let lore_cfg = lore::LoreConfig::from_env();
+        let lore_active = lore_cfg.enabled && lore::lei_available();
+        if lore_cfg.enabled && !lore_active {
+            v(
+                vd,
+                "upstream-followup stage: `lei` not found on $PATH; continuing with the upstream branch lookup only",
+            );
+        }
+        let followup = if lore_active || master_repo.is_some() {
+            let spinner = stage_progress_line(&patch_tag, &sha_short, 1, 2, "Upstream follow-up");
+            run_upstream_followup_stage(
+                client,
+                model,
+                repo,
+                sha,
+                &commit_headers,
+                &patch_diff,
+                &lore_cfg,
+                &spinner,
+                vd,
+                &mut stage_tot,
+                worker_ctx,
+                effective_repo,
+                totals,
+                publisher,
+                &mut usage_steps,
+                master_repo,
+                lore_active,
+            )
+            .await
+        } else {
+            None
+        };
+        let reference = prompts::build_reference_context(
+            target,
+            &changed,
+            max_context_size,
+            phase0_selected_prompts.as_deref(),
+            followup.as_ref().map(|result| result.summary.as_str()),
+        )?;
+        let prefetch_block = prefetch_context_block(effective_repo, &patch_diff, vd).await;
+        let reference_with_prefetch = if prefetch_block.is_empty() {
+            reference
+        } else {
+            format!("{reference}{prefetch_block}")
+        };
+        let user =
+            api::single_pass_user_payload(&reference_with_prefetch, &commit_headers, &patch_diff);
+        let spinner = stage_progress_line(&patch_tag, &sha_short, 2, 2, "Second-opinion check");
+        let tool_cfg = fast_review_tool_config(effective_repo, no_tools);
+        let started = Instant::now();
+        let (raw, usage) = api::chat_completion_stage_timeout(
+            client,
+            model,
+            crate::target::reviewer_system_prompt(target),
+            &user,
+            model.temperature,
+            Some(&spinner),
+            Some(&mut stage_tot),
+            vd,
+            tool_cfg.as_ref(),
+            worker_ctx,
+            effective_repo,
+        )
+        .await?;
+        totals.add_usage(usage);
+        let stage = StageUsage {
+            step: "2nd-opinion",
+            usage,
+            wall: started.elapsed(),
+            error: None,
+        };
+        publisher.add_stage(stage.clone());
+        usage_steps.push(stage);
+        publisher.set_findings(json!({ "findings": [] }));
+        let mut result = json!({
+            "sha": sha,
+            "findings": [],
+            "_fast_review": api::strip_json_fences(&raw),
+            "usage": commit_usage_json(&usage_steps),
+            "usage_steps": usage_steps_array(&usage_steps),
+            "fast": true,
+        });
+        if let Some(selected) = phase0_selected_prompts.filter(|selected| !selected.is_empty()) {
+            result["phase0_selected_prompts"] = json!(selected);
+        }
+        return Ok(result);
+    }
 
     v(
         vd,
@@ -469,11 +632,7 @@ async fn commit_review_inner(
     let commit_headers = git::show_commit_headers(repo, sha)?;
     let patch_diff = git::show_patch_diff_only(repo, sha)?;
 
-    let series_for_consolidation = if fast {
-        String::new()
-    } else {
-        series_context_for_consolidation(repo, range, idx, num_commits)
-    };
+    let series_for_consolidation = series_context_for_consolidation(repo, range, idx, num_commits);
     v(
         vd,
         format!(
@@ -485,69 +644,58 @@ async fn commit_review_inner(
     let patch_tag = patch_series_tag(idx + 1, num_commits);
     let sha_short = short_sha10(sha);
     let tool_cfg = (!no_tools).then(|| api::ToolLoopConfig::new(effective_repo));
-    let review = if fast {
-        let prefetch_block = prefetch_context_block(effective_repo, &patch_diff, vd).await;
-        let reference_with_prefetch = if prefetch_block.is_empty() {
-            reference.clone()
-        } else {
-            format!("{reference}{prefetch_block}")
-        };
-        run_single_pass(
-            client,
-            model,
-            target,
-            &reference_with_prefetch,
-            &commit_headers,
-            &patch_diff,
-            vd,
-            &patch_tag,
-            &sha_short,
-            tool_cfg.as_ref(),
-            totals,
-            worker_ctx,
-            publisher,
-            effective_repo,
-            second_opinion,
-        )
-        .await?
-    } else {
-        run_two_pass(
-            client,
-            model,
-            target,
-            repo,
-            sha,
-            &patch_tag,
-            &sha_short,
-            &patch,
-            &commit_headers,
-            &patch_diff,
-            &changed,
-            max_context_size,
-            max_context_size / 2,
-            &series_for_consolidation,
-            vd,
-            tool_cfg.as_ref(),
-            totals,
-            worker_ctx,
-            publisher,
-            effective_repo,
-            second_opinion,
-            master_repo,
-        )
-        .await?
-    };
+    let review = run_two_pass(
+        client,
+        model,
+        target,
+        repo,
+        sha,
+        &patch_tag,
+        &sha_short,
+        &patch,
+        &commit_headers,
+        &patch_diff,
+        &changed,
+        max_context_size,
+        max_context_size / 2,
+        &series_for_consolidation,
+        vd,
+        tool_cfg.as_ref(),
+        totals,
+        worker_ctx,
+        publisher,
+        effective_repo,
+        second_opinion,
+        master_repo,
+    )
+    .await?;
 
     let mut findings_val = review.findings_val.clone();
-    drop_hallucinated_locations(&mut findings_val, &changed, vd);
-    let diff_idx = diff_index::DiffIndex::from_unified_diff(&patch_diff);
-    drop_unanchored_locations(&mut findings_val, &diff_idx, vd);
-
+    let repaired = cleanup_repair_and_validate_findings(
+        &mut findings_val,
+        &commit_headers,
+        &patch_diff,
+        &changed,
+        vd,
+    );
+    if repaired.relocated > 0 || repaired.dropped > 0 {
+        v(
+            vd,
+            format!(
+                "final source repair: relocated {} patch-text finding(s), dropped {} ambiguous finding(s)",
+                repaired.relocated, repaired.dropped
+            ),
+        );
+    }
     let mut commit_obj = json!({
         "sha": sha,
         "findings": findings_val.get("findings").cloned().unwrap_or(json!([])),
         "usage": review.usage_commit,
     });
+    if !review.validation_context.is_empty() {
+        // Internal hand-off to the global validation stage. Removed before output.
+        commit_obj["_validation_context"] = json!(review.validation_context);
+    }
     if let Some(st) = &review.usage_steps {
         commit_obj["usage_steps"] = st.clone();
     }
@@ -821,8 +969,8 @@ async fn execute_commit_task(
 }
 
 /// Drop any `location` entry on a finding whose `file` is not in the patch's changed
-/// paths. Run once at the commit level after consolidation so it covers fast-mode,
-/// two-pass-mode, and merged second-opinion findings uniformly. The finding itself is
+/// paths. Run once at the commit level after consolidation so it covers the full
+/// multi-pass review and merged second-opinion findings uniformly. The finding itself is
 /// preserved (the prose still has review signal); only the suspect anchor is dropped.
 fn drop_hallucinated_locations(findings_val: &mut Value, changed: &[String], vd: &VerboseDest) {
     let Some(arr) = findings_val
@@ -914,7 +1062,73 @@ fn drop_unanchored_locations(
                 }
             }
         }
+
+        let identifiers = obj
+            .get("problem")
+            .and_then(Value::as_str)
+            .map(backticked_c_identifiers)
+            .unwrap_or_default();
+        if !identifiers.is_empty() {
+            let end = obj
+                .get("location")
+                .and_then(|l| l.get("line_end"))
+                .and_then(Value::as_u64)
+                .unwrap_or(line);
+            if !idx.range_contains_identifier(file, line, end, side, &identifiers) {
+                v(
+                    vd,
+                    format!(
+                        "dropping semantically mismatched location for finding (anchor does not contain any named identifier: {})",
+                        identifiers.join(", ")
+                    ),
+                );
+                obj.remove("location");
+            }
+        }
     }
+}
+
+/// Validate model-authored anchors before using their presence to decide whether deterministic
+/// source repair is needed. Repair may create a new anchor, so validate once more afterward.
+fn cleanup_repair_and_validate_findings(
+    findings_val: &mut Value,
+    commit_message: &str,
+    patch: &str,
+    changed: &[String],
+    vd: &VerboseDest,
+) -> api::MessageConcernRepair {
+    drop_hallucinated_locations(findings_val, changed, vd);
+    let diff_idx = diff_index::DiffIndex::from_unified_diff(patch);
+    drop_unanchored_locations(findings_val, &diff_idx, vd);
+
+    let repaired = api::repair_misattributed_message_findings(findings_val, commit_message, patch);
+
+    // `added_line_matches()` should only create real RIGHT-side hunk anchors. Keep this final
+    // check as a postcondition so a future repair strategy cannot leak an invalid location.
+    drop_unanchored_locations(findings_val, &diff_idx, vd);
+    repaired
+}
+
+fn backticked_c_identifiers(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('`') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('`') else {
+            break;
+        };
+        let token = rest[..end].trim().trim_end_matches("()");
+        if !token.is_empty()
+            && token.chars().enumerate().all(|(i, c)| {
+                c == '_' || c.is_ascii_alphanumeric() && (i > 0 || !c.is_ascii_digit())
+            })
+            && !out.iter().any(|existing| existing == token)
+        {
+            out.push(token.to_string());
+        }
+        rest = &rest[end + 1..];
+    }
+    out
 }
 
 /// Merge per-commit metadata (subject/author/date/parents, raw diff, changed paths) onto the
@@ -1040,6 +1254,17 @@ fn append_validation_usage_step(out: &mut Value, model_id: &str, step: Value) {
     out["validation_usage"] = validation_usage_json_from_steps(model_id, steps);
 }
 
+fn without_unverified_sensitive_findings(findings: &Value) -> (Vec<Value>, usize) {
+    let raw = findings.as_array().cloned().unwrap_or_default();
+    let before = raw.len();
+    let retained: Vec<Value> = raw
+        .into_iter()
+        .filter(|finding| !api::finding_requires_repository_verification(finding))
+        .collect();
+    let withheld = before.saturating_sub(retained.len());
+    (retained, withheld)
+}
+
 /// Findings-mode validation: takes per-commit `findings[]` JSON and produces
 /// per-commit `out["commits"][i]["validated_findings"]`. Skips commits with
 /// empty findings; commits absent from the validator's response keep their
@@ -1060,7 +1285,7 @@ async fn run_findings_validation(
     // Snapshot the commits we need to send. We only validate commits that
     // have at least one finding; commits with empty findings are passed
     // through unchanged.
-    let mut payload_owned: Vec<(String, String, String, Value)> = Vec::new();
+    let mut payload_owned: Vec<(String, String, String, String, String, Value)> = Vec::new();
     if let Some(commits) = out["commits"].as_array() {
         for c in commits {
             let findings = match c.get("findings").and_then(|f| f.as_array()) {
@@ -1082,93 +1307,189 @@ async fn run_findings_validation(
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
-            payload_owned.push((sha12, subject, diff, Value::Array(findings.clone())));
+            let commit_message = git::show_commit_headers(repo, sha_full).unwrap_or_default();
+            let reference_context = c
+                .get("_validation_context")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            payload_owned.push((
+                sha12,
+                subject,
+                commit_message,
+                reference_context,
+                diff,
+                Value::Array(findings.clone()),
+            ));
         }
     }
     if payload_owned.is_empty() {
         v(vdest, "validation skipped (no findings to validate)");
         return;
     }
-    let payload_refs: Vec<api::ValidationFindingsCommit<'_>> = payload_owned
-        .iter()
-        .map(
-            |(sha, subject, diff, findings)| api::ValidationFindingsCommit {
-                sha: sha.as_str(),
-                subject: subject.as_str(),
-                diff: diff.as_str(),
-                findings,
-            },
-        )
-        .collect();
-    let user_msg = api::validation_findings_user_payload(&payload_refs);
-    log_validation_header(vdest, main_model, validation_cfg, mode);
-    let label = format!("[validation:{}] Validating findings", mode.label());
-    let progress_line = progress_ui.map(|ui| ui.stage_ctx(label.clone()));
-    let mut stage_tot = api::CumulativeTokenUsage::default();
-    let t_val = Instant::now();
-    let tool_cfg = (!no_tools).then(|| api::ToolLoopConfig::new(repo));
-    let (parsed_opt, _last_raw, summed, last_err, _attempts) =
-        api::chat_completion_with_retry_stage_timeout(
-            client,
-            validation_cfg,
-            api::SYSTEM_REVIEW_VALIDATION_FINDINGS,
-            &user_msg,
-            validation_cfg.temperature,
-            Some(&label),
-            Some(&mut stage_tot),
-            vdest,
-            tool_cfg.as_ref(),
-            progress_line.as_ref(),
-            repo,
-            api::parse_validation_findings,
-            api::RETRY_REMINDER_FINDINGS_VALIDATION,
-            api::STAGE_RETRY_MAX_ATTEMPTS,
-        )
-        .await;
-    if let Some(w) = progress_line.as_ref() {
-        w.finish_commit_line();
-    }
-    totals.add_usage(summed);
-    let wall_ms = t_val.elapsed().as_millis() as u64;
-    let validation_error = last_err.as_ref().map(api::short_error_reason);
-    append_validation_usage_step(
-        out,
-        &validation_cfg.model_id,
-        usage_step_json("findings", summed, wall_ms, validation_error),
-    );
-    let Some(parsed) = parsed_opt else {
-        let msg = last_err
-            .map(|e| format!("{e:#}"))
-            .unwrap_or_else(|| "no response".to_string());
-        v(
-            vdest,
-            format!("validation stage failed (continuing with raw findings): {msg}"),
-        );
-        return;
+    let refs_for = |indices: &[usize]| -> Vec<api::ValidationFindingsCommit<'_>> {
+        indices
+            .iter()
+            .map(|&idx| {
+                let (sha, subject, commit_message, reference_context, diff, findings) =
+                    &payload_owned[idx];
+                api::ValidationFindingsCommit {
+                    sha: sha.as_str(),
+                    subject: subject.as_str(),
+                    commit_message: commit_message.as_str(),
+                    reference_context: reference_context.as_str(),
+                    diff: diff.as_str(),
+                    findings,
+                }
+            })
+            .collect()
     };
+    let user_budget = api::validation_findings_user_budget(validation_cfg.max_input_tokens);
+    let all_indices: Vec<usize> = (0..payload_owned.len()).collect();
+    let all_payload_refs = refs_for(&all_indices);
+    let batches = api::validation_findings_batches(&all_payload_refs, user_budget);
+
+    log_validation_header(vdest, main_model, validation_cfg, mode);
     v(
         vdest,
         format!(
-            "validation done in {:.1?} ({} prompt + {} completion tokens)",
-            t_val.elapsed(),
-            summed.prompt.unwrap_or(0),
-            summed.completion.unwrap_or(0)
+            "validation: {} commit(s) split into {} structured batch(es), user-message budget {} bytes",
+            payload_owned.len(),
+            batches.len(),
+            user_budget
         ),
     );
-
-    // Index validator output by short sha so we can attach per-commit.
+    let mut stage_tot = api::CumulativeTokenUsage::default();
+    let tool_cfg = (!no_tools).then(|| {
+        api::ToolLoopConfig::new(repo).requiring(api::ToolVerification::SensitiveFindings)
+    });
     let mut by_sha: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
-    if let Some(arr) = parsed.get("commits").and_then(|c| c.as_array()) {
-        for entry in arr {
-            let Some(sha) = entry.get("sha").and_then(|s| s.as_str()) else {
-                continue;
+    let mut verification_failed_shas: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut successful_batches = 0usize;
+    for (batch_idx, indices) in batches.iter().enumerate() {
+        let batch_num = batch_idx + 1;
+        let payload_refs = refs_for(indices);
+        let user_msg =
+            match api::validation_findings_user_payload_bounded(&payload_refs, user_budget) {
+                Ok(user_msg) => user_msg,
+                Err(e) => {
+                    let error = format!("{e:#}");
+                    v(
+                        vdest,
+                        format!(
+                            "validation batch {batch_num}/{} skipped: {error}",
+                            batches.len()
+                        ),
+                    );
+                    append_validation_usage_step(
+                        out,
+                        &validation_cfg.model_id,
+                        usage_step_json(
+                            format!("findings-{batch_num}/{}", batches.len()),
+                            TokenUsage::default(),
+                            0,
+                            Some(error),
+                        ),
+                    );
+                    continue;
+                }
             };
-            let findings = entry
-                .get("findings")
-                .cloned()
-                .unwrap_or_else(|| Value::Array(Vec::new()));
-            by_sha.insert(sha.to_string(), findings);
+        let label = format!(
+            "[validation:{}] Validating findings batch {batch_num}/{}",
+            mode.label(),
+            batches.len()
+        );
+        let progress_line = progress_ui.map(|ui| ui.stage_ctx(label.clone()));
+        let t_val = Instant::now();
+        let (parsed_opt, _last_raw, summed, last_err, _attempts) =
+            api::chat_completion_with_retry_stage_timeout_preserve_input(
+                client,
+                validation_cfg,
+                api::SYSTEM_REVIEW_VALIDATION_FINDINGS,
+                &user_msg,
+                validation_cfg.temperature,
+                Some(&label),
+                Some(&mut stage_tot),
+                vdest,
+                tool_cfg.as_ref(),
+                progress_line.as_ref(),
+                repo,
+                api::parse_validation_findings,
+                api::RETRY_REMINDER_FINDINGS_VALIDATION,
+                api::STAGE_RETRY_MAX_ATTEMPTS,
+            )
+            .await;
+        if let Some(w) = progress_line.as_ref() {
+            w.finish_commit_line();
         }
+        totals.add_usage(summed);
+        let wall_ms = t_val.elapsed().as_millis() as u64;
+        let mandatory_verification_failed = last_err
+            .as_ref()
+            .is_some_and(api::is_required_tool_verification_error);
+        let validation_error = last_err.as_ref().map(api::short_error_reason);
+        append_validation_usage_step(
+            out,
+            &validation_cfg.model_id,
+            usage_step_json(
+                format!("findings-{batch_num}/{}", batches.len()),
+                summed,
+                wall_ms,
+                validation_error,
+            ),
+        );
+        let Some(parsed) = parsed_opt else {
+            if mandatory_verification_failed {
+                for &idx in indices {
+                    verification_failed_shas.insert(payload_owned[idx].0.clone());
+                }
+            }
+            let msg = last_err
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_else(|| "no response".to_string());
+            v(
+                vdest,
+                if mandatory_verification_failed {
+                    format!(
+                        "validation batch {batch_num}/{} failed mandatory repository verification (withholding sensitive raw findings): {msg}",
+                        batches.len()
+                    )
+                } else {
+                    format!(
+                        "validation batch {batch_num}/{} failed (continuing with raw findings for that batch): {msg}",
+                        batches.len()
+                    )
+                },
+            );
+            continue;
+        };
+        successful_batches += 1;
+        v(
+            vdest,
+            format!(
+                "validation batch {batch_num}/{} done in {:.1?} ({} prompt + {} completion tokens)",
+                batches.len(),
+                t_val.elapsed(),
+                summed.prompt.unwrap_or(0),
+                summed.completion.unwrap_or(0)
+            ),
+        );
+        if let Some(arr) = parsed.get("commits").and_then(|c| c.as_array()) {
+            for entry in arr {
+                let Some(sha) = entry.get("sha").and_then(|s| s.as_str()) else {
+                    continue;
+                };
+                let findings = entry
+                    .get("findings")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new()));
+                by_sha.insert(sha.to_string(), findings);
+            }
+        }
+    }
+    if successful_batches == 0 && verification_failed_shas.is_empty() {
+        return;
     }
 
     if let Some(commits) = out["commits"].as_array_mut() {
@@ -1201,6 +1522,19 @@ async fn run_findings_validation(
                     .get_mut("findings")
                     .map(|f| f.take())
                     .unwrap_or(Value::Array(Vec::new()));
+            } else if verification_failed_shas.contains(sha12) {
+                let (retained, withheld) = without_unverified_sensitive_findings(
+                    c.get("findings").unwrap_or(&Value::Null),
+                );
+                v(
+                    vdest,
+                    format!(
+                        "validation commit {sha12}: withheld {} sensitive unverified finding(s), retained {} unrelated finding(s)",
+                        withheld,
+                        retained.len()
+                    ),
+                );
+                c["validated_findings"] = Value::Array(retained);
             }
         }
     }
@@ -1274,7 +1608,15 @@ async fn render_commit_lkml_phase(
             .cloned()
             .or_else(|| c.get("findings").cloned())
             .unwrap_or_else(|| json!([]));
-        let arr_empty = chosen.as_array().is_some_and(|a| a.is_empty());
+        let fast_review = c
+            .get("_fast_review")
+            .and_then(|value| value.as_str())
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_owned);
+        let arr_empty = fast_review.is_none()
+            && chosen
+                .as_array()
+                .is_some_and(|findings| findings.is_empty());
         let patch = c
             .get("patch")
             .and_then(|s| s.as_str())
@@ -1303,13 +1645,22 @@ async fn render_commit_lkml_phase(
             let commit_headers =
                 git::show_commit_headers(repo.as_path(), &sha_for_task).unwrap_or_default();
             let patch_capped = api::cap_utf8(&patch, 120_000);
-            let findings_val = json!({ "findings": chosen });
-            let user = api::lkml_report_user_payload(
-                template.as_str(),
-                &findings_val,
-                &commit_headers,
-                &patch_capped,
-            );
+            let user = if let Some(review) = fast_review.as_deref() {
+                api::fast_lkml_report_user_payload(
+                    template.as_str(),
+                    review,
+                    &commit_headers,
+                    &patch_capped,
+                )
+            } else {
+                let findings_val = json!({ "findings": chosen });
+                api::lkml_report_user_payload(
+                    template.as_str(),
+                    &findings_val,
+                    &commit_headers,
+                    &patch_capped,
+                )
+            };
             let label = format!("[lkml] {}", &sha_for_task[..sha_for_task.len().min(12)]);
             let progress_line = progress_ui.as_ref().map(|ui| ui.stage_ctx(label.clone()));
             let mut stage_tot = api::CumulativeTokenUsage::default();
@@ -1334,7 +1685,7 @@ async fn render_commit_lkml_phase(
                 Err(e) => {
                     v(&vd, format!("LKML render failed for {sha_for_task}: {e:#}"));
                     (
-                        None,
+                        fast_review.clone(),
                         TokenUsage::default(),
                         Some(api::short_error_reason(&e)),
                     )
@@ -1861,7 +2212,7 @@ async fn main() -> Result<()> {
 
     // Validation is review-only and on by default; capture the opt-out flag.
     let validation_mode = match &cli.command {
-        Command::Review(a) => a.validation_mode,
+        Command::Review(a) if !a.fast => a.validation_mode,
         _ => ValidationMode::Off,
     };
     let validation_disabled = validation_mode == ValidationMode::Off;
@@ -1982,8 +2333,8 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
     // vars early gives a fast failure for bad input, and lets the header
     // preview the validation model when it differs from the main one. The
     // global validation stage can still be opted out via --validation-mode=off;
-    // the per-commit second-opinion call is always on for review runs.
-    let validation_cfg = if action.is_review() {
+    // the per-commit second-opinion call is always on for staged review runs.
+    let validation_cfg = if action.is_review() && !action.review_fast() {
         Some(
             config::resolve_validation_from_env(&model)
                 .context("resolve validation config from BORO_VALIDATION_* env")?,
@@ -2049,7 +2400,7 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
                 (CommitAction::Review { .. }, config::Backend::OpenAi) if action.review_no_tools() =>
                     "disabled (--no-tools)",
                 (CommitAction::Review { .. }, config::Backend::OpenAi) =>
-                    "enabled (read_files, git_blame, git_diff, git_show - broad pass, specialists, consolidation, LKML; not phase 0)",
+                    "enabled (grep_repo, read_files, read_symbol, git history/diff/show, run_git, rg - review, specialists, validation, LKML; not phase 0 or consolidation)",
             }
         ),
     );
@@ -2315,6 +2666,15 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
         .await;
     }
 
+    // The prefetched source block is an internal validation hand-off, not report data.
+    if let Some(commits) = out["commits"].as_array_mut() {
+        for commit in commits {
+            if let Some(obj) = commit.as_object_mut() {
+                obj.remove("_validation_context");
+            }
+        }
+    }
+
     // Phase 3: render per-commit LKML from validated_findings (or raw
     // findings when validation was off / failed). Skipped in findings mode
     // (structured findings replace the narrative) and on dry-run / Ctrl-C.
@@ -2349,13 +2709,21 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
             patch_ui.clone(),
         )
         .await;
+
+        if let Some(commits) = out["commits"].as_array_mut() {
+            for commit in commits {
+                if let Some(object) = commit.as_object_mut() {
+                    object.remove("_fast_review");
+                }
+            }
+        }
     }
 
     // Run-wide quick summary. One AI call (validation model, falls back to main model) that
     // produces a short prose summary of the findings, plus locally-computed severity counts.
     // Always on for `review` regardless of validation mode (filter / off / findings); skipped
     // on dry-run, Ctrl-C, or non-review subcommands.
-    if !cli.global.dry_run && !cancelled && action.is_review() {
+    if !cli.global.dry_run && !cancelled && action.is_review() && !action.review_fast() {
         let summary_model = validation_cfg.as_ref().unwrap_or(&model);
         run_quick_summary(
             &client,
@@ -2414,136 +2782,6 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
         std::process::exit(130);
     }
     Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_single_pass(
-    client: &reqwest::Client,
-    model: &config::ResolvedModel,
-    target: config::ReviewTarget,
-    reference: &str,
-    commit_headers: &str,
-    patch_diff: &str,
-    vd: &VerboseDest,
-    patch_tag: &str,
-    sha_short: &str,
-    tool_cfg: Option<&api::ToolLoopConfig<'_>>,
-    totals: &mut RunTotals,
-    worker_ctx: Option<&WorkerLineCtx>,
-    publisher: &SnapshotPublisher,
-    effective_repo: &Path,
-    second_opinion: Option<&config::ResolvedModel>,
-) -> Result<CommitReviewResult> {
-    let user = api::single_pass_user_payload(reference, commit_headers, patch_diff);
-    let sys_len = crate::target::reviewer_system_prompt(target).len();
-    let usr_len = user.len();
-    v(
-        vd,
-        format!(
-            "API: single-pass chat/completions - system={sys_len} chars, user={usr_len} chars (~{} input tokens rough)",
-            rough_token_hint(sys_len + usr_len)
-        ),
-    );
-
-    let display_total = 1 + second_opinion.is_some() as u32;
-    let spin = stage_progress_line(patch_tag, sha_short, 1, display_total, "Single-pass review");
-    let mut stage_tot = api::CumulativeTokenUsage::default();
-    let t_review = Instant::now();
-    let (parsed_review, _raw, usage, review_err, _attempts) =
-        api::chat_completion_with_retry_stage_timeout(
-            client,
-            model,
-            crate::target::reviewer_system_prompt(target),
-            &user,
-            model.temperature,
-            Some(&spin),
-            Some(&mut stage_tot),
-            vd,
-            tool_cfg,
-            worker_ctx,
-            effective_repo,
-            api::parse_findings_json,
-            api::RETRY_REMINDER_FINDINGS,
-            api::STAGE_RETRY_MAX_ATTEMPTS,
-        )
-        .await;
-    let d_review = t_review.elapsed();
-    totals.add_usage(usage);
-    let review_stage = StageUsage {
-        step: "review",
-        usage,
-        wall: d_review,
-        error: review_err.as_ref().map(api::short_error_reason),
-    };
-    let mut usage_step: Vec<StageUsage> = vec![review_stage.clone()];
-    publisher.add_stage(review_stage);
-
-    v(
-        vd,
-        format!(
-            "single-pass response: prompt_tokens={:?} tokens={:?}",
-            usage.prompt, usage.completion,
-        ),
-    );
-
-    let mut findings_val = match parsed_review {
-        Some(v) => v,
-        None => {
-            if let Some(e) = review_err {
-                v(
-                    vd,
-                    format!(
-                        "single-pass failed after retries (continuing with empty findings): {e:#}"
-                    ),
-                );
-            }
-            json!({ "findings": [] })
-        }
-    };
-    publisher.set_findings(findings_val.clone());
-
-    if let Some(cfg) = second_opinion {
-        let so_findings = run_second_opinion(
-            client,
-            cfg,
-            target,
-            reference,
-            &findings_val,
-            commit_headers,
-            patch_diff,
-            patch_tag,
-            sha_short,
-            2,
-            display_total,
-            vd,
-            worker_ctx,
-            totals,
-            publisher,
-            &mut usage_step,
-            effective_repo,
-            tool_cfg,
-        )
-        .await;
-        let added = append_findings(&mut findings_val, &so_findings);
-        if added > 0 {
-            v(
-                vd,
-                format!("second-opinion added {added} finding(s); merged into commit findings"),
-            );
-            publisher.set_findings(findings_val.clone());
-        } else {
-            v(vd, "second-opinion returned no additional findings");
-        }
-    }
-
-    let usage_json = commit_usage_json(&usage_step);
-    let steps = usage_steps_array(&usage_step);
-    Ok(CommitReviewResult {
-        findings_val,
-        usage_commit: usage_json,
-        usage_steps: Some(steps),
-        phase0_selected_prompts: None,
-    })
 }
 
 async fn prefetch_context_block(
@@ -2893,7 +3131,6 @@ async fn run_second_opinion(
     cfg: &config::ResolvedModel,
     target: config::ReviewTarget,
     reference: &str,
-    current_findings: &Value,
     commit_headers: &str,
     patch_diff: &str,
     patch_tag: &str,
@@ -2908,8 +3145,11 @@ async fn run_second_opinion(
     effective_repo: &Path,
     tool_cfg: Option<&api::ToolLoopConfig<'_>>,
 ) -> Value {
-    let user =
-        api::second_opinion_user_payload(reference, current_findings, commit_headers, patch_diff);
+    // Keep this pass identical to `--fast`: the reference bundle already contains
+    // the fast-review instructions and upstream follow-up, and the payload adds the
+    // commit message plus diff. The only intentional difference is the caller's
+    // model (`BORO_VALIDATION_MODEL` here, `BORO_MODEL` under `--fast`).
+    let user = api::single_pass_user_payload(reference, commit_headers, patch_diff);
     v(
         vd,
         format!(
@@ -2930,7 +3170,7 @@ async fn run_second_opinion(
     let (parsed, _raw, usage, err, _attempts) = api::chat_completion_with_retry_stage_timeout(
         client,
         cfg,
-        crate::target::second_opinion_system_prompt(target),
+        crate::target::reviewer_system_prompt(target),
         &user,
         cfg.temperature,
         Some(&spinner),
@@ -3172,14 +3412,9 @@ async fn run_two_pass(
         followup_summary.as_ref().map(|f| f.summary.as_str()),
     )?;
     let prefetch_block = prefetch_context_block(effective_repo, patch_diff, vd).await;
-    let reference_with_prefetch = if prefetch_block.is_empty() {
-        reference.clone()
-    } else {
-        format!("{reference}{prefetch_block}")
-    };
-
-    let pass1_user =
-        api::broad_concerns_user_payload(&reference_with_prefetch, commit_headers, patch_diff);
+    // Broad review already has the complete diff and repository tools. Keep the much
+    // larger source/linkage bundle for the stage that explicitly verifies linkage.
+    let pass1_user = api::broad_concerns_user_payload(&reference, commit_headers, patch_diff);
     v(
         vd,
         format!(
@@ -3231,7 +3466,7 @@ async fn run_two_pass(
         ),
     );
 
-    let concerns = match parsed_pass1 {
+    let mut concerns = match parsed_pass1 {
         Some(v1) => v1.get("concerns").cloned().unwrap_or_else(|| json!([])),
         None => {
             v(
@@ -3241,6 +3476,17 @@ async fn run_two_pass(
             json!([])
         }
     };
+    let repaired =
+        api::repair_misattributed_message_concerns(&mut concerns, commit_headers, patch_diff);
+    if repaired.relocated > 0 || repaired.dropped > 0 {
+        v(
+            vd,
+            format!(
+                "pass 1 source repair: relocated {} patch-text concern(s), dropped {} ambiguous concern(s)",
+                repaired.relocated, repaired.dropped
+            ),
+        );
+    }
 
     let patch_slim = api::cap_utf8(patch_diff, 400_000);
     v(
@@ -3298,11 +3544,12 @@ async fn run_two_pass(
         } else {
             (prior_block.as_str(), fp_digest.as_str())
         };
+        let stage_prefetch = if st == 7 { prefetch_block.as_str() } else { "" };
         let user = api::specialist_stage_user_payload(
             instr,
             &addon,
             &patch_slim,
-            &prefetch_block,
+            stage_prefetch,
             st,
             prior_for_stage,
             fp_for_stage,
@@ -3324,6 +3571,10 @@ async fn run_two_pass(
             stages::short_description(st),
         );
         let t_st = Instant::now();
+        let required_tool_cfg = (st == 7 && tool_cfg.is_some()).then(|| {
+            api::ToolLoopConfig::new(effective_repo).requiring(api::ToolVerification::Stage7Linkage)
+        });
+        let stage_tool_cfg = required_tool_cfg.as_ref().or(tool_cfg);
         let (parsed_stage, _raw_s, u_s, stage_error, _attempts) =
             api::chat_completion_with_retry_stage_timeout(
                 client,
@@ -3334,11 +3585,21 @@ async fn run_two_pass(
                 Some(&spinner),
                 Some(&mut stage_tot),
                 vd,
-                tool_cfg,
+                stage_tool_cfg,
                 worker_ctx,
                 effective_repo,
-                api::parse_concerns_strict,
-                api::RETRY_REMINDER_CONCERNS,
+                |raw| {
+                    if st == 7 {
+                        api::parse_stage7_concerns_strict(raw)
+                    } else {
+                        api::parse_concerns_strict(raw)
+                    }
+                },
+                if st == 7 {
+                    api::RETRY_REMINDER_STAGE7_CONCERNS
+                } else {
+                    api::RETRY_REMINDER_CONCERNS
+                },
                 api::STAGE_RETRY_MAX_ATTEMPTS,
             )
             .await;
@@ -3393,8 +3654,7 @@ async fn run_two_pass(
                 client,
                 cfg,
                 target,
-                &reference_with_prefetch,
-                &findings_val,
+                &reference,
                 commit_headers,
                 patch_diff,
                 patch_tag,
@@ -3429,6 +3689,7 @@ async fn run_two_pass(
             usage_commit: usage_json,
             usage_steps: Some(steps),
             phase0_selected_prompts,
+            validation_context: prefetch_block.clone(),
         });
     }
 
@@ -3459,11 +3720,19 @@ async fn run_two_pass(
     }
     let clustered_value = Value::Array(clustered_concerns);
 
+    let consolidation_prefetch = if merged
+        .as_array()
+        .is_some_and(|concerns| concerns.iter().any(concern_requires_linkage_context))
+    {
+        prefetch_block.as_str()
+    } else {
+        ""
+    };
     let pass2_user = api::consolidation_user_payload(
         &extras,
         &json!({ "concerns": clustered_value }),
         series_context,
-        &prefetch_block,
+        consolidation_prefetch,
     );
     v(
         vd,
@@ -3574,8 +3843,7 @@ async fn run_two_pass(
             client,
             cfg,
             target,
-            &reference_with_prefetch,
-            &consolidated_findings,
+            &reference,
             commit_headers,
             patch_diff,
             patch_tag,
@@ -3610,7 +3878,13 @@ async fn run_two_pass(
         usage_commit: usage_json,
         usage_steps: Some(steps),
         phase0_selected_prompts,
+        validation_context: prefetch_block,
     })
+}
+
+fn concern_requires_linkage_context(concern: &Value) -> bool {
+    concern.get("category").and_then(Value::as_str) == Some("configuration-linkage")
+        || concern.get("proof").is_some()
 }
 
 /// Update the snapshot's findings to a fallback derived from the merged concerns
@@ -3760,6 +4034,47 @@ diff --git a/foo.c b/foo.c
         assert_eq!(usage["completion_tokens"], 7);
         assert_eq!(usage["cache_creation_tokens"], 1);
         assert_eq!(usage["cache_read_tokens"], 3);
+    }
+
+    #[test]
+    fn only_configuration_linkage_concerns_request_prefetch_for_consolidation() {
+        assert!(concern_requires_linkage_context(&json!({
+            "category": "configuration-linkage",
+            "proof": {
+                "failing_config": "CONFIG_FOO=n",
+                "caller_condition": "CONFIG_BAR=y",
+                "provider_condition": "CONFIG_FOO=y",
+                "failure": "undefined reference"
+            }
+        })));
+        assert!(concern_requires_linkage_context(&json!({
+            "proof": { "failure": "undefined reference" }
+        })));
+        assert!(!concern_requires_linkage_context(&json!({
+            "category": "hardware-architecture",
+            "type": "s7:barrier"
+        })));
+        assert!(!concern_requires_linkage_context(&json!({
+            "type": "s5:race"
+        })));
+    }
+
+    #[test]
+    fn mandatory_verification_failure_withholds_only_sensitive_findings() {
+        let findings = json!([{
+            "problem": "helper has no caller",
+            "severity": "Medium",
+            "severity_explanation": "repository lookup required"
+        }, {
+            "problem": "lock is released twice",
+            "severity": "High",
+            "severity_explanation": "double unlock on the error path"
+        }]);
+
+        let (retained, withheld) = without_unverified_sensitive_findings(&findings);
+        assert_eq!(withheld, 1);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0]["problem"], "lock is released twice");
     }
 
     #[test]
@@ -3932,6 +4247,34 @@ diff --git a/foo.c b/foo.c
     }
 
     #[test]
+    fn drops_location_that_does_not_contain_named_symbol() {
+        let diff = "--- a/foo.c\n+++ b/foo.c\n@@ -1,3 +1,4 @@\n int unrelated;\n+int still_unrelated;\n+void target_helper(void);\n int tail;\n";
+        let idx = diff_index::DiffIndex::from_unified_diff(diff);
+        let mut findings = json!({"findings":[{
+            "problem":"`target_helper()` has broken linkage",
+            "severity":"High",
+            "severity_explanation":"x",
+            "location":{"file":"foo.c","line":2,"side":"RIGHT"}
+        }]});
+        drop_unanchored_locations(&mut findings, &idx, &vd());
+        assert!(findings["findings"][0].get("location").is_none());
+    }
+
+    #[test]
+    fn keeps_location_containing_named_symbol() {
+        let diff = "--- a/foo.c\n+++ b/foo.c\n@@ -1,1 +1,1 @@\n+void target_helper(void);\n";
+        let idx = diff_index::DiffIndex::from_unified_diff(diff);
+        let mut findings = json!({"findings":[{
+            "problem":"`target_helper()` has broken linkage",
+            "severity":"High",
+            "severity_explanation":"x",
+            "location":{"file":"foo.c","line":1,"side":"RIGHT"}
+        }]});
+        drop_unanchored_locations(&mut findings, &idx, &vd());
+        assert!(findings["findings"][0].get("location").is_some());
+    }
+
+    #[test]
     fn drops_only_line_end_when_line_anchors_but_end_does_not() {
         let idx = diff_index::DiffIndex::from_unified_diff(DIFF);
         let mut findings = json!({
@@ -3971,5 +4314,84 @@ diff --git a/foo.c b/foo.c
         });
         drop_unanchored_locations(&mut findings, &idx, &vd());
         assert!(findings["findings"][0].get("location").is_none());
+    }
+
+    #[test]
+    fn invalid_location_is_cleaned_before_message_typo_repair() {
+        let patch = "\
+diff --git a/foo.c b/foo.c
+--- a/foo.c
++++ b/foo.c
+@@ -10 +10,2 @@
+ context
++/* CPU is avaialable. */
+";
+        let mut findings = json!({"findings": [{
+            "problem": "commit message typo: `avaialable` should be `available`.",
+            "severity": "Low",
+            "severity_explanation": "The misspelling is in the commit message.",
+            "offending_text": "avaialable",
+            "replacement_text": "available",
+            "location": {"file": "foo.c", "line": 999, "side": "RIGHT"}
+        }]});
+
+        let repaired = cleanup_repair_and_validate_findings(
+            &mut findings,
+            "Clean commit message.",
+            patch,
+            &["foo.c".to_string()],
+            &vd(),
+        );
+
+        assert_eq!(repaired.relocated, 1);
+        assert_eq!(repaired.dropped, 0);
+        assert_eq!(findings["findings"][0]["location"]["file"], "foo.c");
+        assert_eq!(findings["findings"][0]["location"]["line"], 11);
+        assert_eq!(findings["findings"][0]["location"]["side"], "RIGHT");
+        assert!(findings["findings"][0]["problem"]
+            .as_str()
+            .unwrap()
+            .contains("added source comment"));
+    }
+}
+
+#[cfg(test)]
+mod fast_cli_tests {
+    use super::*;
+
+    #[test]
+    fn fast_cli_enables_the_single_pass_mode() {
+        let cli = Cli::try_parse_from(["boro", "review", "--fast", "HEAD"]).unwrap();
+        let Command::Review(args) = cli.command else {
+            panic!("expected review command");
+        };
+        assert!(args.fast);
+        assert!(!args.no_tools);
+    }
+
+    #[test]
+    fn fast_honors_no_tools() {
+        let cli = Cli::try_parse_from(["boro", "review", "--fast", "--no-tools", "HEAD"]).unwrap();
+        let Command::Review(args) = cli.command else {
+            panic!("expected review command");
+        };
+        assert!(args.fast);
+        assert!(args.no_tools);
+        assert!(fast_review_tool_config(Path::new("."), args.no_tools).is_none());
+    }
+
+    #[test]
+    fn fast_requires_repository_verification_for_sensitive_findings() {
+        let cfg = fast_review_tool_config(Path::new("."), false).unwrap();
+        assert_eq!(cfg.verification, api::ToolVerification::SensitiveFindings);
+    }
+
+    #[test]
+    fn fast_uses_single_pass_prompt_builder() {
+        let payload = api::single_pass_user_payload("reference", "headers", "patch");
+        assert!(payload.contains("reference"));
+        assert!(payload.contains("headers"));
+        assert!(payload.contains("patch"));
+        assert!(payload.contains("Return ONLY a JSON object"));
     }
 }

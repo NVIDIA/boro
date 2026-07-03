@@ -133,6 +133,34 @@ pub struct ToolLoopConfig<'a> {
     /// If true, `tools::openai_tools_json` advertises `edit_file` and `tools::execute_tool`
     /// will run it. All other tools remain read-only.
     pub allow_edit_file: bool,
+    /// Output-dependent verification requirement. This turns prompt guidance into a runtime
+    /// postcondition: selected findings cannot be returned before at least one repository tool
+    /// has actually executed.
+    pub verification: ToolVerification,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolVerification {
+    Optional,
+    Stage7Linkage,
+    SensitiveFindings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage7ConcernCategory {
+    ConfigurationLinkage,
+    HardwareArchitecture,
+}
+
+fn stage7_concern_category(concern: &Value) -> Result<Stage7ConcernCategory> {
+    match concern.get("category").and_then(Value::as_str) {
+        Some("configuration-linkage") => Ok(Stage7ConcernCategory::ConfigurationLinkage),
+        Some("hardware-architecture") => Ok(Stage7ConcernCategory::HardwareArchitecture),
+        Some(other) => anyhow::bail!(
+            "stage 7 concern has unknown category {other:?}; expected \"configuration-linkage\" or \"hardware-architecture\""
+        ),
+        None => anyhow::bail!("stage 7 concern missing required string category"),
+    }
 }
 
 impl<'a> ToolLoopConfig<'a> {
@@ -141,7 +169,13 @@ impl<'a> ToolLoopConfig<'a> {
             repo,
             max_tool_iterations: 24,
             allow_edit_file: false,
+            verification: ToolVerification::Optional,
         }
+    }
+
+    pub fn requiring(mut self, verification: ToolVerification) -> Self {
+        self.verification = verification;
+        self
     }
 
     /// Construct a tool-loop config with the write-capable `edit_file` tool enabled. Use only
@@ -205,6 +239,108 @@ For git_show, pass `object` to `git show`: a commit hash, `HEAD`, a tag, or `<re
 If `HEAD:path` fails, try the patch commit before the colon; if that still fails, the path may be wrong for that commit: use paths from the patch text, or parent revision syntax such as `rev^:path`. \
 Prior tool results may appear in your context as a short `<tool_result elided ...>` stub - that's an intentional token-saving step (boro replaces consumed tool results with a placeholder once you've incorporated them into a later turn). Do not retry those calls; the information you extracted from them is already in your next assistant message. \
 When finished, respond with ONLY the JSON structure the user message requires (no markdown fences, no prose outside JSON).";
+
+const REQUIRED_TOOL_REMINDER: &str = "Your proposed output contains a repository-verifiable \
+linkage, declaration, definition, export, stub, symbol, or caller claim, but you did not execute \
+any repository tool. Before returning non-empty JSON, use grep_repo/read_files/read_symbol and, \
+when relevant, inspect Kbuild/Makefile or textual .c inclusion ownership. If the claim cannot be \
+verified from tool results, return an empty concerns/findings array.";
+
+#[derive(Debug)]
+struct RequiredToolVerificationError;
+
+impl std::fmt::Display for RequiredToolVerificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "model returned a repository-verifiable finding twice without executing a required repository tool",
+        )
+    }
+}
+
+impl std::error::Error for RequiredToolVerificationError {}
+
+pub fn is_required_tool_verification_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<RequiredToolVerificationError>()
+            .is_some()
+    })
+}
+
+const SENSITIVE_FINDING_TERMS: &[&str] = &[
+    "not declared",
+    "missing declaration",
+    "not defined",
+    "missing definition",
+    "not exported",
+    "export_symbol",
+    "unresolved symbol",
+    "linkage error",
+    "missing stub",
+    "no caller",
+];
+
+pub fn finding_requires_repository_verification(finding: &Value) -> bool {
+    let lower = finding.to_string().to_ascii_lowercase();
+    SENSITIVE_FINDING_TERMS
+        .iter()
+        .any(|term| lower.contains(term))
+}
+
+fn output_requires_tool_verification(policy: ToolVerification, raw: &str) -> bool {
+    if policy == ToolVerification::Optional {
+        return false;
+    }
+    let parsed = match policy {
+        ToolVerification::Stage7Linkage => parse_model_json_with_key(raw, "concerns"),
+        ToolVerification::SensitiveFindings => parse_model_json_with_key(raw, "commits")
+            .or_else(|_| parse_model_json_with_key(raw, "findings")),
+        ToolVerification::Optional => return false,
+    };
+    let Ok(value) = parsed else {
+        return false; // The outer schema retry owns malformed output.
+    };
+
+    match policy {
+        ToolVerification::Stage7Linkage => value
+            .get("concerns")
+            .and_then(Value::as_array)
+            .is_some_and(|concerns| {
+                concerns.iter().any(|concern| {
+                    matches!(
+                        stage7_concern_category(concern),
+                        Ok(Stage7ConcernCategory::ConfigurationLinkage)
+                    )
+                })
+            }),
+        ToolVerification::SensitiveFindings => {
+            value
+                .get("findings")
+                .and_then(Value::as_array)
+                .is_some_and(|findings| {
+                    findings
+                        .iter()
+                        .any(finding_requires_repository_verification)
+                })
+                || value
+                    .get("commits")
+                    .and_then(Value::as_array)
+                    .is_some_and(|commits| {
+                        commits.iter().any(|commit| {
+                            commit
+                                .get("findings")
+                                .and_then(Value::as_array)
+                                .is_some_and(|findings| {
+                                    findings
+                                        .iter()
+                                        .any(finding_requires_repository_verification)
+                                })
+                        })
+                    })
+        }
+        ToolVerification::Optional => false,
+    }
+}
 
 /// Replacement text for tool-result `content` after a later assistant turn has consumed it.
 /// Kept short to maximize input-token savings on the next POST.
@@ -1029,6 +1165,15 @@ Return ONLY a JSON object with a 'concerns' array (each item: \
 If you have no concerns, return `{\"concerns\": []}`. \
 No markdown fences, no prose outside the JSON.";
 
+pub const RETRY_REMINDER_STAGE7_CONCERNS: &str =
+    "Your previous Stage 7 response was rejected because it did not match the required JSON shape. \
+Return ONLY a JSON object with a 'concerns' array. Every item must contain \
+{\"category\": \"configuration-linkage\"|\"hardware-architecture\", \"type\": string, \
+\"description\": string, \"reasoning\": string}. A configuration-linkage concern MUST also \
+contain exactly {\"proof\":{\"failing_config\":string,\"caller_condition\":string,\"provider_condition\":string,\"failure\":string}}. \
+A hardware-architecture concern MUST omit 'proof'. If you have no concerns, return \
+`{\"concerns\": []}`. No markdown fences, no prose outside the JSON.";
+
 pub const RETRY_REMINDER_FINDINGS: &str =
     "Your previous response was rejected because it did not match the required JSON shape. \
 Return ONLY a JSON object with a 'findings' array (each item: \
@@ -1104,6 +1249,14 @@ struct InputBudgetTrim {
     after_estimate: u32,
     target_tokens: u32,
     max_input_tokens: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputTruncationPolicy {
+    /// Prose-oriented requests may be shortened in the middle as a last resort.
+    Middle,
+    /// Structured requests must be fitted by their builder so serialization boundaries survive.
+    Reject,
 }
 
 fn request_json_len(body: &Value) -> usize {
@@ -1339,6 +1492,37 @@ fn enforce_request_input_budget(
     }))
 }
 
+fn enforce_request_input_budget_preserving_initial_user(
+    messages: &mut [Value],
+    body: &mut Value,
+    max_input_tokens: u32,
+) -> Result<Option<InputBudgetTrim>> {
+    let target_tokens = input_budget_target_tokens(max_input_tokens);
+    let before = estimate_request_input_tokens(body);
+    if before <= target_tokens {
+        return Ok(None);
+    }
+
+    // Tool conversations can grow after the valid structured request has already been sent.
+    // Reduce those transient results, but never cut the initial JSON-bearing user message.
+    let changed = shrink_tool_messages_to_fit(messages, body, target_tokens);
+    let after = estimate_request_input_tokens(body);
+    if after > target_tokens {
+        anyhow::bail!(
+            "structured request exceeds configured input budget: estimated {after} input tokens after trimming tool results, target {target_tokens} (max_input_tokens={max_input_tokens}); split the request or reduce its structured context"
+        );
+    }
+    if !changed {
+        return Ok(None);
+    }
+    Ok(Some(InputBudgetTrim {
+        before_estimate: before,
+        after_estimate: after,
+        target_tokens,
+        max_input_tokens,
+    }))
+}
+
 fn parse_number_after(haystack: &str, needle: &str) -> Option<u32> {
     let lower = haystack.to_ascii_lowercase();
     let start = lower.find(needle)? + needle.len();
@@ -1427,6 +1611,7 @@ pub async fn chat_completion(
         worker_line,
         effective_repo,
         None,
+        InputTruncationPolicy::Middle,
     )
     .await
 }
@@ -1458,6 +1643,7 @@ pub async fn chat_completion_stage_timeout(
         worker_line,
         effective_repo,
         Some(StageDeadline::new(model_timeout::review_stage_timeout())),
+        InputTruncationPolicy::Middle,
     )
     .await
 }
@@ -1476,6 +1662,7 @@ async fn chat_completion_inner(
     worker_line: Option<&WorkerLineCtx>,
     effective_repo: &Path,
     stage_deadline: Option<StageDeadline>,
+    input_truncation: InputTruncationPolicy,
 ) -> Result<(String, TokenUsage)> {
     let label = spinner_label
         .map(String::from)
@@ -1653,6 +1840,7 @@ async fn chat_completion_inner(
 
     let mut usages_acc: Vec<TokenUsage> = Vec::new();
     let mut tool_iterations = 0u32;
+    let mut successful_tool_calls = 0u32;
     let mut effective_max_input_tokens = model.max_input_tokens;
     let mut context_budget_retries = 0u32;
     let mut use_stream_options = true;
@@ -1660,6 +1848,7 @@ async fn chat_completion_inner(
     // require an explicit `tools=` parameter (e.g. some Bedrock adapters) don't reject requests.
     let mut disable_tools = false;
     let mut stream_stage_header_printed = false;
+    let mut verification_reminded = false;
 
     loop {
         // Drop consumed tool-result payloads from prior iterations. Each tool result whose content
@@ -1723,9 +1912,19 @@ async fn chat_completion_inner(
 
         let mut body = Value::Object(body);
         if let Some(max_input_tokens) = effective_max_input_tokens {
-            if let Some(trim) =
-                enforce_request_input_budget(&mut messages, &mut body, max_input_tokens)?
-            {
+            let trim = match input_truncation {
+                InputTruncationPolicy::Middle => {
+                    enforce_request_input_budget(&mut messages, &mut body, max_input_tokens)?
+                }
+                InputTruncationPolicy::Reject => {
+                    enforce_request_input_budget_preserving_initial_user(
+                        &mut messages,
+                        &mut body,
+                        max_input_tokens,
+                    )?
+                }
+            };
+            if let Some(trim) = trim {
                 v_chat(
                     dest,
                     format!(
@@ -1754,7 +1953,7 @@ async fn chat_completion_inner(
                 .await?
                 .context("read chat/completions body")?;
 
-            // One-shot fallback: if the provider rejected our cache markers
+            // Single-request fallback: if the provider rejected our cache markers
             // (e.g. Vertex/Gemini, whose caching API is incompatible with
             // inline `cache_control` when system / tools are also set on the
             // request), strip the markers from the system + initial user
@@ -2015,6 +2214,13 @@ async fn chat_completion_inner(
                 let join_out = await_with_stage_deadline(join, stage_deadline, &label).await?;
                 // Never abort the review on tool failure: send structured error back so the model can retry.
                 let out = tool_message_content_for_join_result(&tool_name, join_out);
+                let failed = serde_json::from_str::<Value>(&out)
+                    .ok()
+                    .and_then(|value| value.get("tool_error").and_then(Value::as_bool))
+                    .unwrap_or(false);
+                if !failed {
+                    successful_tool_calls += 1;
+                }
                 if dest.active() {
                     verbose_section(
                         dest,
@@ -2035,6 +2241,22 @@ async fn chat_completion_inner(
         }
 
         let content = message_content_to_string(&message);
+        if let Some(cfg) = tool_loop {
+            if successful_tool_calls == 0
+                && output_requires_tool_verification(cfg.verification, &content)
+            {
+                if verification_reminded {
+                    return Err(RequiredToolVerificationError.into());
+                }
+                verification_reminded = true;
+                dest.line(
+                    "required-tool verification: rejecting non-empty unverified output and asking the model to inspect the repository",
+                );
+                messages.push(message);
+                messages.push(json!({"role": "user", "content": REQUIRED_TOOL_REMINDER}));
+                continue;
+            }
+        }
         if dest.active() {
             v_chat(
                 dest,
@@ -2106,6 +2328,7 @@ where
         schema_reminder,
         max_attempts,
         None,
+        InputTruncationPolicy::Middle,
     )
     .await
 }
@@ -2146,6 +2369,50 @@ where
         schema_reminder,
         max_attempts,
         Some(StageDeadline::new(model_timeout::review_stage_timeout())),
+        InputTruncationPolicy::Middle,
+    )
+    .await
+}
+
+/// Retry a structured stage without allowing the generic request fitter to cut through its
+/// serialization. Callers must batch or shrink the structured fields before invoking this.
+#[allow(clippy::too_many_arguments)]
+pub async fn chat_completion_with_retry_stage_timeout_preserve_input<F, T>(
+    client: &reqwest::Client,
+    model: &ResolvedModel,
+    system: &str,
+    user: &str,
+    temperature: Option<f32>,
+    spinner_label: Option<&str>,
+    cumulative: Option<&mut CumulativeTokenUsage>,
+    dest: &VerboseDest,
+    tool_loop: Option<&ToolLoopConfig<'_>>,
+    worker_line: Option<&WorkerLineCtx>,
+    effective_repo: &Path,
+    parse_fn: F,
+    schema_reminder: &str,
+    max_attempts: u32,
+) -> (Option<T>, String, TokenUsage, Option<anyhow::Error>, u32)
+where
+    F: Fn(&str) -> Result<T>,
+{
+    chat_completion_with_retry_inner(
+        client,
+        model,
+        system,
+        user,
+        temperature,
+        spinner_label,
+        cumulative,
+        dest,
+        tool_loop,
+        worker_line,
+        effective_repo,
+        parse_fn,
+        schema_reminder,
+        max_attempts,
+        Some(StageDeadline::new(model_timeout::review_stage_timeout())),
+        InputTruncationPolicy::Reject,
     )
     .await
 }
@@ -2167,6 +2434,7 @@ async fn chat_completion_with_retry_inner<F, T>(
     schema_reminder: &str,
     max_attempts: u32,
     stage_deadline: Option<StageDeadline>,
+    input_truncation: InputTruncationPolicy,
 ) -> (Option<T>, String, TokenUsage, Option<anyhow::Error>, u32)
 where
     F: Fn(&str) -> Result<T>,
@@ -2204,6 +2472,7 @@ where
             worker_line,
             effective_repo,
             stage_deadline,
+            input_truncation,
         )
         .await;
         match result {
@@ -2223,6 +2492,13 @@ augmenting prompt with schema reminder and retrying",
                 }
             }
             Err(e) => {
+                if is_required_tool_verification_error(&e) {
+                    dest.line(format!(
+                        "stage retry: mandatory repository verification was not satisfied: {e:#}; withholding unverified sensitive findings",
+                    ));
+                    last_err = Some(e);
+                    return (None, last_raw, summed, last_err, attempt);
+                }
                 if model_timeout::is(&e) {
                     dest.line(format!(
                         "stage retry: API attempt {attempt}/{max} timed out: {e:#}; skipping stage",
@@ -2460,6 +2736,297 @@ pub fn diff_touches_comments(patch: &str) -> bool {
         }
     }
     false
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MessageConcernRepair {
+    pub relocated: usize,
+    pub dropped: usize,
+}
+
+/// Repair spelling/grammar concerns that the broad-pass model attributes to the commit
+/// message even though the quoted text exists only on an added diff line.
+///
+/// This is deliberately narrow: only unanchored `msg:typo` and `msg:grammar` concerns are
+/// considered. A uniquely matching added line is deterministic evidence of the real source, so
+/// the concern is reclassified and anchored there. If the model quotes text absent from the
+/// commit message but it cannot be mapped unambiguously to one added line, drop the concern
+/// instead of letting the LKML renderer present it as a commit-message issue.
+pub fn repair_misattributed_message_concerns(
+    concerns: &mut Value,
+    commit_message: &str,
+    patch: &str,
+) -> MessageConcernRepair {
+    let Some(arr) = concerns.as_array_mut() else {
+        return MessageConcernRepair::default();
+    };
+    let mut result = MessageConcernRepair::default();
+
+    arr.retain_mut(|concern| {
+        let Some(obj) = concern.as_object_mut() else {
+            return true;
+        };
+        if obj.get("location").is_some_and(Value::is_object) {
+            return true;
+        }
+        let ty = obj.get("type").and_then(Value::as_str).unwrap_or("");
+        let replacement_type = match ty {
+            "msg:typo" => "code:typo",
+            "msg:grammar" => "code:grammar",
+            _ => return true,
+        };
+        let evidence = format!(
+            "{}\n{}",
+            obj.get("description").and_then(Value::as_str).unwrap_or(""),
+            obj.get("reasoning").and_then(Value::as_str).unwrap_or("")
+        );
+        let quoted = offending_fragments(obj, &evidence);
+        let absent: Vec<&str> = quoted
+            .iter()
+            .map(String::as_str)
+            .filter(|text| !commit_message.contains(text))
+            .collect();
+        if absent.is_empty() {
+            return true;
+        }
+
+        let mut matches = Vec::<(String, u64)>::new();
+        for text in absent {
+            for found in added_line_matches(patch, text) {
+                if !matches.contains(&found) {
+                    matches.push(found);
+                }
+            }
+        }
+        if matches.len() != 1 {
+            result.dropped += 1;
+            return false;
+        }
+
+        let (file, line) = matches.pop().expect("checked one match");
+        obj.insert("type".to_string(), json!(replacement_type));
+        obj.insert(
+            "location".to_string(),
+            json!({"file": file, "line": line, "side": "RIGHT"}),
+        );
+        for field in ["description", "reasoning"] {
+            if let Some(text) = obj.get(field).and_then(Value::as_str).map(str::to_string) {
+                let repaired = text
+                    .replace("commit message body", "added source comment")
+                    .replace("commit message", "added source comment");
+                obj.insert(field.to_string(), json!(repaired));
+            }
+        }
+        result.relocated += 1;
+        true
+    });
+
+    result
+}
+
+/// Final defence after consolidation. Models sometimes discard the concern type and location
+/// while recreating the same false "commit message" attribution as a finding.
+pub fn repair_misattributed_message_findings(
+    findings: &mut Value,
+    commit_message: &str,
+    patch: &str,
+) -> MessageConcernRepair {
+    let Some(arr) = findings.get_mut("findings").and_then(Value::as_array_mut) else {
+        return MessageConcernRepair::default();
+    };
+    let mut result = MessageConcernRepair::default();
+
+    arr.retain_mut(|finding| {
+        let Some(obj) = finding.as_object_mut() else {
+            return true;
+        };
+        if obj.get("location").is_some_and(Value::is_object) {
+            return true;
+        }
+        let problem = obj.get("problem").and_then(Value::as_str).unwrap_or("");
+        let problem_lower = problem.to_ascii_lowercase();
+        let is_message_language_issue = problem_lower.contains("commit message")
+            && ["typo", "misspell", "grammar", "spelling"]
+                .iter()
+                .any(|word| problem_lower.contains(word));
+        if !is_message_language_issue {
+            return true;
+        }
+
+        let evidence = format!(
+            "{}\n{}",
+            problem,
+            obj.get("severity_explanation")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        );
+        let quoted = offending_fragments(obj, &evidence);
+        let absent: Vec<&str> = quoted
+            .iter()
+            .map(String::as_str)
+            .filter(|text| !commit_message.contains(text))
+            .collect();
+        if absent.is_empty() {
+            return true;
+        }
+        let mut matches = Vec::<(String, u64)>::new();
+        for text in absent {
+            for found in added_line_matches(patch, text) {
+                if !matches.contains(&found) {
+                    matches.push(found);
+                }
+            }
+        }
+        if matches.len() != 1 {
+            result.dropped += 1;
+            return false;
+        }
+
+        let (file, line) = matches.pop().expect("checked one match");
+        obj.insert(
+            "location".to_string(),
+            json!({"file": file, "line": line, "side": "RIGHT"}),
+        );
+        for field in ["problem", "severity_explanation"] {
+            if let Some(text) = obj.get(field).and_then(Value::as_str).map(str::to_string) {
+                let repaired = text
+                    .replace("commit message body", "added source comment")
+                    .replace("commit message", "added source comment");
+                obj.insert(field.to_string(), json!(repaired));
+            }
+        }
+        result.relocated += 1;
+        true
+    });
+
+    result
+}
+
+#[derive(Debug)]
+struct QuotedFragment {
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+fn quoted_fragments(text: &str) -> Vec<QuotedFragment> {
+    let mut out = Vec::new();
+    for delimiter in ['\'', '"', '`'] {
+        let mut rest = text;
+        let mut offset = 0usize;
+        while let Some(start) = rest.find(delimiter) {
+            let value_start = start + delimiter.len_utf8();
+            let after_start = &rest[value_start..];
+            let Some(end) = after_start.find(delimiter) else {
+                break;
+            };
+            let value = after_start[..end].trim();
+            if value.chars().count() >= 3 {
+                out.push(QuotedFragment {
+                    start: offset + start,
+                    end: offset + value_start + end + delimiter.len_utf8(),
+                    text: value.to_string(),
+                });
+            }
+            let consumed = value_start + end + delimiter.len_utf8();
+            offset += consumed;
+            rest = &rest[consumed..];
+        }
+    }
+    out.sort_by_key(|fragment| fragment.start);
+    out.dedup_by(|a, b| a.start == b.start && a.end == b.end);
+    out
+}
+
+fn quote_is_replacement(text: &str, fragment: &QuotedFragment) -> bool {
+    let prefix = text[..fragment.start].trim_end().to_ascii_lowercase();
+    let suffix = text[fragment.end..].trim_start().to_ascii_lowercase();
+
+    // In "bad should be good" and "bad instead of good", the first quote is the
+    // offending source text even if an earlier phrase happens to look replacement-like.
+    if [
+        "should be",
+        "instead of",
+        "rather than",
+        "corrected to",
+        "->",
+        "→",
+    ]
+    .iter()
+    .any(|cue| suffix.starts_with(cue))
+    {
+        return false;
+    }
+
+    [
+        "should be",
+        "instead of",
+        "rather than",
+        "corrected to",
+        "correction is",
+        "correct spelling is",
+        "replacement is",
+        "->",
+        "→",
+    ]
+    .iter()
+    .any(|cue| prefix.ends_with(cue))
+        || (prefix.ends_with("with")
+            && prefix
+                .chars()
+                .rev()
+                .take(80)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+                .contains("replace"))
+}
+
+fn offending_fragments(obj: &serde_json::Map<String, Value>, evidence: &str) -> Vec<String> {
+    if let Some(explicit) = obj
+        .get("offending_text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return vec![explicit.to_string()];
+    }
+
+    let mut out = Vec::new();
+    for fragment in quoted_fragments(evidence) {
+        if !quote_is_replacement(evidence, &fragment) && !out.contains(&fragment.text) {
+            out.push(fragment.text);
+        }
+    }
+    out
+}
+
+fn added_line_matches(patch: &str, needle: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for hunk in collect_diff_hunks(patch) {
+        let mut new_line = u64::from(hunk.new_start);
+        for line in hunk.text.lines().skip(1) {
+            if line.starts_with("+++") || line.starts_with("---") {
+                continue;
+            }
+            match line.as_bytes().first().copied() {
+                Some(b'+') => {
+                    if line[1..].contains(needle) {
+                        let found = (hunk.file.clone(), new_line);
+                        if !out.contains(&found) {
+                            out.push(found);
+                        }
+                    }
+                    new_line += 1;
+                }
+                Some(b'-') | Some(b'\\') => {}
+                Some(b' ') | None => new_line += 1,
+                _ => break,
+            }
+        }
+    }
+    out
 }
 
 pub fn strip_json_fences(s: &str) -> String {
@@ -2740,6 +3307,62 @@ pub fn parse_concerns_strict(raw: &str) -> Result<Value> {
     Ok(v)
 }
 
+/// Stage 7's structured proof is a machine contract, not merely prompt advice. Reject generic
+/// placeholders so the retry loop gets a chance to demand checked-out-tree evidence.
+pub fn parse_stage7_concerns_strict(raw: &str) -> Result<Value> {
+    let v = parse_concerns_strict(raw)?;
+    let concerns = v["concerns"].as_array().expect("validated above");
+    for concern in concerns {
+        match stage7_concern_category(concern)? {
+            Stage7ConcernCategory::HardwareArchitecture => {
+                if concern.get("proof").is_some() {
+                    anyhow::bail!(
+                        "stage 7 hardware-architecture concern must omit the configuration/linkage proof object"
+                    );
+                }
+                continue;
+            }
+            Stage7ConcernCategory::ConfigurationLinkage => {}
+        }
+        let proof = concern
+            .get("proof")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("stage 7 configuration/linkage concern missing proof object"))?;
+        const FIELDS: &[&str] = &[
+            "failing_config",
+            "caller_condition",
+            "provider_condition",
+            "failure",
+        ];
+        if proof.len() != FIELDS.len() || FIELDS.iter().any(|field| !proof.contains_key(*field)) {
+            anyhow::bail!("stage 7 proof must contain exactly the four required fields");
+        }
+        for field in FIELDS {
+            let text = proof[*field]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow!("stage 7 proof.{field} must be a non-empty string"))?;
+            let lower = text.to_ascii_lowercase();
+            if [
+                "any config",
+                "all config",
+                "every config",
+                "any file",
+                "if another file",
+            ]
+            .iter()
+            .any(|placeholder| lower.contains(placeholder))
+            {
+                anyhow::bail!(
+                    "stage 7 proof.{field} is hypothetical/generic rather than a concrete checked-out-tree condition"
+                );
+            }
+        }
+    }
+    Ok(v)
+}
+
 /// Parse `{"summary": "...", "findings": [...]}` from the test-review stage. Returns the summary
 /// string (empty when missing - the caller decides whether to substitute a placeholder) and a
 /// `Value` with the validated `findings` array (top-level shape `{"findings":[...]}` to match the
@@ -2816,15 +3439,13 @@ pub fn findings_from_merged_concerns(merged: &Value) -> Value {
 /// section so specialists refine Pass 1's output within their domain instead of rediscovering it.
 /// `fp_digest` (the short distilled false-positive guide) is injected before the reference excerpts
 /// so the specialist sees "what NOT to flag" guidance before generating concerns.
-/// `prefetched_context_block` carries source definitions around touched lines and referenced
-/// definitions, matching Sashiko's automatic prefetch path.
+/// When supplied, `prefetched_context_block` carries source definitions around touched lines and
+/// referenced definitions. The multi-pass caller reserves this larger block for the linkage
+/// specialist instead of resending it to every specialist.
 ///
-/// Layout is ordered to maximize prompt-cache hits across the five specialist calls:
-/// content that is byte-identical across stages (patch, prefetched source context, FP digest,
-/// prior concerns) goes at the front; per-stage variation (instruction body, stage-specific reference addon, trailing
-/// JSON schema mentioning the stage number) goes at the back. Anthropic-compat gateways cache
-/// the user block by exact-prefix match, so this turns the patch (capped 400k) into a cache
-/// hit on stages 4–7 instead of a fresh prompt every call.
+/// Layout is ordered to maximize prompt-cache hits across specialist calls: common content goes
+/// at the front and per-stage variation goes at the back. The linkage stage's prefetched context
+/// is also placed before stage-specific instructions.
 pub fn specialist_stage_user_payload(
     instruction_body: &str,
     reference_addon_md: &str,
@@ -2852,12 +3473,12 @@ pub fn specialist_stage_user_payload(
         format!("{prefetched_context_block}\n")
     };
     let concern_schema = if stage == 7 {
-        r#"{"type":"s7:string","description":"string","reasoning":"string","location":{"file":"path/in/diff","line":N,"line_end":N,"side":"LEFT|RIGHT"}}"#
+        r#"{"category":"configuration-linkage|hardware-architecture","type":"s7:string","description":"string","reasoning":"string","location":{"file":"path/in/diff","line":N,"line_end":N,"side":"LEFT|RIGHT"}}"#
     } else {
         r#"{"type":"string","description":"string","reasoning":"string","location":{"file":"path/in/diff","line":N,"line_end":N,"side":"LEFT|RIGHT"}}"#
     };
     let proof_contract = if stage == 7 {
-        r#"For stage 7, the "proof" object is conditional. For every configuration/linkage concern it is REQUIRED with exactly these four non-empty string fields: "proof":{"failing_config":"string","caller_condition":"string","provider_condition":"string","failure":"string"}. For hardware/architecture concerns, OMIT "proof" and do not invent configuration or linkage values. "#
+        r#"For stage 7, "category" is REQUIRED and must be exactly "configuration-linkage" or "hardware-architecture". For every "configuration-linkage" concern, "proof" is REQUIRED with exactly these four non-empty string fields: "proof":{"failing_config":"string","caller_condition":"string","provider_condition":"string","failure":"string"}. For "hardware-architecture" concerns, OMIT "proof" and do not invent configuration or linkage values. "#
     } else {
         ""
     };
@@ -2927,11 +3548,12 @@ pub fn broad_concerns_user_payload(
 # Commit message (subject and body)\n\n\
 Review this text for **English** quality: spelling, grammar, syntax, and clarity. \
 Check that the subject and body match the diff below (no mis-stated behavior). \
-Add `concerns` for substantive problems; use `type` values such as `msg:typo`, `msg:grammar`, `msg:clarity`, or `msg:mismatch` when useful.\n\n\
+Add `concerns` for substantive problems; use `type` values such as `msg:typo`, `msg:grammar`, `msg:clarity`, or `msg:mismatch` when useful. \
+Treat the commit-message and patch blocks as separate sources. Before emitting any `msg:*` concern, verify that the exact offending text appears in the `Commit message` fenced block. For every `msg:typo` or `msg:grammar` concern, set `offending_text` to the exact bad source text and, when proposing a correction, set `replacement_text` separately; never put the suggested correction in `offending_text`. Never describe text that appears only in the patch as a commit-message issue. For spelling or grammar mistakes in an added source comment, use `code:typo` or `code:grammar` and include a RIGHT-side `location` on the affected added line; if you cannot anchor such a patch issue, omit it.\n\n\
 ```\n{headers_capped}\n```\n\n\
 # Patch under review (diff only)\n\n```\n{patch_capped}\n```\n\n\
 Return ONLY JSON (no markdown fences): \
-{{\"concerns\":[{{\"type\":\"string\",\"description\":\"string\",\"reasoning\":\"string\",\"location\":{{\"file\":\"path/in/diff\",\"line\":N,\"line_end\":N,\"side\":\"LEFT|RIGHT\"}}}}]}}. \
+{{\"concerns\":[{{\"type\":\"string\",\"description\":\"string\",\"reasoning\":\"string\",\"offending_text\":\"optional exact bad text\",\"replacement_text\":\"optional suggested correction\",\"location\":{{\"file\":\"path/in/diff\",\"line\":N,\"line_end\":N,\"side\":\"LEFT|RIGHT\"}}}}]}}. \
 Top-level key must be \"concerns\" (not \"findings\"). \
 For every concern, make \"reasoning\" carry concrete proof appropriate to the issue type: the relevant code or text facts, a reachable trigger or witness when applicable, the violated invariant or contradiction, and the concrete failure or user-visible defect. Exact contradictory text is sufficient proof for comment and commit-message concerns. Do not use \"may\", \"might\", \"could\", or \"not guaranteed\" as a substitute for missing evidence. \
 Do not emit a concern merely because the old/removed code was buggy when the new/right-side diff fixes that behavior; report only remaining, incomplete, or newly introduced bugs. \
@@ -2951,7 +3573,7 @@ Review for **English** quality (spelling, grammar, syntax, clarity) and for cons
 ```\n{headers_capped}\n```\n\n\
 # Patch under review (diff only)\n\n```\n{patch_capped}\n```\n\n\
 {USER_JSON_INSTRUCTION}\n\n\
-Include `findings` for commit-message issues when substantive (typos/grammar are typically Low severity)."
+Treat the commit-message and patch blocks as separate sources. Call something a commit-message issue only after verifying that the exact offending text appears in the `Commit message` block. Text found only in an added source comment is a code-comment issue and MUST carry a RIGHT-side `location` on that added line; if it cannot be anchored, omit it. Include `findings` for genuine commit-message issues when substantive (typos/grammar are typically Low severity)."
     )
 }
 
@@ -2977,10 +3599,11 @@ Apply the proof rule to every concern, not only configuration/linkage concerns. 
 For configuration/linkage concerns, treat a complete proof containing a valid `failing_config`, the checked-out tree's exact `caller_condition` and `provider_condition`, and a concrete `failure` as sufficient evidence. Preserve such a finding even when the failing configuration is non-default. Do not discard it merely because the description uses cautious wording when the structured `proof` and reasoning establish all four facts. Conversely, discard claims that a declaration, definition, export, or stub “may” or “might” be absent, is “not guaranteed”, or “could be absent” when they do not provide that complete proof. \
 Respect introduced vs pre-existing issues: drop pre-existing issues when the reviewed diff fixes them. A finding must identify a bug that remains in the new/right-side code, an incomplete fix, or a different bug introduced by the patch. High/critical pre-existing issues in an enclosing function or directly referenced definition may be kept only when they still exist after the patch and this patch touches or revalidates that path; low/medium pre-existing issues should be dropped unless introduced or made worse by this patch. \
 Keep valid concerns about commit-message English/grammar/typos or misleading changelog text (often `msg:*` types) when they are user-visible issues.\n\
+Enforce source boundaries for English-quality concerns: retain a `msg:*` concern only when its offending text is actually from the commit message, not from a source comment in the diff. For spelling or grammar findings, preserve `offending_text` and `replacement_text` as separate fields; `offending_text` must quote the bad source text, never the proposed correction. A spelling or grammar concern about text in the patch must be described as a code/comment issue and must retain a valid diff `location`; if the input has no location, discard it rather than misreporting it as a commit-message issue.\n\
 If the series context lists patches **after** the one under review, you may discard a concern only when a later subject (or clear evidence) shows the issue was actually addressed; do not dismiss based on vague promises in commit messages alone.\n\
 When referring to other patches in this series, use their **subjects** (one-line titles), not git hashes.\n\
 When the prior JSON carries a \"location\" object on a concern or finding, preserve it verbatim on the resulting finding. When you merge several inputs into one finding, keep the most specific location; if they disagree, drop \"location\" rather than invent one.\n\
-Return ONLY JSON: {{\"findings\":[{{\"problem\":\"...\",\"severity\":\"Low|Medium|High|Critical\",\"severity_explanation\":\"...\",\"location\":{{\"file\":\"path/in/diff\",\"line\":N,\"line_end\":N,\"side\":\"LEFT|RIGHT\"}}}}]}}. \
+Return ONLY JSON: {{\"findings\":[{{\"problem\":\"...\",\"severity\":\"Low|Medium|High|Critical\",\"severity_explanation\":\"...\",\"offending_text\":\"optional exact bad text\",\"replacement_text\":\"optional suggested correction\",\"location\":{{\"file\":\"path/in/diff\",\"line\":N,\"line_end\":N,\"side\":\"LEFT|RIGHT\"}}}}]}}. \
 The \"location\" field is optional - include it on a finding only when at least one merged input had one.",
         serde_json::to_string_pretty(prior_json).unwrap_or_default()
     )
@@ -3056,29 +3679,90 @@ pub const SYSTEM_CONFIG_FRAGMENT: &str = include_str!("../resources/config-fragm
 pub const SYSTEM_REVIEW_VALIDATION_FINDINGS: &str =
     include_str!("../resources/review-validation-findings.md");
 
+pub fn fast_lkml_report_user_payload(
+    inline_template: &str,
+    fast_review: &str,
+    commit_headers: &str,
+    patch_capped: &str,
+) -> String {
+    let fast_review = cap_utf8(fast_review, 120_000);
+    format!(
+        "{inline_template}\n\n# Commit (headers)\n\n```\n{commit_headers}\n```\n\n\
+# Patch (for quoting context; may be truncated)\n\n```\n{patch_capped}\n```\n\n\
+# Fast review result\n\n{fast_review}\n\n\
+Turn the fast review result into the final LKML-ready email body per the rules above. \
+Preserve every concrete finding, but do not invent new findings. When quoting the patch, copy \
+lines verbatim. Return only the email body text, with no JSON and no markdown code fence wrapping \
+the entire message."
+    )
+}
+
 /// Per-commit input to the findings-mode validation payload. The
 /// builder serializes a list of these as the model's user message.
 pub struct ValidationFindingsCommit<'a> {
     pub sha: &'a str,
     pub subject: &'a str,
+    pub commit_message: &'a str,
+    pub reference_context: &'a str,
     pub diff: &'a str,
     /// The per-commit `findings[]` array exactly as it appears in `out`.
     pub findings: &'a Value,
 }
 
-/// Build the user message for `--validation-mode=findings`. Caps each diff
-/// at 80 KiB so a long series stays within the validator's context window;
-/// the prompt instructs the model to emit JSON, so the input is JSON too.
-pub fn validation_findings_user_payload(commits: &[ValidationFindingsCommit<'_>]) -> String {
+const VALIDATION_COMMIT_MESSAGE_MAX_BYTES: usize = 48_000;
+const VALIDATION_REFERENCE_MAX_BYTES: usize = 80_000;
+const VALIDATION_DIFF_MAX_BYTES: usize = 80_000;
+const VALIDATION_SCALE_DENOMINATOR: usize = 1_000_000;
+
+/// Conservative share of the complete request budget available to the serialized validation user
+/// message. The remainder is reserved for the system prompt, repository tool schemas, chat
+/// framing, and a schema reminder on retry. The request layer performs the final exact estimate
+/// and rejects a structured request that still does not fit.
+pub fn validation_findings_user_budget(max_input_tokens: Option<u32>) -> usize {
+    let max_input_tokens = max_input_tokens.unwrap_or(crate::config::DEFAULT_MAX_INPUT_TOKENS);
+    let target_tokens = input_budget_target_tokens(max_input_tokens) as usize;
+    let estimated_request_bytes = target_tokens.saturating_mul(INPUT_EST_BYTES_PER_TOKEN_X2) / 2;
+    estimated_request_bytes.saturating_mul(3) / 5
+}
+
+fn validation_findings_user_wire_len(payload: &str) -> usize {
+    serde_json::to_vec(payload)
+        .map(|encoded| encoded.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn validation_findings_user_payload_scaled(
+    commits: &[ValidationFindingsCommit<'_>],
+    scale: usize,
+) -> String {
     let entries: Vec<Value> = commits
         .iter()
         .map(|c| {
-            json!({
+            let commit_message_cap = VALIDATION_COMMIT_MESSAGE_MAX_BYTES.saturating_mul(scale)
+                / VALIDATION_SCALE_DENOMINATOR;
+            let reference_cap =
+                VALIDATION_REFERENCE_MAX_BYTES.saturating_mul(scale) / VALIDATION_SCALE_DENOMINATOR;
+            let diff_cap =
+                VALIDATION_DIFF_MAX_BYTES.saturating_mul(scale) / VALIDATION_SCALE_DENOMINATOR;
+            let mut entry = json!({
                 "sha": c.sha,
                 "subject": c.subject,
-                "diff": cap_utf8(c.diff, 80_000),
+                "commit_message": cap_utf8_middle_exact(c.commit_message, commit_message_cap),
+                "reference_context": cap_utf8_middle_exact(c.reference_context, reference_cap),
+                "diff": cap_utf8_middle_exact(c.diff, diff_cap),
                 "findings": c.findings,
-            })
+            });
+            let commit_message_truncated = c.commit_message.len() > commit_message_cap;
+            let reference_context_truncated = c.reference_context.len() > reference_cap;
+            let diff_truncated = c.diff.len() > diff_cap;
+            if commit_message_truncated || reference_context_truncated || diff_truncated {
+                entry["context_status"] = json!({
+                    "commit_message_truncated": commit_message_truncated,
+                    "reference_context_truncated": reference_context_truncated,
+                    "diff_truncated": diff_truncated,
+                });
+            }
+            entry
         })
         .collect();
     let body = serde_json::to_string_pretty(&json!({ "commits": entries }))
@@ -3087,40 +3771,93 @@ pub fn validation_findings_user_payload(commits: &[ValidationFindingsCommit<'_>]
         "Per-commit findings under review (validate per the system prompt):\n\n```json\n{body}\n```\n\n\
 Return ONLY a JSON object: {{\"commits\":[{{\"sha\":\"<sha12>\",\"findings\":[...]}}]}}. \
 Preserve every kept finding's \"location\" object byte-for-byte from the input. \
+When \"context_status\" reports a truncated field, do not treat absence from that field as evidence; use repository tools when the claim requires the omitted context. \
 No markdown fences, no prose outside the JSON."
     )
 }
 
-/// User payload for the second-opinion stage. Carries the same reference bundle as Pass 1 plus
-/// commit headers, patch diff, and current pipeline findings. The stage still reviews the full
-/// patch, but sees the current findings so it can avoid duplicate output.
-pub fn second_opinion_user_payload(
-    reference: &str,
-    current_findings: &Value,
-    commit_headers: &str,
-    patch_diff: &str,
-) -> String {
-    let headers_capped = cap_utf8(commit_headers, 48_000);
-    let patch_capped = cap_utf8(patch_diff, 400_000);
-    let findings_capped = cap_utf8(
-        &serde_json::to_string_pretty(current_findings)
-            .unwrap_or_else(|_| "{\"findings\":[]}".to_string()),
-        80_000,
-    );
-    format!(
-        "{reference}\n\n\
-Current findings from the main multi-stage pipeline (these will be merged with your output before validation):\n\n```json\n{findings_capped}\n```\n\n\
-# Commit (headers)\n\n```\n{headers_capped}\n```\n\n\
-# Patch under second-opinion review (diff only)\n\n```\n{patch_capped}\n```\n\n\
-Review the whole patch independently. Emit only additional concrete findings \
-that should be merged with the current findings above and sent to validation. \
-Do not duplicate an existing finding unless your version materially improves the \
-evidence, location, or severity framing. If you find no additional concrete \
-issues, return an empty findings array. Do not report a defect that exists only \
-in the removed/old code when the reviewed patch fixes it; report only remaining, \
-incomplete, or newly introduced bugs.\n\n\
-{USER_JSON_INSTRUCTION}"
-    )
+/// Build the findings-validation message with valid JSON whose serialized string representation
+/// is no larger than `max_bytes`.
+/// Source fields are reduced together before serialization; SHA, subject, findings, and the
+/// output contract are never truncated. This is intentionally separate from generic request
+/// fitting, which cannot safely cut through an embedded JSON document.
+pub fn validation_findings_user_payload_bounded(
+    commits: &[ValidationFindingsCommit<'_>],
+    max_bytes: usize,
+) -> Result<String> {
+    let full = validation_findings_user_payload_scaled(commits, VALIDATION_SCALE_DENOMINATOR);
+    if validation_findings_user_wire_len(&full) <= max_bytes {
+        return Ok(full);
+    }
+
+    let minimum = validation_findings_user_payload_scaled(commits, 0);
+    let minimum_wire_len = validation_findings_user_wire_len(&minimum);
+    if minimum_wire_len > max_bytes {
+        anyhow::bail!(
+            "validation findings and framing require {} bytes, exceeding the {}-byte structured user-message budget",
+            minimum_wire_len,
+            max_bytes
+        );
+    }
+
+    let mut lo = 0usize;
+    let mut hi = VALIDATION_SCALE_DENOMINATOR;
+    let mut best = minimum;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let candidate = validation_findings_user_payload_scaled(commits, mid);
+        if validation_findings_user_wire_len(&candidate) <= max_bytes {
+            best = candidate;
+            lo = mid.saturating_add(1);
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok(best)
+}
+
+/// Greedily group commits whose full structured payload fits `max_bytes`. An individually
+/// oversized commit remains a one-entry batch and is reduced by
+/// [`validation_findings_user_payload_bounded`] immediately before it is sent.
+pub fn validation_findings_batches(
+    commits: &[ValidationFindingsCommit<'_>],
+    max_bytes: usize,
+) -> Vec<Vec<usize>> {
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    for idx in 0..commits.len() {
+        let mut candidate = current.clone();
+        candidate.push(idx);
+        let candidate_refs: Vec<ValidationFindingsCommit<'_>> = candidate
+            .iter()
+            .map(|&candidate_idx| ValidationFindingsCommit {
+                sha: commits[candidate_idx].sha,
+                subject: commits[candidate_idx].subject,
+                commit_message: commits[candidate_idx].commit_message,
+                reference_context: commits[candidate_idx].reference_context,
+                diff: commits[candidate_idx].diff,
+                findings: commits[candidate_idx].findings,
+            })
+            .collect();
+        if !current.is_empty()
+            && validation_findings_user_wire_len(&validation_findings_user_payload(&candidate_refs))
+                > max_bytes
+        {
+            batches.push(std::mem::take(&mut current));
+        }
+        current.push(idx);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+/// Build the unbatched form used for sizing and small validation requests.
+pub fn validation_findings_user_payload(commits: &[ValidationFindingsCommit<'_>]) -> String {
+    validation_findings_user_payload_scaled(commits, VALIDATION_SCALE_DENOMINATOR)
 }
 
 /// System prompt for the `test` command's "pick a quick test" pre-stage. Assembled at first use
@@ -3550,6 +4287,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fast_lkml_payload_carries_review_and_patch() {
+        let payload = fast_lkml_report_user_payload(
+            "inline rules",
+            "Finding: broken locking",
+            "Subject: [PATCH] fix",
+            "diff --git a/foo.c b/foo.c",
+        );
+        assert!(payload.contains("inline rules"));
+        assert!(payload.contains("Finding: broken locking"));
+        assert!(payload.contains("Subject: [PATCH] fix"));
+        assert!(payload.contains("diff --git a/foo.c b/foo.c"));
+        assert!(payload.contains("final LKML-ready email body"));
+    }
+
+    #[test]
     fn findings_json_after_prose_in_markdown_fence() {
         let raw = "Reasoning here.\n\n```json\n{\"findings\":[]}\n```\n";
         let v = parse_findings_json(raw).unwrap();
@@ -3618,6 +4370,233 @@ mod tests {
     }
 
     #[test]
+    fn english_quality_prompts_keep_commit_and_patch_sources_distinct() {
+        let broad = broad_concerns_user_payload("", "commit marker", "patch marker");
+        assert!(broad.contains("Treat the commit-message and patch blocks as separate sources"));
+        assert!(broad.contains("verify that the exact offending text appears"));
+        assert!(broad.contains("Never describe text that appears only in the patch"));
+        assert!(broad.contains("use `code:typo` or `code:grammar`"));
+        assert!(broad.contains("include a RIGHT-side `location`"));
+        assert!(broad.contains("set `offending_text` to the exact bad source text"));
+        assert!(broad.contains("set `replacement_text` separately"));
+
+        let single = single_pass_user_payload("", "commit marker", "patch marker");
+        assert!(single.contains("Call something a commit-message issue only after verifying"));
+        assert!(single.contains("Text found only in an added source comment"));
+        assert!(single.contains("MUST carry a RIGHT-side `location`"));
+
+        let consolidation = consolidation_user_payload("", &json!({}), "", "");
+        assert!(consolidation.contains("Enforce source boundaries"));
+        assert!(consolidation.contains("retain a `msg:*` concern only when"));
+        assert!(consolidation.contains("discard it rather than misreporting it"));
+        assert!(consolidation.contains("preserve `offending_text` and `replacement_text`"));
+    }
+
+    #[test]
+    fn misattributed_message_typo_is_relocated_to_unique_added_line() {
+        let mut concerns = json!([{
+            "type": "msg:typo",
+            "description": "Misspelling of 'available' in commit message body.",
+            "reasoning": "The commit message contains 'avaialable' instead of 'available'.",
+            "location": null
+        }]);
+        let patch = "\
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -100,2 +100,3 @@
+ context
++ * CPU in the span if none are avaialable.
+ context
+";
+        let result = repair_misattributed_message_concerns(
+            &mut concerns,
+            "The allocator chooses the next available CPU.",
+            patch,
+        );
+
+        assert_eq!(
+            result,
+            MessageConcernRepair {
+                relocated: 1,
+                dropped: 0
+            }
+        );
+        assert_eq!(concerns[0]["type"], "code:typo");
+        assert_eq!(concerns[0]["location"]["file"], "kernel/sched/topology.c");
+        assert_eq!(concerns[0]["location"]["line"], 101);
+        assert_eq!(concerns[0]["location"]["side"], "RIGHT");
+        assert!(concerns[0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("added source comment"));
+    }
+
+    #[test]
+    fn genuine_message_typo_is_not_relocated() {
+        let mut concerns = json!([{
+            "type": "msg:typo",
+            "description": "Commit message says 'avaialable'.",
+            "reasoning": "The exact misspelling is 'avaialable'."
+        }]);
+        let result = repair_misattributed_message_concerns(
+            &mut concerns,
+            "Use the first avaialable CPU.",
+            "",
+        );
+
+        assert_eq!(result, MessageConcernRepair::default());
+        assert_eq!(concerns[0]["type"], "msg:typo");
+        assert!(concerns[0].get("location").is_none());
+    }
+
+    #[test]
+    fn correction_quote_is_not_used_as_the_offending_text() {
+        let mut concerns = json!([{
+            "type": "msg:typo",
+            "description": "`avaialable` should be `available` in the commit message.",
+            "reasoning": "The correction is `available`."
+        }]);
+        let patch = "\
+diff --git a/a.c b/a.c
+--- a/a.c
++++ b/a.c
+@@ -1 +1,2 @@
++/* Keep available CPUs here. */
+";
+
+        let result = repair_misattributed_message_concerns(
+            &mut concerns,
+            "Use the first avaialable CPU.",
+            patch,
+        );
+
+        assert_eq!(result, MessageConcernRepair::default());
+        assert_eq!(concerns[0]["type"], "msg:typo");
+        assert!(concerns[0].get("location").is_none());
+    }
+
+    #[test]
+    fn replacement_match_does_not_make_patch_typo_ambiguous() {
+        let mut concerns = json!([{
+            "type": "msg:typo",
+            "description": "`avaialable` should be `available` in the commit message.",
+            "reasoning": "The source uses the misspelling."
+        }]);
+        let patch = "\
+diff --git a/a.c b/a.c
+--- a/a.c
++++ b/a.c
+@@ -1 +1,3 @@
++/* CPU is avaialable. */
++/* Keep available CPUs here. */
+";
+
+        let result = repair_misattributed_message_concerns(&mut concerns, "Clean message.", patch);
+
+        assert_eq!(
+            result,
+            MessageConcernRepair {
+                relocated: 1,
+                dropped: 0
+            }
+        );
+        assert_eq!(concerns[0]["type"], "code:typo");
+        assert_eq!(concerns[0]["location"]["line"], 1);
+    }
+
+    #[test]
+    fn explicit_offending_text_wins_over_quoted_replacement() {
+        let mut concerns = json!([{
+            "type": "msg:typo",
+            "description": "Use `available` instead.",
+            "reasoning": "The commit message is misspelled.",
+            "offending_text": "avaialable",
+            "replacement_text": "available"
+        }]);
+        let patch = "\
+diff --git a/a.c b/a.c
+--- a/a.c
++++ b/a.c
+@@ -1 +1,2 @@
++/* CPU is avaialable. */
+";
+
+        let result = repair_misattributed_message_concerns(&mut concerns, "Clean message.", patch);
+        assert_eq!(result.relocated, 1);
+        assert_eq!(concerns[0]["location"]["line"], 1);
+    }
+
+    #[test]
+    fn ambiguous_misattributed_message_typo_is_dropped() {
+        let mut concerns = json!([{
+            "type": "msg:typo",
+            "description": "Commit message contains 'teh'.",
+            "reasoning": "The typo is 'teh'."
+        }]);
+        let patch = "\
+diff --git a/a.c b/a.c
+--- a/a.c
++++ b/a.c
+@@ -1 +1,2 @@
++/* teh first */
++/* teh second */
+";
+        let result = repair_misattributed_message_concerns(&mut concerns, "clean message", patch);
+
+        assert_eq!(
+            result,
+            MessageConcernRepair {
+                relocated: 0,
+                dropped: 1
+            }
+        );
+        assert_eq!(concerns, json!([]));
+    }
+
+    #[test]
+    fn consolidated_message_typo_is_relocated_before_lkml_rendering() {
+        let mut findings = json!({"findings": [{
+            "problem": "Misspelling of 'available' in commit message body.",
+            "severity": "Low",
+            "severity_explanation": "This is a simple typo ('avaialable') in the commit message."
+        }]});
+        let patch = "\
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -2963,2 +2963,3 @@
+ context
++ * CPU in the span if none are avaialable.
+ context
+";
+        let result = repair_misattributed_message_findings(
+            &mut findings,
+            "The first available CPU is selected.",
+            patch,
+        );
+
+        assert_eq!(
+            result,
+            MessageConcernRepair {
+                relocated: 1,
+                dropped: 0
+            }
+        );
+        let finding = &findings["findings"][0];
+        assert_eq!(finding["location"]["file"], "kernel/sched/topology.c");
+        assert_eq!(finding["location"]["line"], 2964);
+        assert!(finding["problem"]
+            .as_str()
+            .unwrap()
+            .contains("added source comment"));
+        assert!(!finding["severity_explanation"]
+            .as_str()
+            .unwrap()
+            .contains("commit message"));
+    }
+
+    #[test]
     fn stage7_and_consolidation_share_linkage_proof_contract() {
         let stage7 = specialist_stage_user_payload("", "", "diff", "", 7, "", "");
         for field in [
@@ -3628,9 +4607,13 @@ mod tests {
         ] {
             assert!(stage7.contains(field), "stage 7 schema missing {field}");
         }
-        assert!(stage7.contains("configuration/linkage concern it is REQUIRED"));
+        assert!(stage7.contains("\"category\" is REQUIRED"));
+        assert!(stage7.contains("\"configuration-linkage\""));
+        assert!(stage7.contains("\"hardware-architecture\""));
         assert!(stage7.contains("exactly these four non-empty string fields"));
-        assert!(stage7.contains(r#""reasoning":"string","location":{"file":"path/in/diff""#));
+        assert!(stage7.contains(
+            r#""category":"configuration-linkage|hardware-architecture","type":"s7:string""#
+        ));
 
         let stage6 = specialist_stage_user_payload("", "", "diff", "", 6, "", "");
         assert!(!stage6.contains("failing_config"));
@@ -3659,7 +4642,7 @@ mod tests {
         let stage7 = specialist_stage_user_payload(instruction, "", "diff", "", 7, "", "");
 
         assert!(stage7.contains("missing `dma_wmb()`/`dma_rmb()` barriers"));
-        assert!(stage7.contains("For hardware/architecture concerns, OMIT \"proof\""));
+        assert!(stage7.contains("For \"hardware-architecture\" concerns, OMIT \"proof\""));
         assert!(stage7.contains("do not invent configuration or linkage values"));
     }
 
@@ -3675,15 +4658,11 @@ mod tests {
     }
 
     #[test]
-    fn second_opinion_prompt_rejects_fixed_old_code_only_reports() {
-        let s = second_opinion_user_payload("", &json!({"findings": []}), "subject", "diff");
-        assert!(s.contains("defect that exists only"));
-        assert!(s.contains("reviewed patch fixes it"));
-        assert_eq!(
-            s.matches("If you find no additional concrete issues")
-                .count(),
-            1
-        );
+    fn independent_review_prompt_rejects_fixed_old_code_only_reports() {
+        let reference = include_str!("../resources/fast-review.md");
+        let s = single_pass_user_payload(reference, "subject", "diff");
+        assert!(s.contains("Do not report the bug that the patch is fixing"));
+        assert!(s.contains("new/right-side diff removes"));
     }
 
     #[test]
@@ -3773,15 +4752,145 @@ mod tests {
         let commits = vec![ValidationFindingsCommit {
             sha: "abc123def456",
             subject: "fix loop",
+            commit_message: "commit abc123def456\n\n    Explain why the loop bound changes.",
+            reference_context: "x.c: helper() guarantees count is positive",
             diff: "diff --git a/x.c b/x.c\n--- a/x.c\n+++ b/x.c",
             findings: &findings,
         }];
         let s = validation_findings_user_payload(&commits);
         assert!(s.contains("\"sha\": \"abc123def456\""));
         assert!(s.contains("\"subject\": \"fix loop\""));
+        assert!(s.contains("Explain why the loop bound changes"));
+        assert!(s.contains("helper() guarantees count is positive"));
         assert!(s.contains("\"problem\": \"off-by-one\""));
         // The closing instruction mentioning the strict output shape must be present.
         assert!(s.contains("Return ONLY a JSON object"));
+    }
+
+    #[test]
+    fn bounded_validation_payload_stays_valid_and_preserves_findings() {
+        let findings = json!([{
+            "problem": "off-by-one",
+            "severity": "Medium",
+            "severity_explanation": "loop bound",
+            "location": {"file": "x.c", "line": 42, "side": "RIGHT"}
+        }]);
+        let commit_message = "message é\n".repeat(4_000);
+        let reference_context = "reference helper context\n".repeat(4_000);
+        let diff = "+ changed source line\n".repeat(4_000);
+        let commits = vec![ValidationFindingsCommit {
+            sha: "abc123def456",
+            subject: "fix loop",
+            commit_message: &commit_message,
+            reference_context: &reference_context,
+            diff: &diff,
+            findings: &findings,
+        }];
+
+        let payload = validation_findings_user_payload_bounded(&commits, 8_000).unwrap();
+        assert!(payload.len() <= 8_000);
+        assert!(validation_findings_user_wire_len(&payload) <= 8_000);
+        let json_body = payload
+            .split_once("```json\n")
+            .unwrap()
+            .1
+            .split_once("\n```")
+            .unwrap()
+            .0;
+        let parsed: Value = serde_json::from_str(json_body).unwrap();
+        assert_eq!(parsed["commits"][0]["sha"], "abc123def456");
+        assert_eq!(parsed["commits"][0]["findings"], findings);
+        assert_eq!(
+            parsed["commits"][0]["context_status"]["reference_context_truncated"],
+            true
+        );
+    }
+
+    #[test]
+    fn validation_user_budget_reserves_default_request_framing() {
+        let max_input_tokens = crate::config::DEFAULT_MAX_INPUT_TOKENS;
+        let user_budget = validation_findings_user_budget(Some(max_input_tokens));
+        let user = format!(
+            "{}{}",
+            "x".repeat(user_budget),
+            RETRY_REMINDER_FINDINGS_VALIDATION
+        );
+        let messages = json!([
+            {
+                "role": "system",
+                "content": format!(
+                    "{}{}",
+                    SYSTEM_REVIEW_VALIDATION_FINDINGS,
+                    SYSTEM_REPO_TOOLS_SUFFIX
+                )
+            },
+            {"role": "user", "content": user}
+        ]);
+        let body = json!({
+            "model": "validator",
+            "messages": messages,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "tools": tools::openai_tools_json(false),
+            "tool_choice": "auto",
+        });
+        assert!(
+            estimate_request_input_tokens(&body) <= input_budget_target_tokens(max_input_tokens)
+        );
+    }
+
+    #[test]
+    fn validation_payload_batches_oversized_commits_without_losing_order() {
+        let findings = json!([{
+            "problem": "problem",
+            "severity": "Low",
+            "severity_explanation": "proof"
+        }]);
+        let context = "source context\n".repeat(2_000);
+        let commits = vec![
+            ValidationFindingsCommit {
+                sha: "111111111111",
+                subject: "one",
+                commit_message: "message one",
+                reference_context: &context,
+                diff: "diff one",
+                findings: &findings,
+            },
+            ValidationFindingsCommit {
+                sha: "222222222222",
+                subject: "two",
+                commit_message: "message two",
+                reference_context: &context,
+                diff: "diff two",
+                findings: &findings,
+            },
+            ValidationFindingsCommit {
+                sha: "333333333333",
+                subject: "three",
+                commit_message: "message three",
+                reference_context: &context,
+                diff: "diff three",
+                findings: &findings,
+            },
+        ];
+
+        let batches = validation_findings_batches(&commits, 20_000);
+        assert_eq!(batches, vec![vec![0], vec![1], vec![2]]);
+        for batch in batches {
+            let refs: Vec<ValidationFindingsCommit<'_>> = batch
+                .iter()
+                .map(|&idx| ValidationFindingsCommit {
+                    sha: commits[idx].sha,
+                    subject: commits[idx].subject,
+                    commit_message: commits[idx].commit_message,
+                    reference_context: commits[idx].reference_context,
+                    diff: commits[idx].diff,
+                    findings: commits[idx].findings,
+                })
+                .collect();
+            let payload = validation_findings_user_payload_bounded(&refs, 20_000).unwrap();
+            assert!(validation_findings_user_wire_len(&payload) <= 20_000);
+        }
     }
 
     #[test]
@@ -4497,43 +5606,6 @@ index 111..222 100644
     }
 
     #[test]
-    fn second_opinion_user_payload_carries_prompt_frame() {
-        let current = json!({
-            "findings": [{
-                "problem": "existing issue",
-                "severity": "Low",
-                "severity_explanation": "existing explanation"
-            }]
-        });
-        let s = second_opinion_user_payload("ref-bundle", &current, "commit hdr", "diff body");
-        // The "active ingredient" - the user-approved prompt frame - must be present verbatim.
-        assert!(
-            s.contains("Current findings from the main multi-stage pipeline"),
-            "missing current-findings context"
-        );
-        assert!(
-            s.contains("evidence, location, or severity framing"),
-            "missing duplicate-avoidance evidence framing"
-        );
-        assert!(
-            s.contains("additional concrete findings"),
-            "missing additional-findings framing"
-        );
-        assert!(
-            s.contains("Review the whole patch independently"),
-            "missing full-patch review framing"
-        );
-        // Same JSON shape as regular review stages.
-        assert!(s.contains(r#""findings""#));
-        assert!(s.contains("severity"));
-        assert!(s.contains("existing issue"));
-        // Body content survives.
-        assert!(s.contains("ref-bundle"));
-        assert!(s.contains("commit hdr"));
-        assert!(s.contains("diff body"));
-    }
-
-    #[test]
     fn parse_concerns_strict_accepts_valid_empty_array() {
         let v = parse_concerns_strict(r#"{"concerns": []}"#).expect("parses");
         assert!(v["concerns"].is_array());
@@ -4547,6 +5619,88 @@ index 111..222 100644
         )
         .expect("parses");
         assert_eq!(v["concerns"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stage7_parser_rejects_hypothetical_generic_proof() {
+        let raw = r#"{"concerns":[{"category":"configuration-linkage","type":"s7:linkage","description":"d","reasoning":"r","proof":{"failing_config":"Any config where another file calls it","caller_condition":"Any file including the header","provider_condition":"not exported","failure":"unresolved symbol"}}]}"#;
+        assert!(parse_stage7_concerns_strict(raw).is_err());
+    }
+
+    #[test]
+    fn stage7_parser_accepts_concrete_four_field_proof() {
+        let raw = r#"{"concerns":[{"category":"configuration-linkage","type":"s7:undefined-symbol","description":"d","reasoning":"r","proof":{"failing_config":"CONFIG_FOO=m with CONFIG_BAR=y","caller_condition":"foo.o is selected by obj-$(CONFIG_FOO)","provider_condition":"bar.o is built into vmlinux by obj-y","failure":"foo.ko has an undefined reference to bar"}}]}"#;
+        assert!(parse_stage7_concerns_strict(raw).is_ok());
+        assert!(output_requires_tool_verification(
+            ToolVerification::Stage7Linkage,
+            raw
+        ));
+    }
+
+    #[test]
+    fn stage7_parser_rejects_missing_or_unknown_category() {
+        let missing =
+            r#"{"concerns":[{"type":"s7:undefined-symbol","description":"d","reasoning":"r"}]}"#;
+        let unknown = r#"{"concerns":[{"category":"linkage","type":"s7:undefined-symbol","description":"d","reasoning":"r"}]}"#;
+        assert!(parse_stage7_concerns_strict(missing).is_err());
+        assert!(parse_stage7_concerns_strict(unknown).is_err());
+    }
+
+    #[test]
+    fn stage7_linkage_category_requires_proof_independent_of_type_label() {
+        let raw = r#"{"concerns":[{"category":"configuration-linkage","type":"s7:declaration","description":"d","reasoning":"r"}]}"#;
+        assert!(parse_stage7_concerns_strict(raw).is_err());
+        assert!(output_requires_tool_verification(
+            ToolVerification::Stage7Linkage,
+            raw
+        ));
+    }
+
+    #[test]
+    fn stage7_hardware_category_accepts_no_proof_and_does_not_require_linkage_tool() {
+        let raw = r#"{"concerns":[{"category":"hardware-architecture","type":"s7:dma-ordering","description":"d","reasoning":"r"}]}"#;
+        assert!(parse_stage7_concerns_strict(raw).is_ok());
+        assert!(!output_requires_tool_verification(
+            ToolVerification::Stage7Linkage,
+            raw
+        ));
+    }
+
+    #[test]
+    fn stage7_hardware_category_rejects_linkage_proof() {
+        let raw = r#"{"concerns":[{"category":"hardware-architecture","type":"s7:dma-ordering","description":"d","reasoning":"r","proof":{"failing_config":"CONFIG_FOO=n","caller_condition":"caller","provider_condition":"provider","failure":"failure"}}]}"#;
+        assert!(parse_stage7_concerns_strict(raw).is_err());
+    }
+
+    #[test]
+    fn sensitive_finding_requires_tool_verification() {
+        let raw = r#"{"commits":[{"sha":"abc","findings":[{"problem":"helper is not exported","severity":"High"}]}]}"#;
+        assert!(output_requires_tool_verification(
+            ToolVerification::SensitiveFindings,
+            raw
+        ));
+        assert!(!output_requires_tool_verification(
+            ToolVerification::SensitiveFindings,
+            r#"{"commits":[{"sha":"abc","findings":[]}]}"#
+        ));
+        assert!(finding_requires_repository_verification(&json!({
+            "problem": "helper has no caller",
+            "severity": "Medium"
+        })));
+        assert!(!finding_requires_repository_verification(&json!({
+            "problem": "double unlock on the error path",
+            "severity": "High"
+        })));
+    }
+
+    #[test]
+    fn required_tool_verification_error_survives_context() {
+        let error =
+            anyhow::Error::new(RequiredToolVerificationError).context("validation request failed");
+        assert!(is_required_tool_verification_error(&error));
+        assert!(!is_required_tool_verification_error(&anyhow!(
+            "ordinary validation failure"
+        )));
     }
 
     #[test]

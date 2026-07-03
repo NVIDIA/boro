@@ -226,12 +226,20 @@ context locally, then runs the ordered stages below.
 | 7 | Hardware & portability | Drivers/HW: DMA, IRQ, barriers, endianness |
 | 8 | Comment / code consistency | Audit comments touched by the patch against the actual code |
 | 9 | Consolidation pass | Merges concerns into findings and applies severity guidance |
-| 10 | Second-opinion check | Independent review; findings merge into the main findings |
+| 10 | Second-opinion check | Fast-style independent review; findings merge into the main findings |
 | 11 | Findings validation | Drops false positives and tightens surviving findings |
 | 12 | LKML-style report | Narrative reply text plus run-wide findings summary |
 
 `BORO_MODEL` is used for steps 0-9. `BORO_VALIDATION_MODEL` is used for
 steps 10-12 and falls back to `BORO_MODEL` when unset.
+
+The second-opinion check uses the same prompt and inputs as the single-pass
+check performed by `--fast`: the normal reviewer system prompt, the
+`fast-review.md` instructions, reference and prefetched source context,
+the subsystem guides selected by step 0, upstream-follow-up summary, commit
+message, and diff. It does not receive the main pipeline's findings. In the full
+pipeline this independent check uses `BORO_VALIDATION_MODEL`; under `--fast` it
+uses `BORO_MODEL`.
 
 `--validation-mode` changes only the post-discovery stages:
 
@@ -246,10 +254,13 @@ selects the Git repository and branch checked for follow-up fixes. It defaults t
 local path or `file://` URI to inspect a local Linux repository instead.
 `--upstream-branch` defaults to `master`.
 
-With `--fast`, the per-commit discovery pipeline is replaced by a single
-review call using `BORO_MODEL`; the second-opinion pass, global validation,
-LKML rendering, and summary reporting still use `BORO_VALIDATION_MODEL` as
-described above.
+With `--fast`, each commit gets the same independent second-opinion check as
+step 10, but using `BORO_MODEL`. That response is passed through the normal
+per-commit LKML renderer to produce the final report. The upstream follow-up
+stage runs after subsystem identification, and both stages feed the reference
+bundle. Specialist passes, validation, and the run-wide model summary are
+skipped. Combine `--fast` with `--no-tools` to disable repository tools in both
+the fast review and LKML rendering pass.
 
 ### Upstream follow-up stage (lore.kernel.org + upstream branch)
 
@@ -319,9 +330,10 @@ Skipped on `--fast` (single-pass collapse).
 
 ### Extra options
 
-The option `--fast` collapses the pipeline into a single findings-focused call
-per commit and it can be used as a shortcut to get a really quick and cheap
-review.
+The option `--fast` identifies the subsystem, runs the upstream follow-up stage,
+performs the independent second-opinion check in one `BORO_MODEL` step per
+commit, then runs the normal LKML report pass over that result. It skips
+specialists, validation, and the run-wide summary.
 
 The option `--validation-mode` selects whether (and how) the global
 findings-validation stage runs:

@@ -103,10 +103,18 @@ pub fn print_report_human(out: &Value) {
     print_stats_block(out, &commits);
     print_quick_summary_block(out);
     let mode = out.get("validation_mode").and_then(|v| v.as_str());
+    let fast = !commits.is_empty()
+        && commits
+            .iter()
+            .all(|commit| commit.get("fast").and_then(Value::as_bool) == Some(true));
     // Both filter and findings modes populate `validated_findings[]`; the
     // Findings section prefers those over raw findings for both.
     let use_validated = matches!(mode, Some("findings") | Some("filter"));
-    print_findings_block(&commits, use_validated);
+    // Fast output is already the final prose. Its intentionally empty structured
+    // findings array must not produce a misleading "no findings" section above it.
+    if !fast {
+        print_findings_block(&commits, use_validated);
+    }
 
     // Findings mode skips the per-commit LKML pass entirely; the JSON
     // viewer renders validated_findings inline. Every other mode (off /

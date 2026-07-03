@@ -12,7 +12,7 @@
 //! `RIGHT` (using the new file's line number) and once under `LEFT` (using the old
 //! file's line number), matching the viewer's anchoring semantics.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Side {
@@ -32,6 +32,7 @@ impl Side {
 #[derive(Debug, Default, Clone)]
 pub struct DiffIndex {
     keys: HashSet<(String, u64, Side)>,
+    text: HashMap<(String, u64, Side), String>,
 }
 
 impl DiffIndex {
@@ -91,22 +92,19 @@ impl DiffIndex {
             let first = line.chars().next();
             match first {
                 Some('+') => {
-                    idx.keys
-                        .insert((path_str.to_string(), new_line, Side::Right));
+                    idx.insert(path_str, new_line, Side::Right, &line[1..]);
                     new_line += 1;
                 }
                 Some('-') => {
-                    idx.keys
-                        .insert((path_str.to_string(), old_line, Side::Left));
+                    idx.insert(path_str, old_line, Side::Left, &line[1..]);
                     old_line += 1;
                 }
                 Some(' ') | None => {
                     // Context (a leading space) or a bare empty line, which `git diff` emits for
                     // an entirely blank context line. Index under both sides.
-                    idx.keys
-                        .insert((path_str.to_string(), new_line, Side::Right));
-                    idx.keys
-                        .insert((path_str.to_string(), old_line, Side::Left));
+                    let text = line.strip_prefix(' ').unwrap_or(line);
+                    idx.insert(path_str, new_line, Side::Right, text);
+                    idx.insert(path_str, old_line, Side::Left, text);
                     old_line += 1;
                     new_line += 1;
                 }
@@ -125,6 +123,38 @@ impl DiffIndex {
     pub fn contains(&self, file: &str, line: u64, side: Side) -> bool {
         self.keys.contains(&(file.to_string(), line, side))
     }
+
+    fn insert(&mut self, file: &str, line: u64, side: Side, text: &str) {
+        let key = (file.to_string(), line, side);
+        self.keys.insert(key.clone());
+        self.text.insert(key, text.to_string());
+    }
+
+    /// True when at least one named identifier occurs in the anchored range. This catches
+    /// locations that are syntactically valid hunk coordinates but point at unrelated code.
+    pub fn range_contains_identifier(
+        &self,
+        file: &str,
+        start: u64,
+        end: u64,
+        side: Side,
+        identifiers: &[String],
+    ) -> bool {
+        (start..=end).any(|line| {
+            self.text
+                .get(&(file.to_string(), line, side))
+                .is_some_and(|text| identifiers.iter().any(|id| contains_c_identifier(text, id)))
+        })
+    }
+}
+
+fn contains_c_identifier(text: &str, ident: &str) -> bool {
+    text.match_indices(ident).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + ident.len()..].chars().next();
+        before.is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+            && after.is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+    })
 }
 
 /// Parse a unified-diff hunk header tail after `@@ `: `-OLD[,OCNT] +NEW[,NCNT] @@ context`.
@@ -303,5 +333,24 @@ diff --git a/foo.c b/foo.c
         assert_eq!(Side::from_str("RIGHT"), Side::Right);
         assert_eq!(Side::from_str(""), Side::Right);
         assert_eq!(Side::from_str("weird"), Side::Right);
+    }
+
+    #[test]
+    fn semantic_range_requires_named_identifier() {
+        let idx = DiffIndex::from_unified_diff(SIMPLE_DIFF);
+        assert!(idx.range_contains_identifier(
+            "foo.c",
+            12,
+            13,
+            Side::Right,
+            &["added_two".to_string()]
+        ));
+        assert!(!idx.range_contains_identifier(
+            "foo.c",
+            10,
+            11,
+            Side::Right,
+            &["added_two".to_string()]
+        ));
     }
 }
