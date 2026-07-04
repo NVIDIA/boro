@@ -147,6 +147,9 @@ pub enum ToolVerification {
     Optional,
     Stage7Linkage,
     SensitiveFindings,
+    BaselineFalsePositiveProof,
+    Stage7LinkageAndBaselineFalsePositiveProof,
+    ValidationFindingsAndBaselineChallenges,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +252,12 @@ any repository tool. Before returning non-empty JSON, use grep_repo/read_files/r
 when relevant, inspect Kbuild/Makefile or textual .c inclusion ownership. If the claim cannot be \
 verified from tool results, return an empty concerns/findings array.";
 
+const REQUIRED_BASELINE_PROOF_TOOL_REMINDER: &str = "You proposed removing a protected fast-review \
+finding as a false positive, but you did not execute any repository tool. A baseline removal requires \
+conclusive checked-out-tree evidence, not reasoning from the diff or prompt alone. Inspect the exact \
+definitions, callers, configuration, or history needed to prove the finding impossible. If the evidence \
+does not contradict the complete finding with certainty, return an empty baseline_false_positives array.";
+
 #[derive(Debug)]
 struct RequiredToolVerificationError;
 
@@ -298,6 +307,15 @@ fn output_requires_tool_verification(policy: ToolVerification, raw: &str) -> boo
         ToolVerification::Stage7Linkage => parse_model_json_with_key(raw, "concerns"),
         ToolVerification::SensitiveFindings => parse_model_json_with_key(raw, "commits")
             .or_else(|_| parse_model_json_with_key(raw, "findings")),
+        ToolVerification::BaselineFalsePositiveProof => {
+            parse_model_json_with_key(raw, "baseline_false_positives")
+        }
+        ToolVerification::Stage7LinkageAndBaselineFalsePositiveProof => {
+            parse_model_json_with_key(raw, "concerns")
+        }
+        ToolVerification::ValidationFindingsAndBaselineChallenges => {
+            parse_model_json_with_key(raw, "commits")
+        }
         ToolVerification::Optional => return false,
     };
     let Ok(value) = parsed else {
@@ -316,7 +334,8 @@ fn output_requires_tool_verification(policy: ToolVerification, raw: &str) -> boo
                     )
                 })
             }),
-        ToolVerification::SensitiveFindings => {
+        ToolVerification::SensitiveFindings
+        | ToolVerification::ValidationFindingsAndBaselineChallenges => {
             value
                 .get("findings")
                 .and_then(Value::as_array)
@@ -330,14 +349,40 @@ fn output_requires_tool_verification(policy: ToolVerification, raw: &str) -> boo
                     .and_then(Value::as_array)
                     .is_some_and(|commits| {
                         commits.iter().any(|commit| {
-                            commit
+                            let sensitive_finding = commit
                                 .get("findings")
                                 .and_then(Value::as_array)
                                 .is_some_and(|findings| {
                                     findings
                                         .iter()
                                         .any(finding_requires_repository_verification)
-                                })
+                                });
+                            let baseline_confirmation = commit
+                                .get("confirmed_false_positives")
+                                .and_then(Value::as_array)
+                                .is_some_and(|challenges| !challenges.is_empty());
+                            sensitive_finding || baseline_confirmation
+                        })
+                    })
+        }
+        ToolVerification::BaselineFalsePositiveProof => value
+            .get("baseline_false_positives")
+            .and_then(Value::as_array)
+            .is_some_and(|proofs| !proofs.is_empty()),
+        ToolVerification::Stage7LinkageAndBaselineFalsePositiveProof => {
+            value
+                .get("baseline_false_positives")
+                .and_then(Value::as_array)
+                .is_some_and(|proofs| !proofs.is_empty())
+                || value
+                    .get("concerns")
+                    .and_then(Value::as_array)
+                    .is_some_and(|concerns| {
+                        concerns.iter().any(|concern| {
+                            matches!(
+                                stage7_concern_category(concern),
+                                Ok(Stage7ConcernCategory::ConfigurationLinkage)
+                            )
                         })
                     })
         }
@@ -2256,7 +2301,17 @@ async fn chat_completion_inner(
                     "required-tool verification: rejecting non-empty unverified output and asking the model to inspect the repository",
                 );
                 messages.push(message);
-                messages.push(json!({"role": "user", "content": REQUIRED_TOOL_REMINDER}));
+                let reminder = if matches!(
+                    cfg.verification,
+                    ToolVerification::BaselineFalsePositiveProof
+                        | ToolVerification::Stage7LinkageAndBaselineFalsePositiveProof
+                        | ToolVerification::ValidationFindingsAndBaselineChallenges
+                ) {
+                    REQUIRED_BASELINE_PROOF_TOOL_REMINDER
+                } else {
+                    REQUIRED_TOOL_REMINDER
+                };
+                messages.push(json!({"role": "user", "content": reminder}));
                 continue;
             }
         }
@@ -3228,6 +3283,14 @@ pub fn parse_validation_findings(raw: &str) -> Result<Value> {
         for f in findings.iter_mut() {
             sanitize_finding_location(f);
         }
+        if let Some(confirmed) = obj.get("confirmed_false_positives") {
+            let wrapper = json!({
+                "concerns": [],
+                "baseline_false_positives": confirmed,
+            });
+            parse_specialist_concerns_strict(&wrapper.to_string())
+                .context("invalid confirmed baseline false-positive proof")?;
+        }
     }
     Ok(v)
 }
@@ -3310,10 +3373,108 @@ pub fn parse_concerns_strict(raw: &str) -> Result<Value> {
     Ok(v)
 }
 
+/// Parse a specialist response and enforce the deliberately narrow contract for
+/// challenging a protected fast-review finding. Natural-language proof cannot
+/// be made trustworthy by a label alone, so the host requires an exact target,
+/// explicit verified facts, a contradiction, and an unqualified conclusion.
+pub fn parse_specialist_concerns_strict(raw: &str) -> Result<Value> {
+    let v = parse_concerns_strict(raw)?;
+    let Some(challenges) = v.get("baseline_false_positives") else {
+        return Ok(v);
+    };
+    let challenges = challenges
+        .as_array()
+        .context("'baseline_false_positives' must be an array")?;
+    const HEDGES: &[&str] = &[
+        "may",
+        "might",
+        "could",
+        "likely",
+        "possibly",
+        "perhaps",
+        "appears",
+        "seems",
+        "uncertain",
+        "unclear",
+    ];
+    for challenge in challenges {
+        let obj = challenge
+            .as_object()
+            .context("each baseline false-positive challenge must be an object")?;
+        if obj.len() != 3
+            || !obj.contains_key("baseline_id")
+            || !obj.contains_key("finding")
+            || !obj.contains_key("proof")
+        {
+            anyhow::bail!(
+                "baseline false-positive challenge must contain exactly baseline_id, finding, and proof"
+            );
+        }
+        obj["baseline_id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .context("baseline challenge baseline_id must be a non-empty string")?;
+        obj["finding"]
+            .as_object()
+            .context("baseline challenge finding must be the exact finding object")?;
+        let proof = obj["proof"]
+            .as_object()
+            .context("baseline challenge proof must be an object")?;
+        const PROOF_FIELDS: &[&str] = &[
+            "finding_claim",
+            "verified_facts",
+            "contradiction",
+            "conclusion",
+        ];
+        if proof.len() != PROOF_FIELDS.len()
+            || PROOF_FIELDS.iter().any(|field| !proof.contains_key(*field))
+        {
+            anyhow::bail!(
+                "baseline challenge proof must contain exactly finding_claim, verified_facts, contradiction, and conclusion"
+            );
+        }
+        if proof["conclusion"].as_str() != Some("false_positive") {
+            anyhow::bail!("baseline challenge proof conclusion must be exactly 'false_positive'");
+        }
+        let facts = proof["verified_facts"]
+            .as_array()
+            .filter(|facts| !facts.is_empty())
+            .context("baseline challenge verified_facts must be a non-empty array")?;
+        let mut proof_text = String::new();
+        for field in ["finding_claim", "contradiction"] {
+            let text = proof[field]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .with_context(|| format!("baseline challenge proof.{field} must be non-empty"))?;
+            proof_text.push(' ');
+            proof_text.push_str(text);
+        }
+        for fact in facts {
+            let text = fact
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .context("every baseline challenge verified fact must be a non-empty string")?;
+            proof_text.push(' ');
+            proof_text.push_str(text);
+        }
+        let lower = proof_text.to_ascii_lowercase();
+        if lower
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|word| HEDGES.contains(&word))
+        {
+            anyhow::bail!("baseline challenge proof contains uncertainty or hedging");
+        }
+    }
+    Ok(v)
+}
+
 /// Stage 7's structured proof is a machine contract, not merely prompt advice. Reject generic
 /// placeholders so the retry loop gets a chance to demand checked-out-tree evidence.
 pub fn parse_stage7_concerns_strict(raw: &str) -> Result<Value> {
-    let v = parse_concerns_strict(raw)?;
+    let v = parse_specialist_concerns_strict(raw)?;
     let concerns = v["concerns"].as_array().expect("validated above");
     for concern in concerns {
         match stage7_concern_category(concern)? {
@@ -3449,7 +3610,8 @@ pub fn findings_from_merged_concerns(merged: &Value) -> Value {
 /// Layout is ordered to maximize prompt-cache hits across specialist calls: common content goes
 /// at the front and per-stage variation goes at the back. The linkage stage's prefetched context
 /// is also placed before stage-specific instructions.
-pub fn specialist_stage_user_payload(
+#[allow(clippy::too_many_arguments)]
+pub fn specialist_stage_user_payload_with_baseline(
     instruction_body: &str,
     reference_addon_md: &str,
     patch_slim: &str,
@@ -3457,6 +3619,7 @@ pub fn specialist_stage_user_payload(
     stage: u8,
     prior_concerns_block: &str,
     fp_digest: &str,
+    fast_baseline_block: &str,
 ) -> String {
     let prior_section = if prior_concerns_block.is_empty() {
         String::new()
@@ -3475,6 +3638,11 @@ pub fn specialist_stage_user_payload(
     } else {
         format!("{prefetched_context_block}\n")
     };
+    let baseline_section = if fast_baseline_block.is_empty() {
+        String::new()
+    } else {
+        format!("# Protected fast-review findings (read-only)\n\n{fast_baseline_block}\n\n")
+    };
     let concern_schema = if stage == 7 {
         r#"{"category":"configuration-linkage|hardware-architecture","type":"s7:string","description":"string","reasoning":"string","location":{"file":"path/in/diff","line":N,"line_end":N,"side":"LEFT|RIGHT"}}"#
     } else {
@@ -3490,10 +3658,11 @@ pub fn specialist_stage_user_payload(
 {prefetch_section}\
 {fp_section}\
 {prior_section}\
+{baseline_section}\
 # boro specialist stage {stage}\n\n{instruction_body}\n\n\
 # Reference excerpts for this stage\n\n{reference_addon_md}\n\n\
 Return ONLY JSON (no markdown fences): \
-{{\"concerns\":[{concern_schema}]}}. \
+{{\"concerns\":[{concern_schema}],\"baseline_false_positives\":[{{\"baseline_id\":\"fast-N\",\"finding\":{{\"exact\":\"finding object copied from the protected input\"}},\"proof\":{{\"finding_claim\":\"exact problem text\",\"verified_facts\":[\"fact established with repository tools\"],\"contradiction\":\"why those facts make the complete finding impossible\",\"conclusion\":\"false_positive\"}}}}]}}. \
 Top-level key must be \"concerns\" (not \"findings\"). \
 Use a short \"type\" label prefixed with \"s{stage}:\" (e.g. \"s{stage}:uaf\"). \
 {proof_contract}\
@@ -3502,7 +3671,32 @@ Do not emit a concern merely because the old/removed code was buggy when the new
 The \"location\" field is OPTIONAL - include it only when you can anchor the concern to a specific hunk in the diff: \
 \"file\" must match the diff path exactly (post-image for RIGHT, pre-image for LEFT), \"line\" is 1-based, \"line_end\" optional for a range, \"side\" is \"RIGHT\" for added/modified lines or \"LEFT\" for removed/context lines in the old file. \
 Do NOT invent locations - omit when unsure. \
-Use an empty concerns array if nothing applies to this lens."
+The protected fast-review findings are immutable input. Never rewrite, replace, deduplicate, or return them as concerns. You may challenge one only when repository-tool evidence proves the complete finding false with no assumptions or uncertainty. A challenge must copy its baseline_id and entire finding object exactly, proof.finding_claim must equal that finding's problem text exactly, verified_facts must state the concrete facts established by repository inspection, and contradiction must demonstrate that the complete reported failure is impossible. Plausibility, missing evidence for the finding, a different interpretation, lower severity, or inability to reproduce is not proof. When any doubt remains, do not challenge it. If repository tools are unavailable, baseline_false_positives MUST be empty. \
+Use an empty concerns array if nothing applies to this lens and an empty baseline_false_positives array unless a fast finding is conclusively disproved."
+    )
+}
+
+/// Backward-compatible builder for callers that have no protected fast-review
+/// snapshot (primarily focused prompt-layout tests and non-review uses).
+#[cfg(test)]
+pub fn specialist_stage_user_payload(
+    instruction_body: &str,
+    reference_addon_md: &str,
+    patch_slim: &str,
+    prefetched_context_block: &str,
+    stage: u8,
+    prior_concerns_block: &str,
+    fp_digest: &str,
+) -> String {
+    specialist_stage_user_payload_with_baseline(
+        instruction_body,
+        reference_addon_md,
+        patch_slim,
+        prefetched_context_block,
+        stage,
+        prior_concerns_block,
+        fp_digest,
+        "",
     )
 }
 
@@ -3536,6 +3730,29 @@ pub fn format_prior_concerns_for_specialist(concerns: &Value, max_bytes: usize) 
     }
     let json_str = serde_json::to_string(&slim).unwrap_or_default();
     cap_utf8(&json_str, max_bytes)
+}
+
+/// Serialize the one-shot findings as an ID-tagged, read-only specialist input.
+/// IDs are host-generated from the immutable snapshot and are never stored on
+/// or allowed to modify the findings themselves.
+pub fn format_fast_baseline_for_specialist(findings: &Value) -> String {
+    let Some(findings) = findings.as_array() else {
+        return String::new();
+    };
+    if findings.is_empty() {
+        return String::new();
+    }
+    let tagged: Vec<Value> = findings
+        .iter()
+        .enumerate()
+        .map(|(idx, finding)| {
+            json!({
+                "baseline_id": format!("fast-{idx}"),
+                "finding": finding,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&tagged).unwrap_or_default()
 }
 
 /// Full multi-pass "broad concerns" call: subsystem reference material, explicit commit message review, diff.
@@ -3711,9 +3928,12 @@ pub struct ValidationFindingsCommit<'a> {
     pub commit_message: &'a str,
     pub reference_context: &'a str,
     pub diff: &'a str,
-    /// Immutable one-shot findings, supplied only so validation can identify
-    /// semantic duplicates among the regular candidates.
+    /// Protected one-shot findings. Validation uses these for semantic duplicate
+    /// detection and as the immutable target of specialist proof challenges.
     pub baseline_findings: &'a Value,
+    /// Specialist-proposed removals. The strong validator may confirm an entry
+    /// verbatim, but omission or any validation failure preserves the baseline.
+    pub baseline_challenges: &'a Value,
     /// Regular-stage candidate additions. Only these may appear in the output.
     pub findings: &'a Value,
 }
@@ -3760,6 +3980,7 @@ fn validation_findings_user_payload_scaled(
                 "reference_context": cap_utf8_middle_exact(c.reference_context, reference_cap),
                 "diff": cap_utf8_middle_exact(c.diff, diff_cap),
                 "baseline_findings": c.baseline_findings,
+                "baseline_false_positive_challenges": c.baseline_challenges,
                 "findings": c.findings,
             });
             let commit_message_truncated = c.commit_message.len() > commit_message_cap;
@@ -3779,8 +4000,8 @@ fn validation_findings_user_payload_scaled(
         .unwrap_or_else(|_| "{\"commits\":[]}".to_string());
     format!(
         "Per-commit findings under review (validate per the system prompt):\n\n```json\n{body}\n```\n\n\
-Return ONLY a JSON object: {{\"commits\":[{{\"sha\":\"<sha12>\",\"findings\":[...]}}]}}. \
-Treat \"baseline_findings\" as immutable comparison context. Return only surviving entries from \"findings\"; never copy baseline entries into the output. \
+Return ONLY a JSON object: {{\"commits\":[{{\"sha\":\"<sha12>\",\"findings\":[...],\"confirmed_false_positives\":[...]}}]}}. \
+Treat \"baseline_findings\" as immutable comparison context. Return only surviving entries from \"findings\"; never copy baseline entries into the output. Independently validate every entry in \"baseline_false_positive_challenges\" against the repository and return only conclusively proven entries, verbatim, under each commit's \"confirmed_false_positives\" array. An empty or omitted confirmation array preserves every baseline finding. \
 Preserve every kept finding's \"location\" object byte-for-byte from the input. \
 When \"context_status\" reports a truncated field, do not treat absence from that field as evidence; use repository tools when the claim requires the omitted context. \
 No markdown fences, no prose outside the JSON."
@@ -3790,7 +4011,7 @@ No markdown fences, no prose outside the JSON."
 /// Build the findings-validation message with valid JSON whose serialized string representation
 /// is no larger than `max_bytes`.
 /// Source fields are reduced together before serialization; SHA, subject, baseline findings,
-/// candidate findings, and the output contract are never truncated. This is intentionally separate from generic request
+/// specialist challenges, candidate findings, and the output contract are never truncated. This is intentionally separate from generic request
 /// fitting, which cannot safely cut through an embedded JSON document.
 pub fn validation_findings_user_payload_bounded(
     commits: &[ValidationFindingsCommit<'_>],
@@ -3850,6 +4071,7 @@ pub fn validation_findings_batches(
                 reference_context: commits[candidate_idx].reference_context,
                 diff: commits[candidate_idx].diff,
                 baseline_findings: commits[candidate_idx].baseline_findings,
+                baseline_challenges: commits[candidate_idx].baseline_challenges,
                 findings: commits[candidate_idx].findings,
             })
             .collect();
@@ -4773,6 +4995,7 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
 
     #[test]
     fn validation_findings_user_payload_serializes_input() {
+        let challenges = json!([]);
         let baseline = json!([{
             "problem": "existing baseline issue",
             "severity": "Low",
@@ -4791,6 +5014,7 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
             reference_context: "x.c: helper() guarantees count is positive",
             diff: "diff --git a/x.c b/x.c\n--- a/x.c\n+++ b/x.c",
             baseline_findings: &baseline,
+            baseline_challenges: &challenges,
             findings: &findings,
         }];
         let s = validation_findings_user_payload(&commits);
@@ -4807,6 +5031,7 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
 
     #[test]
     fn bounded_validation_payload_stays_valid_and_preserves_findings() {
+        let challenges = json!([]);
         let baseline = json!([{
             "problem": "baseline issue",
             "severity": "Low",
@@ -4828,6 +5053,7 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
             reference_context: &reference_context,
             diff: &diff,
             baseline_findings: &baseline,
+            baseline_challenges: &challenges,
             findings: &findings,
         }];
 
@@ -4887,6 +5113,7 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
     #[test]
     fn validation_payload_batches_oversized_commits_without_losing_order() {
         let baseline = json!([]);
+        let challenges = json!([]);
         let findings = json!([{
             "problem": "problem",
             "severity": "Low",
@@ -4901,6 +5128,7 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
                 reference_context: &context,
                 diff: "diff one",
                 baseline_findings: &baseline,
+                baseline_challenges: &challenges,
                 findings: &findings,
             },
             ValidationFindingsCommit {
@@ -4910,6 +5138,7 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
                 reference_context: &context,
                 diff: "diff two",
                 baseline_findings: &baseline,
+                baseline_challenges: &challenges,
                 findings: &findings,
             },
             ValidationFindingsCommit {
@@ -4919,6 +5148,7 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
                 reference_context: &context,
                 diff: "diff three",
                 baseline_findings: &baseline,
+                baseline_challenges: &challenges,
                 findings: &findings,
             },
         ];
@@ -4935,6 +5165,7 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
                     reference_context: commits[idx].reference_context,
                     diff: commits[idx].diff,
                     baseline_findings: commits[idx].baseline_findings,
+                    baseline_challenges: commits[idx].baseline_challenges,
                     findings: commits[idx].findings,
                 })
                 .collect();
@@ -6188,5 +6419,105 @@ index 111..222 100644
         assert_eq!(arr[0]["location"]["line"], 12);
         assert_eq!(arr[0]["location"]["side"], "RIGHT");
         assert!(arr[1].get("location").is_none());
+    }
+
+    #[test]
+    fn specialist_baseline_challenge_requires_complete_unhedged_proof() {
+        let raw = r#"{
+            "concerns": [],
+            "baseline_false_positives": [{
+                "baseline_id": "fast-0",
+                "finding": {"problem": "foo dereferences NULL", "severity": "High"},
+                "proof": {
+                    "finding_claim": "foo dereferences NULL",
+                    "verified_facts": ["read_symbol shows every caller passes &static_foo"],
+                    "contradiction": "&static_foo is non-NULL on every reachable call",
+                    "conclusion": "false_positive"
+                }
+            }]
+        }"#;
+        let parsed = parse_specialist_concerns_strict(raw).unwrap();
+        assert_eq!(
+            parsed["baseline_false_positives"][0]["baseline_id"],
+            "fast-0"
+        );
+
+        let hedged = raw.replace(
+            "&static_foo is non-NULL on every reachable call",
+            "&static_foo might be non-NULL on every reachable call",
+        );
+        assert!(parse_specialist_concerns_strict(&hedged).is_err());
+    }
+
+    #[test]
+    fn baseline_challenge_output_requires_a_repository_tool() {
+        let raw = r#"{
+            "concerns": [],
+            "baseline_false_positives": [{"baseline_id":"fast-0"}]
+        }"#;
+        assert!(output_requires_tool_verification(
+            ToolVerification::BaselineFalsePositiveProof,
+            raw
+        ));
+        assert!(!output_requires_tool_verification(
+            ToolVerification::BaselineFalsePositiveProof,
+            r#"{"concerns":[],"baseline_false_positives":[]}"#
+        ));
+    }
+
+    #[test]
+    fn strong_validation_confirmation_requires_its_own_repository_tool() {
+        let raw = r#"{
+            "commits": [{
+                "sha": "abc",
+                "findings": [],
+                "confirmed_false_positives": [{"baseline_id":"fast-0"}]
+            }]
+        }"#;
+        assert!(output_requires_tool_verification(
+            ToolVerification::SensitiveFindings,
+            raw
+        ));
+    }
+
+    #[test]
+    fn validation_parser_accepts_only_structured_baseline_confirmations() {
+        let challenge = json!({
+            "baseline_id": "fast-0",
+            "finding": {"problem": "foo dereferences NULL", "severity": "High"},
+            "proof": {
+                "finding_claim": "foo dereferences NULL",
+                "verified_facts": ["every reachable caller passes a static object"],
+                "contradiction": "the argument is non-NULL on every reachable call",
+                "conclusion": "false_positive"
+            }
+        });
+        let valid = json!({
+            "commits": [{
+                "sha": "abc",
+                "findings": [],
+                "confirmed_false_positives": [challenge]
+            }]
+        });
+        assert!(parse_validation_findings(&valid.to_string()).is_ok());
+
+        let malformed = json!({
+            "commits": [{
+                "sha": "abc",
+                "findings": [],
+                "confirmed_false_positives": [{"baseline_id": "fast-0"}]
+            }]
+        });
+        assert!(parse_validation_findings(&malformed.to_string()).is_err());
+    }
+
+    #[test]
+    fn fast_baseline_formatter_adds_ids_without_mutating_findings() {
+        let findings = json!([{"problem":"first"}, {"problem":"second"}]);
+        let before = findings.clone();
+        let block = format_fast_baseline_for_specialist(&findings);
+        assert!(block.contains("\"baseline_id\": \"fast-0\""));
+        assert!(block.contains("\"baseline_id\": \"fast-1\""));
+        assert_eq!(findings, before);
     }
 }

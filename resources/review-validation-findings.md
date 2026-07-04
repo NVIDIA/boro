@@ -23,6 +23,18 @@ The user message gives you a JSON object of this exact shape:
           "severity_explanation": "<proof>"
         }
       ],
+      "baseline_false_positive_challenges": [
+        {
+          "baseline_id": "fast-N",
+          "finding": { "problem": "<exact baseline finding>", "severity": "..." },
+          "proof": {
+            "finding_claim": "<exact problem text>",
+            "verified_facts": ["<specialist-verified fact>"],
+            "contradiction": "<why the complete finding is impossible>",
+            "conclusion": "false_positive"
+          }
+        }
+      ],
       "findings": [
         {
           "problem": "<short statement of the issue>",
@@ -77,12 +89,25 @@ For each finding, decide one of:
   is genuinely wrong, KEEP it - filtering is for clear false positives,
   not for taste.
 
-`baseline_findings` contains the immutable one-shot review. It is context
-for semantic duplicate detection only: never copy, rewrite, or return a
-baseline finding. DROP a regular candidate when it reports the same underlying
-problem as a baseline finding, even if the wording differs. Do not drop a
-candidate merely because it shares a location, function name, or terminology
-with the baseline; distinct failure modes at the same line are novel findings.
+`baseline_findings` contains the protected one-shot review. It is read-only:
+never rewrite or replace a baseline finding. DROP a regular candidate when it
+reports the same underlying problem as a baseline finding, even if the wording
+differs. Do not drop a candidate merely because it shares a location, function
+name, or terminology with the baseline; distinct failure modes at the same line
+are novel findings.
+
+`baseline_false_positive_challenges` contains specialist proposals, not
+trusted conclusions. Independently inspect the reviewed commit with repository
+tools and decide whether each proof establishes with certainty that the
+complete copied baseline finding is false. Confirm a challenge only when all
+of its verified facts are independently established and the contradiction
+makes the reported failure impossible. Missing evidence, lower severity,
+plausibility, inability to reproduce, or an alternative interpretation is not
+enough. If any assumption, ambiguity, or uncertainty remains, do not confirm
+it. Return confirmed challenges verbatim under `confirmed_false_positives`;
+never construct, rewrite, or strengthen a challenge. An empty array preserves
+the baseline. You MUST execute repository tools before returning any confirmed
+challenge; if tools are unavailable, confirm none.
 
 Repository-verifiable absence/linkage claims are not matters of taste. Before
 KEEP or TIGHTEN of a claim that a declaration, definition, export, stub,
@@ -102,8 +127,10 @@ Hard rules:
 - Do NOT introduce new findings. Every finding you emit must
   correspond to one in the input (by `location` and substance).
 - Emit only surviving entries from `findings`. Never emit entries from
-  `baseline_findings`; the caller unions the result with the immutable
-  baseline after validation.
+  `baseline_findings`; the caller unions the result with the protected
+  baseline after applying only your confirmed challenges.
+- Emit only verbatim entries from `baseline_false_positive_challenges` under
+  `confirmed_false_positives`. Omission is rejection and preserves the finding.
 - A finding must describe a problem that remains in or is introduced by
   the reviewed commit. Do NOT keep a finding merely because the parent
   version was wrong; the final report is a review of the patch, not a
@@ -145,6 +172,18 @@ Output shape (strict):
           "location": { "file": "...", "line": N, "side": "LEFT|RIGHT" }
         }
         // ... or [] if all findings for this commit are false positives
+      ],
+      "confirmed_false_positives": [
+        {
+          "baseline_id": "fast-N",
+          "finding": { "problem": "..." },
+          "proof": {
+            "finding_claim": "...",
+            "verified_facts": ["..."],
+            "contradiction": "...",
+            "conclusion": "false_positive"
+          }
+        }
       ]
     }
     // ... one entry per commit in the input, in order
@@ -153,6 +192,6 @@ Output shape (strict):
 ```
 
 No prose outside the JSON. No markdown fences. Top-level key MUST be
-`commits`. Each commit entry MUST carry `sha` and `findings` exactly
-as named. If you receive zero commits with findings (the input had
-none to validate), return `{"commits": []}`.
+`commits`. Each commit entry MUST carry `sha`, `findings`, and
+`confirmed_false_positives` exactly as named. If you receive zero commits with
+findings or challenges, return `{"commits": []}`.

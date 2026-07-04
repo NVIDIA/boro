@@ -61,7 +61,7 @@ review, validates only new regular-stage candidates, and renders the report.
 With `--fast`, the fast review instead uses `BORO_MODEL`.
 
 The intended workflow is to keep the broad and specialist passes cheap while
-using a stronger model for the immutable baseline, validation, and reporting.
+using a stronger model for the protected baseline, validation, and reporting.
 
 For example, run a local model on the broad and specialist stages and point the
 validation stages at a stronger remote model. Token usage is broken out per
@@ -220,7 +220,7 @@ context locally, then runs the ordered stages below.
 | ---: | --- | --- |
 | 0 | Identify kernel subsystem | Select subsystem guide prompts for the shared reference bundle |
 | 1 | Upstream follow-up | Query lore.kernel.org and summarize relevant follow-ups |
-| 2 | Fast complete-context review | Establish the immutable baseline findings |
+| 2 | Fast complete-context review | Establish the protected, read-only baseline findings |
 | 3 | Broad concerns | Independent regular pass over reference context + patch |
 | 4 | Execution flow verification | Control flow, logic, errors, branches, macros, linker/LTO risks |
 | 5 | Resource management | Lifetimes, leaks, UAF, refcounts, teardown vs. async handoffs |
@@ -229,7 +229,7 @@ context locally, then runs the ordered stages below.
 | 8 | Hardware & portability | Drivers/HW: DMA, IRQ, barriers, endianness |
 | 9 | Comment / code consistency | Audit comments touched by the patch against the actual code |
 | 10 | Consolidation pass | Turns regular concerns into candidate additions |
-| 11 | Addition validation | Drops false-positive additions; never changes the fast baseline |
+| 11 | Strong adjudication and addition validation | Independently confirms specialist challenges and filters regular additions |
 | 12 | Additive merge and LKML report | Union survivors into the baseline and render the report |
 
 `BORO_MODEL` is used for regular discovery and consolidation. In normal
@@ -242,18 +242,26 @@ the normal reviewer system prompt, the
 the subsystem guides selected by step 0, upstream-follow-up summary, commit
 message, and diff. In a normal review it uses `BORO_VALIDATION_MODEL`;
 under `--fast` it uses `BORO_MODEL`. Regular discovery is independent
-and can only contribute novel findings; it cannot replace or remove baseline
-findings or their lore provenance. Validation receives the baseline as
-read-only comparison context and drops only regular candidates that clearly
-report the same underlying problem. Local merging removes exact identities
-only, so distinct findings at the same location are retained.
+and can only contribute novel findings; it cannot rewrite or replace baseline
+findings or their lore provenance. A specialist may separately challenge a
+fast finding, but this is only a proposal. The baseline stays read-only while
+all specialists run. The strong validation model then independently inspects
+the repository and may confirm a proposal only by returning its complete,
+exact-target, unhedged proof verbatim. The host applies only those confirmations;
+validation failure, ambiguity, missing tool inspection, malformed output, or
+`--validation-mode=off` preserves the baseline. Deterministic upstream-fix
+findings are not challengeable. The validator also drops regular candidates
+that clearly report the same underlying problem. Local merging removes exact
+identities only, so distinct findings at the same location are retained.
 
 `--validation-mode` changes only the post-discovery stages:
 
-- `filter` (default): validate regular additions, union survivors into the
-  fast baseline, then render LKML prose.
-- `findings`: perform the same additive merge and skip LKML rendering.
-- `off`: add raw regular candidates to the baseline without validation.
+- `filter` (default): adjudicate specialist challenges, validate regular
+  additions, union survivors into the fast baseline, then render LKML prose.
+- `findings`: perform the same adjudication and additive merge while skipping
+  LKML rendering.
+- `off`: preserve every fast finding and add raw regular candidates without
+  validation.
 
 `boro review --upstream-repo URI --upstream-branch BRANCH COMMIT_RANGE`
 selects the Git repository and branch checked for follow-up fixes. It defaults to
@@ -345,11 +353,13 @@ specialists, validation, and the run-wide summary.
 The option `--validation-mode` selects whether (and how) regular-stage
 candidate additions are validated:
 
-- `filter` (default): validates regular additions, unions survivors with
-  the immutable fast baseline, then renders per-commit LKML prose. The viewer / human
+- `filter` (default): validates regular additions, independently adjudicates
+  specialist baseline challenges, unions survivors with the protected fast
+  baseline, then renders per-commit LKML prose. The viewer / human
   report's Findings section shows `validated_findings`; the LKML section
   shows prose built from those survivors.
-- `findings`: performs the same additive validation and merge, **skips** the per-commit LKML
+- `findings`: performs the same challenge adjudication, additive validation,
+  and merge, **skips** the per-commit LKML
   pass entirely (saves one LLM call per commit; the human report's LKML
   section is empty in this mode). `scripts/boro-json-view` auto-detects
   this mode (and `filter`) and anchors `validated_findings` inline
@@ -363,7 +373,8 @@ stdout instead of the human report - the same shape consumed internally,
 with per-commit `findings[]`, `lkml_report` (filter/off modes only),
 `validated_findings[]` (filter/findings modes when validation
 succeeded), and a `usage_summary`. In filter/findings modes,
-`findings[]` is the immutable fast baseline and
+`findings[]` is the protected fast baseline after any specialist challenges
+independently confirmed by the strong validator, and
 `validated_findings[]` is the baseline plus accepted regular additions.
 Each finding may carry optional `location` and `references` fields:
 
