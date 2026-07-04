@@ -105,9 +105,13 @@ cleanly, automatically attempting to resolve conflicts.
 
 Subcommands:
 
-- `boro apply COMMIT_ID` - runs `git cherry-pick -x -s COMMIT_ID`. If Git
-  reports a failed or empty cherry-pick, boro first checks whether the commit
-  subject is already present in path-limited history and skips it when found.
+- `boro apply COMMIT_RANGE` - applies a single commit or each commit in a range
+  such as `BASE..TIP`, oldest first. Boro stops at the first failure and leaves
+  earlier commits applied. Each commit runs through the existing
+  `git cherry-pick -x -s` workflow below; `--dry-run` only lists the series.
+  If Git reports a failed or empty cherry-pick, boro first checks whether the
+  commit subject is already present in path-limited history and skips it when
+  found.
   Otherwise, boro looks for explicit commit references in the target commit
   message; any referenced commits that are not already in `HEAD` are tried
   first with `git cherry-pick -x -s`, then the target commit is retried.

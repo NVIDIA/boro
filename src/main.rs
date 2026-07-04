@@ -178,7 +178,7 @@ struct GlobalOpts {
 enum Command {
     /// LLM code review of each commit in COMMIT_RANGE (multi-stage agentic pipeline).
     Review(ReviewArgs),
-    /// Apply COMMIT_ID with git cherry-pick -x -s; on conflicts, auto-resolve validated hunks.
+    /// Apply each commit in COMMIT_RANGE; on conflicts, auto-resolve validated hunks.
     Apply(ApplyArgs),
     /// Build each commit with `vng -b`; the model reviews the build log.
     #[command(name = "build")]
@@ -233,9 +233,9 @@ struct ReviewArgs {
 
 #[derive(Args, Debug, Clone)]
 struct ApplyArgs {
-    /// Commit to apply with git cherry-pick -x -s
-    #[arg(value_name = "COMMIT_ID")]
-    commit_id: String,
+    /// Git revision range, e.g. HEAD~4..HEAD. A single commit is also accepted.
+    #[arg(value_name = "COMMIT_RANGE")]
+    range: String,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1998,34 +1998,17 @@ async fn run_quick_summary(
     });
 }
 
-async fn run_apply_command(
+async fn run_apply_commit(
     global: &GlobalOpts,
-    args: &ApplyArgs,
+    repo: &Path,
+    commit_id: &str,
+    series_commits: &[String],
     run_start: Instant,
-) -> Result<()> {
+) -> Result<(Value, i32)> {
     let vdest = VerboseDest::new(global.verbose);
     v(
         &vdest,
-        format!("starting (subcommand=apply, commit={:?})", args.commit_id),
-    );
-
-    let repo = match global.source.clone() {
-        Some(p) => p,
-        None => std::env::current_dir().context("default source: current working directory")?,
-    };
-    v(
-        &vdest,
-        format!("working directory / source hint: {}", repo.display()),
-    );
-
-    let repo = git::repo_root(&repo).context("resolve git root")?;
-    v(&vdest, format!("git repository root: {}", repo.display()));
-
-    std::env::set_current_dir(&repo)
-        .with_context(|| format!("set cwd to repository root {}", repo.display()))?;
-    v(
-        &vdest,
-        format!("process working directory: {}", repo.display()),
+        format!("starting (subcommand=apply, commit={commit_id:?})"),
     );
 
     let backend = global.backend.to_config();
@@ -2075,7 +2058,7 @@ async fn run_apply_command(
         );
     }
 
-    let apply_subject = git::commit_subject(&repo, &args.commit_id)
+    let apply_subject = git::commit_subject(repo, commit_id)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -2090,12 +2073,13 @@ async fn run_apply_command(
     let apply_worker = apply_ui.as_ref().map(|ui| ui.worker_ctx(0));
 
     let outcome_result = if global.dry_run {
-        Ok(apply::dry_run(&args.commit_id))
+        Ok(apply::dry_run(commit_id))
     } else {
         let client = http::build_http_client().context("HTTP client")?;
         apply::run(apply::ApplyRequest {
-            repo: repo.as_path(),
-            commit_id: &args.commit_id,
+            repo,
+            commit_id,
+            series_commits,
             client: &client,
             model: &model,
             validation_model: &validation,
@@ -2121,9 +2105,7 @@ async fn run_apply_command(
     }
 
     let outcome_json = outcome.json(&model, &validation);
-    if global.json {
-        output::print_report_json(&outcome_json);
-    } else {
+    if !global.json {
         output::eprint_apply_stats(&outcome_json);
         outcome.print_human();
     }
@@ -2141,9 +2123,76 @@ async fn run_apply_command(
         )
     );
 
-    let code = outcome.exit_code();
-    if code != 0 {
-        std::process::exit(code);
+    Ok((outcome_json, outcome.exit_code()))
+}
+
+async fn run_apply_command(
+    global: &GlobalOpts,
+    args: &ApplyArgs,
+    run_start: Instant,
+) -> Result<()> {
+    let source = global
+        .source
+        .clone()
+        .unwrap_or(std::env::current_dir().context("default source: current directory")?);
+    let repo = git::repo_root(&source).context("resolve git root")?;
+    std::env::set_current_dir(&repo)
+        .with_context(|| format!("set cwd to repository root {}", repo.display()))?;
+    let is_range = args.range.contains("..");
+    let commits = if is_range {
+        let (base, tip) = args
+            .range
+            .split_once("..")
+            .context("apply range must be BASE..TIP")?;
+        if base.is_empty() || tip.is_empty() || tip.contains("..") {
+            anyhow::bail!("apply range must be BASE..TIP: {:?}", args.range);
+        }
+        let base = git::rev_parse_commit(&repo, base).context("resolve apply range base")?;
+        let tip = git::rev_parse_commit(&repo, tip).context("resolve apply range tip")?;
+        if !base.chars().all(|c| c.is_ascii_hexdigit())
+            || !tip.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            anyhow::bail!("apply range endpoints must resolve to commits");
+        }
+        let commits = git::rev_list(&repo, &format!("{base}..{tip}"))
+            .context("resolve apply commit range")?;
+        if commits.is_empty() {
+            anyhow::bail!("commit range {:?} selects no commits", args.range);
+        }
+        commits
+    } else {
+        vec![args.range.clone()]
+    };
+
+    let mut reports = Vec::with_capacity(commits.len());
+    let mut exit_code = 0;
+    for (index, commit) in commits.iter().enumerate() {
+        if commits.len() > 1 && !global.json {
+            println!("\n[PATCH {}/{}] {commit}", index + 1, commits.len());
+        }
+        let (report, code) = run_apply_commit(global, &repo, commit, &commits, run_start).await?;
+        reports.push(report);
+        if code != 0 {
+            exit_code = code;
+            break;
+        }
+    }
+
+    if global.json {
+        if !is_range {
+            output::print_report_json(&reports[0]);
+        } else {
+            output::print_report_json(&json!({
+                "schema_version": 2,
+                "subcommand": "apply",
+                "range": args.range,
+                "commits": reports,
+            }));
+        }
+    }
+    let _ = std::io::stdout().flush();
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
     Ok(())
 }
