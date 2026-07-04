@@ -598,8 +598,9 @@ pub fn render_followup_summary(v: &Value, inbox_url: &str) -> String {
 
     out.push_str(
         "\nCitation rule: when you echo any of the maintainer concerns or follow-up entries above in your \
-findings, include the parenthesised lore URL verbatim so the review report links back to the \
-source thread (e.g. \"The upstream discussion (<url>) noted ...\").\n",
+findings, include the parenthesised lore URL verbatim in the finding's structured `references` \
+array (kind `lore`) so the review report links back to the source thread. Also mention the URL \
+in prose when useful; never invent or rewrite it.\n",
     );
     out
 }
