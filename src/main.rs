@@ -2359,6 +2359,21 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
         .map(|r| r.model_id.as_str());
     output::eprint_run_header(&range, &model.model_id, validation_header_model);
 
+    if action.is_review()
+        && matches!(
+            backend,
+            config::Backend::Claude | config::Backend::Opencode | config::Backend::Codex
+        )
+    {
+        eprintln!(
+            "  Subprocess backend warning: the selected backend runs its own agent loop and Boro's\n  internal repo-tool sandbox is bypassed."
+        );
+        eprintln!(
+            "  In this mode, file and tool access are controlled by the external CLI; use only in\n  environments you trust for file-edit/write-capable review runs."
+        );
+        eprintln!();
+    }
+
     v(
         &vdest,
         format!(

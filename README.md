@@ -186,10 +186,19 @@ same endpoint.
 As an alternative to an API key, you can use the Claude, OpenCode, or Codex
 backends via `--backend claude|opencode|codex`.
 
-In this mode, boro relies on the agent CLI for credentials, tooling, and
-permissions.
-The Codex backend uses `codex exec --json` with approval prompts disabled
-(`--ask-for-approval never` and `--dangerously-bypass-approvals-and-sandbox`).
+In this mode, boro relies on the selected agent CLI for credentials, tooling,
+and permissions. Boro's built-in repo-tool sandbox (`tools.rs`) is not used for
+subprocess backends; the external CLI controls access and tool execution.
+
+This is a compatibility mode with broader permissions than OpenAI-only runs:
+
+- The Claude backend uses `claude --print ... --verbose --dangerously-skip-permissions`.
+- The Codex backend uses `codex exec --json` with approval prompts disabled
+  (`--ask-for-approval never` and `--dangerously-bypass-approvals-and-sandbox`).
+- OpenCode runs through its own tool loop and does not use Boro's repo-tool
+  sandbox controls.
+
+Use these backends only in trusted environments.
 
 ## Use with local Ollama
 
