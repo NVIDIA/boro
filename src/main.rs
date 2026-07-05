@@ -3373,7 +3373,7 @@ fn merge_novel_findings(base: &[Value], additions: &[Value]) -> Vec<Value> {
 }
 
 fn apply_confirmed_fast_false_positives(
-    baseline: &mut Value,
+    baseline_findings: &mut Value,
     proposed: &[Value],
     confirmed: &[Value],
     vd: &VerboseDest,
@@ -3400,9 +3400,8 @@ fn apply_confirmed_fast_false_positives(
         if id != format!("fast-{index}") {
             continue;
         }
-        let Some(original) = baseline
-            .get("findings")
-            .and_then(Value::as_array)
+        let Some(original) = baseline_findings
+            .as_array()
             .and_then(|findings| findings.get(index))
         else {
             continue;
@@ -3435,7 +3434,7 @@ fn apply_confirmed_fast_false_positives(
     if disproved.is_empty() {
         return 0;
     }
-    let Some(findings) = baseline.get_mut("findings").and_then(Value::as_array_mut) else {
+    let Some(findings) = baseline_findings.as_array_mut() else {
         return 0;
     };
     let before = findings.len();
@@ -4665,8 +4664,7 @@ mod fast_cli_tests {
             "problem": "upstream fixed a third issue",
             "source": "upstream-fixes"
         });
-        let mut baseline =
-            json!({"findings": [fast[0].clone(), fast[1].clone(), upstream.clone()]});
+        let mut baseline = json!([fast[0].clone(), fast[1].clone(), upstream.clone()]);
         let challenge = json!({
             "baseline_id": "fast-0",
             "finding": fast[0].clone(),
@@ -4686,13 +4684,13 @@ mod fast_cli_tests {
         );
 
         assert_eq!(removed, 1);
-        assert_eq!(baseline["findings"], json!([fast[1].clone(), upstream]));
+        assert_eq!(baseline, json!([fast[1].clone(), upstream]));
     }
 
     #[test]
     fn baseline_challenge_cannot_remove_a_finding_without_exact_text_match() {
         let fast = vec![json!({"problem": "foo dereferences NULL", "severity": "High"})];
-        let mut baseline = json!({"findings": fast.clone()});
+        let mut baseline = Value::Array(fast.clone());
         let challenge = json!({
             "baseline_id": "fast-0",
             "finding": {"problem": "foo is probably safe", "severity": "High"},
@@ -4713,13 +4711,13 @@ mod fast_cli_tests {
             ),
             0
         );
-        assert_eq!(baseline["findings"], Value::Array(fast));
+        assert_eq!(baseline, Value::Array(fast));
     }
 
     #[test]
     fn strong_validator_cannot_invent_an_unproposed_baseline_removal() {
         let fast = vec![json!({"problem": "foo dereferences NULL", "severity": "High"})];
-        let mut baseline = json!({"findings": fast.clone()});
+        let mut baseline = Value::Array(fast.clone());
         let invented = json!({
             "baseline_id": "fast-0",
             "finding": fast[0].clone(),
@@ -4740,7 +4738,7 @@ mod fast_cli_tests {
             ),
             0
         );
-        assert_eq!(baseline["findings"], Value::Array(fast));
+        assert_eq!(baseline, Value::Array(fast));
     }
 
     #[test]
