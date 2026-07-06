@@ -45,6 +45,12 @@ jobs:
           fi
           exit "$missing"
 
+      - name: Check commit messages
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: .github/scripts/check-commit-messages.sh "$BASE_SHA" "$HEAD_SHA"
+
   test:
     name: Format and test
     runs-on: ubuntu-latest
@@ -59,6 +65,9 @@ jobs:
 
       - name: Check formatting
         run: cargo +stable fmt --all -- --check
+
+      - name: Test commit-message checker
+        run: .github/scripts/test-check-commit-messages.sh
 
       - name: Run tests
         run: cargo +stable test --all-targets --locked
