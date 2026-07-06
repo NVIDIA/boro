@@ -460,6 +460,22 @@ pub fn no_activity_json() -> Value {
     })
 }
 
+fn is_unreserved_path_byte(b: u8) -> bool {
+    matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'@')
+}
+
+fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for &b in value.as_bytes() {
+        if is_unreserved_path_byte(b) {
+            encoded.push(b as char);
+        } else {
+            encoded.push_str(&format!("%{b:02X}"));
+        }
+    }
+    encoded
+}
+
 /// Build the public-inbox URL for a message-id. `mid` may include angle brackets; the URL form
 /// drops them. `inbox_url` is the configured base (e.g. `https://lore.kernel.org/all/`); a
 /// trailing slash is tolerated either way. Returns an empty string when the message-id is empty
@@ -474,7 +490,8 @@ pub fn lore_url(mid: &str, inbox_url: &str) -> String {
         return String::new();
     }
     let base = inbox_url.trim_end_matches('/');
-    format!("{base}/{cleaned}/")
+    let encoded = encode_path_segment(cleaned);
+    format!("{base}/{encoded}/")
 }
 
 /// Render the follow-up JSON (either model-emitted or the short-circuit literal) into the
@@ -898,6 +915,30 @@ body\n";
         assert!(lore_url("", "https://lore.kernel.org/all/").is_empty());
         assert!(lore_url("  ", "https://lore.kernel.org/all/").is_empty());
         assert!(lore_url("<>", "https://lore.kernel.org/all/").is_empty());
+    }
+
+    #[test]
+    fn lore_url_encodes_reserved_path_chars() {
+        assert_eq!(
+            lore_url("a+bc@example.com", "https://lore.kernel.org/all/"),
+            "https://lore.kernel.org/all/a%2Bbc@example.com/"
+        );
+    }
+
+    #[test]
+    fn lore_url_encodes_percent_sign_and_spaces() {
+        assert_eq!(
+            lore_url("<a%b c@example.com>", "https://lore.kernel.org/all/"),
+            "https://lore.kernel.org/all/a%25b%20c@example.com/"
+        );
+    }
+
+    #[test]
+    fn lore_url_encodes_slash() {
+        assert_eq!(
+            lore_url("<a/b@example.com>", "https://lore.kernel.org/all/"),
+            "https://lore.kernel.org/all/a%2Fb@example.com/"
+        );
     }
 
     #[test]
