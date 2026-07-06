@@ -107,6 +107,16 @@ files are textually included by an aggregator source file, in which case they
 are one translation unit. Verify the declaration, actual caller, provider,
 Kbuild ownership, and module boundary with repository tools before reporting.
 
+### 15. Function-like macro expansion
+Do NOT reason from the unexpanded spelling of a function-like macro body. For
+any concern that depends on macro semantics, expand the complete invocation
+chain token by token: bind formal parameters to actual arguments, substitute
+every matching preprocessing token, and rescan for nested expansions.
+Punctuation or member-access operators do not make a matching parameter token
+literal. Account for stringification, token pasting, and variadic arguments
+when present. Keep the concern only if it remains true in the final expanded
+token stream.
+
 ## How to write a concern that survives consolidation
 
 - Name the function, file, and line/region from the diff.

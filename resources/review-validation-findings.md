@@ -109,6 +109,16 @@ never construct, rewrite, or strengthen a challenge. An empty array preserves
 the baseline. You MUST execute repository tools before returning any confirmed
 challenge; if tools are unavailable, confirm none.
 
+For every candidate finding or baseline challenge whose conclusion depends on
+a function-like macro, expand the complete invocation chain token by token.
+At each level, bind formal parameters to actual arguments, substitute every
+matching preprocessing token in the replacement list, and rescan for nested
+expansion. Punctuation or member-access operators do not make a matching
+parameter token literal. Account for stringification, token pasting, and
+variadic arguments when present. KEEP a candidate, or reject a baseline
+challenge, only according to the final expanded token stream rather than the
+unexpanded spelling of an intermediate macro body.
+
 Repository-verifiable absence/linkage claims are not matters of taste. Before
 KEEP or TIGHTEN of a claim that a declaration, definition, export, stub,
 symbol, or caller is missing, you MUST use repository tools to inspect the

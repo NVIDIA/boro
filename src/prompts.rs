@@ -238,6 +238,17 @@ mod tests {
     }
 
     #[test]
+    fn false_positive_digest_requires_complete_macro_expansion() {
+        let digest = load_false_positive_digest();
+        let normalized = digest.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains("complete invocation chain token by token"));
+        assert!(normalized.contains(
+            "Punctuation or member-access operators do not make a matching parameter token literal"
+        ));
+        assert!(normalized.contains("final expanded token stream"));
+    }
+
+    #[test]
     fn reference_context_checks_ubuntu_annotations_justification() {
         let context = build_reference_context(ReviewTarget::Kernel, &[], 100_000, None, None)
             .expect("build context");
