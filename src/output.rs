@@ -153,10 +153,11 @@ fn print_stats_block(out: &Value, commits: &[&Value]) {
     // Stats go to stderr — stdout is reserved for findings + LKML so the report can be piped
     // into another agent / LLM as a clean payload.
     const TO_ERR: bool = true;
-    section_title("Usage & stats", use_color(), TO_ERR);
+    let color = use_color_stderr();
+    section_title("Usage & stats", color, TO_ERR);
 
     if let Some(summary) = out.get("usage_summary") {
-        let c = use_color();
+        let c = color;
         pln!(
             TO_ERR,
             "  {}",
@@ -175,7 +176,7 @@ fn print_stats_block(out: &Value, commits: &[&Value]) {
     }
 
     if let Some(validation) = out.get("validation_usage") {
-        let c = use_color();
+        let c = color;
         let model = validation
             .get("model")
             .and_then(|v| v.as_str())
@@ -215,7 +216,7 @@ fn print_stats_block(out: &Value, commits: &[&Value]) {
     for c in commits {
         if c.get("dry_run").and_then(|v| v.as_bool()) == Some(true) {
             any_commit_stats = true;
-            let co = use_color();
+            let co = color;
             let commit = commit_title(c);
             pln!(
                 TO_ERR,
@@ -251,7 +252,7 @@ fn print_stats_block(out: &Value, commits: &[&Value]) {
 
         if c.get("error").and_then(|v| v.as_str()).is_some() {
             any_commit_stats = true;
-            let co = use_color();
+            let co = color;
             let commit = commit_title(c);
             pln!(
                 TO_ERR,
@@ -273,7 +274,7 @@ fn print_stats_block(out: &Value, commits: &[&Value]) {
             continue;
         }
         any_commit_stats = true;
-        let co = use_color();
+        let co = color;
         let commit = commit_title(c);
         pln!(
             TO_ERR,
@@ -309,12 +310,12 @@ fn print_stats_block(out: &Value, commits: &[&Value]) {
         pln!(
             TO_ERR,
             "  {}",
-            paint!("(no usage data)", use_color(), |s| s.dimmed())
+            paint!("(no usage data)", color, |s| s.dimmed())
         );
         pln!(TO_ERR);
     }
 
-    subsep(use_color(), TO_ERR);
+    subsep(color, TO_ERR);
 }
 
 /// Token / usage figures for `boro apply` human output.
