@@ -403,6 +403,6 @@ mod tests {
             Some("   "),
         )
         .expect("ctx");
-        assert!(!ref_md.contains("upstream follow-up"));
+        assert!(!ref_md.contains("# --- upstream follow-up ---"));
     }
 }

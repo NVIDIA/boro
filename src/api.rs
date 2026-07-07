@@ -4910,6 +4910,9 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
         let s = single_pass_user_payload(reference, "subject", "diff");
         assert!(s.contains("Do not report the bug that the patch is fixing"));
         assert!(s.contains("new/right-side diff removes"));
+        assert!(s.contains("upstream follow-up comments as historical evidence"));
+        assert!(s.contains("conclusively addresses the concern"));
+        assert!(s.contains("do not emit it as a finding"));
     }
 
     #[test]

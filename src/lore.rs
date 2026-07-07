@@ -614,10 +614,14 @@ pub fn render_followup_summary(v: &Value, inbox_url: &str) -> String {
     }
 
     out.push_str(
-        "\nCitation rule: when you echo any of the maintainer concerns or follow-up entries above in your \
-findings, include the parenthesised lore URL verbatim in the finding's structured `references` \
-array (kind `lore`) so the review report links back to the source thread. Also mention the URL \
-in prose when useful; never invent or rewrite it.\n",
+        "\nReview rule: upstream comments are historical evidence, not findings that must be \
+repeated. Independently check each concern against the reviewed commit's new/right-side code \
+and the complete series. If that code conclusively addresses the concern (including a requested \
+revision or test), do not emit it as a finding and do not include it in the LKML report. Keep it \
+only when the reported defect remains, the fix is incomplete, or the patch introduces a distinct \
+bug.\n\nCitation rule: when a concern survives that check, include the parenthesised lore URL \
+verbatim in the finding's structured `references` array (kind `lore`) so the review report links \
+back to the source thread. Also mention the URL in prose when useful; never invent or rewrite it.\n",
     );
     out
 }
@@ -867,6 +871,9 @@ body\n";
         assert!(s.contains("Eric <eric@x> [high]"));
         assert!(s.contains("https://lore.kernel.org/all/concern@x/"));
         assert!(s.contains("v2 was rejected"));
+        assert!(s.contains("upstream comments are historical evidence"));
+        assert!(s.contains("conclusively addresses the concern"));
+        assert!(s.contains("do not include it in the LKML report"));
         assert!(s.contains("Citation rule"));
     }
 
