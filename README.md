@@ -311,7 +311,10 @@ commit messages for `Fixes: <12-char-reviewed-sha>` trailers. That catches
 follow-up fixes which have reached the configured upstream branch but are
 not discoverable in the configured lore window. The lore result feeds every
 downstream discovery stage as part of the reference bundle, so concerns the
-upstream community already raised can be used by later review stages. Git
+upstream community already raised can be used by later review stages. These
+comments are evidence rather than mandatory findings: downstream review must
+drop them when the reviewed new code or complete series conclusively addresses
+the concern, and retain the lore URL only for concerns that still apply. Git
 `Fixes:` hits from the configured upstream branch are also added as
 high-severity findings, so they survive validation and appear in the final
 report even when the model would otherwise ignore reference-only context.

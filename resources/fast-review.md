@@ -56,6 +56,13 @@ substitute for this proof.
 
 Be skeptical of the commit message. Prefer reporting a suspected issue with clear reasoning over silence.
 
+Treat upstream follow-up comments as historical evidence, not as findings that
+must be repeated. Independently verify every upstream concern against the
+reviewed commit's new/right-side code and the complete series. If the current
+code conclusively addresses the concern, including a requested revision or
+test, do not emit it as a finding. Preserve the lore URL only when the defect
+remains, the fix is incomplete, or the patch introduces a distinct bug.
+
 Do not report the bug that the patch is fixing. A defect visible only in
 removed/old code is not a finding when the new/right-side diff removes,
 reorders, initializes, checks, or otherwise fixes it. Report only if the new
