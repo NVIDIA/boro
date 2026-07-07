@@ -46,6 +46,8 @@ pub enum ReviewTarget {
     Qemu,
     /// libvirt (boro-authored prompts under `resources/prompts/libvirt/`).
     Libvirt,
+    /// virt-manager / virtinst (boro-authored prompts under `resources/prompts/virt-manager/`).
+    VirtManager,
 }
 
 impl ReviewTarget {
@@ -54,25 +56,28 @@ impl ReviewTarget {
             ReviewTarget::Kernel => "kernel",
             ReviewTarget::Qemu => "qemu",
             ReviewTarget::Libvirt => "libvirt",
+            ReviewTarget::VirtManager => "virt-manager",
         }
     }
 }
 
-/// Best-effort classification of a source tree as a Linux kernel, QEMU or
-/// libvirt checkout from unambiguous signature files. Returns `None` when the
-/// tree matches none (or, defensively, more than one) — callers should stay
-/// silent in that case rather than guess. Used only to warn on a likely
-/// `--target` mismatch.
+/// Best-effort classification of a source tree as a Linux kernel, QEMU,
+/// libvirt or virt-manager checkout from unambiguous signature files. Returns
+/// `None` when the tree matches none (or, defensively, more than one) — callers
+/// should stay silent in that case rather than guess. Used only to warn on a
+/// likely `--target` mismatch.
 pub fn detect_tree_kind(repo: &std::path::Path) -> Option<ReviewTarget> {
     let has = |rel: &str| repo.join(rel).exists();
     let qemu = has("qapi") && has("qemu-options.hx") && has("include/qemu/osdep.h");
     let kernel = has("Kbuild") && has("mm") && has("kernel/sched") && has("include/linux/kernel.h");
     let libvirt =
         has("include/libvirt/libvirt.h") && has("libvirt.spec.in") && has("src/libvirt.c");
-    match (kernel, qemu, libvirt) {
-        (true, false, false) => Some(ReviewTarget::Kernel),
-        (false, true, false) => Some(ReviewTarget::Qemu),
-        (false, false, true) => Some(ReviewTarget::Libvirt),
+    let virtmanager = has("virtinst") && has("virtManager") && has("virtinst/guest.py");
+    match (kernel, qemu, libvirt, virtmanager) {
+        (true, false, false, false) => Some(ReviewTarget::Kernel),
+        (false, true, false, false) => Some(ReviewTarget::Qemu),
+        (false, false, true, false) => Some(ReviewTarget::Libvirt),
+        (false, false, false, true) => Some(ReviewTarget::VirtManager),
         _ => None,
     }
 }
@@ -364,6 +369,19 @@ mod tests {
             ],
         );
         assert_eq!(detect_tree_kind(tmp.path()), Some(ReviewTarget::Libvirt));
+    }
+
+    #[test]
+    fn detects_virtmanager_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch_all(
+            tmp.path(),
+            &["virtinst/guest.py", "virtManager/connection.py"],
+        );
+        assert_eq!(
+            detect_tree_kind(tmp.path()),
+            Some(ReviewTarget::VirtManager)
+        );
     }
 
     #[test]

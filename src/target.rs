@@ -8,6 +8,7 @@ use crate::config::ReviewTarget;
 pub mod kernel;
 pub mod libvirt;
 pub mod qemu;
+pub mod virt_manager;
 
 pub trait TargetSpec: Sync {
     fn prompt_file(&self, rel: &str) -> Option<EmbeddedFile>;
@@ -56,6 +57,7 @@ pub fn spec(target: ReviewTarget) -> &'static dyn TargetSpec {
         ReviewTarget::Kernel => &kernel::TARGET,
         ReviewTarget::Qemu => &qemu::TARGET,
         ReviewTarget::Libvirt => &libvirt::TARGET,
+        ReviewTarget::VirtManager => &virt_manager::TARGET,
     }
 }
 
@@ -153,15 +155,19 @@ mod tests {
         assert!(reviewer_system_prompt(ReviewTarget::Kernel).contains("Linux kernel"));
         assert!(reviewer_system_prompt(ReviewTarget::Qemu).contains("QEMU"));
         assert!(reviewer_system_prompt(ReviewTarget::Libvirt).contains("libvirt"));
+        assert!(reviewer_system_prompt(ReviewTarget::VirtManager).contains("virt-manager"));
         assert!(phase0_system_prompt(ReviewTarget::Kernel).contains("Linux kernel"));
         assert!(phase0_system_prompt(ReviewTarget::Qemu).contains("QEMU"));
         assert!(phase0_system_prompt(ReviewTarget::Libvirt).contains("libvirt"));
+        assert!(phase0_system_prompt(ReviewTarget::VirtManager).contains("virt-manager"));
         assert!(lkml_system_prompt(ReviewTarget::Kernel).contains("LKML"));
         assert!(lkml_system_prompt(ReviewTarget::Qemu).contains("qemu-devel"));
         assert!(lkml_system_prompt(ReviewTarget::Libvirt).contains("devel@lists.libvirt.org"));
+        assert!(lkml_system_prompt(ReviewTarget::VirtManager).contains("GitHub pull request"));
         assert!(quick_summary_system_prompt(ReviewTarget::Kernel).contains("Linux kernel"));
         assert!(quick_summary_system_prompt(ReviewTarget::Qemu).contains("QEMU"));
         assert!(quick_summary_system_prompt(ReviewTarget::Libvirt).contains("libvirt"));
+        assert!(quick_summary_system_prompt(ReviewTarget::VirtManager).contains("virt-manager"));
     }
 
     #[test]
@@ -183,7 +189,11 @@ mod tests {
         assert!(kernel.contains("loadable-module"));
 
         // Non-kernel targets get exactly the domain-neutral base, no kernel rules.
-        for t in [ReviewTarget::Qemu, ReviewTarget::Libvirt] {
+        for t in [
+            ReviewTarget::Qemu,
+            ReviewTarget::Libvirt,
+            ReviewTarget::VirtManager,
+        ] {
             let prompt = review_validation_findings(t);
             assert_eq!(
                 prompt, base,

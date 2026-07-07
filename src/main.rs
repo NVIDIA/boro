@@ -84,6 +84,8 @@ enum TargetArg {
     Qemu,
     /// libvirt.
     Libvirt,
+    /// virt-manager / virtinst.
+    VirtManager,
 }
 
 impl TargetArg {
@@ -92,6 +94,7 @@ impl TargetArg {
             TargetArg::Kernel => config::ReviewTarget::Kernel,
             TargetArg::Qemu => config::ReviewTarget::Qemu,
             TargetArg::Libvirt => config::ReviewTarget::Libvirt,
+            TargetArg::VirtManager => config::ReviewTarget::VirtManager,
         }
     }
 }

@@ -5461,6 +5461,7 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
             crate::config::ReviewTarget::Kernel,
             crate::config::ReviewTarget::Qemu,
             crate::config::ReviewTarget::Libvirt,
+            crate::config::ReviewTarget::VirtManager,
         ] {
             let prompt = crate::target::quick_summary_system_prompt(target);
             assert!(prompt.contains("Return ONLY a JSON object"));

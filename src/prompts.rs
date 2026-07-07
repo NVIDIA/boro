@@ -437,6 +437,103 @@ mod tests {
     }
 
     #[test]
+    fn virtmanager_assembled_payload_has_no_kernel_mandates() {
+        // The full virt-manager discovery/validation payload must not carry
+        // kernel-only (or daemon-C) requirements that contradict a Python
+        // GTK client.
+        let mut payload = String::new();
+        payload.push_str(crate::target::one_shot_review(ReviewTarget::VirtManager));
+        payload.push('\n');
+        payload.push_str(&load_false_positive_digest(ReviewTarget::VirtManager));
+        payload.push('\n');
+        for st in 3u8..=8u8 {
+            let body = crate::target::stage_instructions(ReviewTarget::VirtManager, st)
+                .expect("virt-manager overrides every specialist stage 3-8");
+            payload.push_str(body);
+            payload.push('\n');
+        }
+        payload.push_str(
+            &build_reference_context(
+                ReviewTarget::VirtManager,
+                &["virtinst/devices/disk.py".to_string()],
+                300_000,
+                None,
+                None,
+            )
+            .expect("ctx"),
+        );
+
+        for tok in [
+            "Kconfig",
+            "Kbuild",
+            "CONFIG_",
+            "GFP_",
+            "copy_to_user",
+            "rcu_read_lock",
+            "virDomainObjBeginJob",
+            "qemuDomainObjEnterMonitor",
+        ] {
+            assert!(
+                !payload.contains(tok),
+                "virt-manager assembled payload leaked kernel/C-daemon token: {tok}"
+            );
+        }
+
+        // Positive signals that the virt-manager-specific content is wired.
+        assert!(
+            payload.contains("idle_add"),
+            "GTK main-thread guidance missing"
+        );
+        assert!(
+            payload.contains("gi.require_version"),
+            "Python dependency-portability guidance missing"
+        );
+    }
+
+    #[test]
+    fn embedded_virtmanager_prompts_are_present() {
+        for rel in [
+            "technical-patterns.md",
+            "callstack.md",
+            "false-positive-guide.md",
+            "severity.md",
+            "inline-template.md",
+            "coding-style.md",
+            "subsystem/subsystem.md",
+            "subsystem/threading.md",
+        ] {
+            let t = read_prompt_rel(ReviewTarget::VirtManager, rel, 50_000).expect("read");
+            assert!(
+                t.map(|s| s.len() > 200).unwrap_or(false),
+                "virt-manager prompt {rel} must be embedded and non-trivial (resources/prompts/virt-manager/)"
+            );
+        }
+    }
+
+    #[test]
+    fn virtmanager_subsystem_mapping_selects_expected_guides() {
+        let picked = pick_subsystem_files(
+            ReviewTarget::VirtManager,
+            &[
+                "virtinst/devices/disk.py".to_string(),
+                "virtManager/connection.py".to_string(),
+                "virtinst/cli.py".to_string(),
+            ],
+        );
+        for want in [
+            "subsystem/devices.md",
+            "subsystem/connection.md",
+            "subsystem/cli.md",
+        ] {
+            assert!(picked.contains(&want.to_string()), "missing {want}");
+            assert!(
+                prompt_exists(ReviewTarget::VirtManager, want),
+                "{want} not embedded"
+            );
+        }
+    }
+
+    #[test]
     fn phase0_narrowing_skips_path_matched_when_picks_present() {
         // mm/page_alloc.c would normally pull in subsystem/mm-alloc.md via pick_subsystem_files,
         // but Phase 0 picked a different guide → mm-alloc.md should be absent and the picked
