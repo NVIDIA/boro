@@ -87,4 +87,19 @@ mod tests {
         assert!(single_pass.contains("set/domain membership alone does not carry"));
         assert!(single_pass.contains("architecture-overridable helpers"));
     }
+
+    #[test]
+    fn execution_prompts_require_complete_macro_expansion() {
+        let execution = instruction_body(3).expect("stage 3 prompt");
+        let single_pass = include_str!("../resources/fast-review.md");
+
+        for prompt in [execution, single_pass] {
+            let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(normalized.contains("complete invocation chain token by token"));
+            assert!(normalized.contains(
+                "Punctuation or member-access operators do not make a matching parameter token literal"
+            ));
+            assert!(normalized.contains("final expanded token stream"));
+        }
+    }
 }

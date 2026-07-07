@@ -28,6 +28,15 @@ For generic code using architecture-overridable helpers, inspect non-stub
 architecture implementations. A constant fallback on the stated target does
 not prove two predicates equivalent across architectures.
 
+For every finding whose conclusion depends on a function-like macro, expand
+the complete invocation chain token by token before reporting it. At each
+level, identify the formal parameters and actual arguments, substitute every
+matching preprocessing token in the replacement list, and rescan the result
+for nested macro expansion. Punctuation or member-access operators do not make
+a matching parameter token literal. Account for stringification, token
+pasting, and variadic arguments when present. Base the finding on the final
+expanded token stream, not on the unexpanded spelling of the macro body.
+
 Every finding must carry concrete proof appropriate to its issue type: the
 relevant code or text facts, a reachable trigger or witness when applicable,
 the violated invariant or direct contradiction, and the concrete failure or

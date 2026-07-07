@@ -4572,6 +4572,19 @@ mod tests {
     }
 
     #[test]
+    fn validation_findings_prompt_requires_complete_macro_expansion() {
+        let normalized = SYSTEM_REVIEW_VALIDATION_FINDINGS
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(normalized.contains("complete invocation chain token by token"));
+        assert!(normalized.contains(
+            "Punctuation or member-access operators do not make a matching parameter token literal"
+        ));
+        assert!(normalized.contains("final expanded token stream"));
+    }
+
+    #[test]
     fn validation_prompt_keeps_upstream_fix_findings() {
         assert!(SYSTEM_REVIEW_VALIDATION_FINDINGS.contains("\"source\": \"upstream-fixes\""));
         assert!(SYSTEM_REVIEW_VALIDATION_FINDINGS.contains("KEEP these findings"));

@@ -40,7 +40,18 @@ This is separate from a TOCTOU check: even with no concurrent state change,
 validating object A and consuming object B is unsafe when B was never shown to
 satisfy A's acceptance predicates.
 
-Additionally, verify preprocessor macro correctness and spelling (for example,
-ensure `CONFIG_` prefixes are used where expected instead of `HAVE_`). Check
-that static/inline declarations or section placements will not cause linker
-errors or Link-Time Optimization (LTO) symbol loss.
+## Preprocessor expansion
+
+Before emitting a concern, or accepting or challenging a protected finding,
+whose conclusion depends on a function-like macro, expand the complete
+invocation chain token by token. At each level, identify the formal parameters
+and actual arguments, substitute every matching preprocessing token in the
+replacement list, and rescan the result for nested macro expansion.
+Punctuation or member-access operators do not make a matching parameter token
+literal. Account for stringification, token pasting, and variadic arguments
+when present. Judge the behavior from the final expanded token stream, not the
+unexpanded spelling of the macro body.
+
+Additionally, verify preprocessor macro spelling, including configuration
+symbol prefixes. Check that static/inline declarations or section placements
+will not cause linker errors or Link-Time Optimization (LTO) symbol loss.
