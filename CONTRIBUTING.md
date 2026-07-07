@@ -3,6 +3,22 @@
 Contributions to Boro are accepted under the Developer Certificate of Origin
 (DCO) 1.1. Boro does not use a Contributor License Agreement.
 
+## Commit Messages
+
+Start each non-merge commit subject with a lowercase subsystem name and a
+capitalized description:
+
+```text
+subsystem: Short description of the change
+```
+
+Do not use Conventional Commit subjects such as `fix(subsystem): ...`,
+`feat(subsystem): ...`, or `feature(subsystem): ...`.
+
+Wrap the subject and body prose at 72 columns. Git trailers such as
+`Signed-off-by:` and `Fixes:` may exceed that limit because they must remain
+intact.
+
 ## Signing Your Work
 
 Every commit must include a `Signed-off-by` trailer that certifies your
