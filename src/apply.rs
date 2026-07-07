@@ -574,6 +574,7 @@ impl ApplyOutcome {
 pub struct ApplyRequest<'a> {
     pub repo: &'a Path,
     pub commit_id: &'a str,
+    pub series_commits: &'a [String],
     pub client: &'a reqwest::Client,
     pub model: &'a config::ResolvedModel,
     pub validation_model: &'a config::ResolvedModel,
@@ -704,7 +705,12 @@ pub async fn run(req: ApplyRequest<'_>) -> Result<ApplyOutcome> {
         });
     }
 
-    if let Some(retry) = maybe_apply_dependencies_and_retry(req.repo, req.commit_id, req.verbose)? {
+    if let Some(retry) = maybe_apply_dependencies_and_retry(
+        req.repo,
+        req.commit_id,
+        req.series_commits,
+        req.verbose,
+    )? {
         cherry = retry.output;
         applied_dependencies = retry.applied;
         if cherry.success {
@@ -1219,9 +1225,10 @@ struct DependencyRetry {
 fn maybe_apply_dependencies_and_retry(
     repo: &Path,
     target_commit: &str,
+    series_commits: &[String],
     verbose: &VerboseDest,
 ) -> Result<Option<DependencyRetry>> {
-    let dependencies = missing_referenced_dependencies(repo, target_commit)?;
+    let dependencies = missing_referenced_dependencies(repo, target_commit, series_commits)?;
     if dependencies.is_empty() {
         return Ok(None);
     }
@@ -1302,7 +1309,11 @@ fn maybe_apply_dependencies_and_retry(
     Ok(Some(DependencyRetry { applied, output }))
 }
 
-fn missing_referenced_dependencies(repo: &Path, target_commit: &str) -> Result<Vec<String>> {
+fn missing_referenced_dependencies(
+    repo: &Path,
+    target_commit: &str,
+    series_commits: &[String],
+) -> Result<Vec<String>> {
     let target = resolve_commit(repo, target_commit)?
         .with_context(|| format!("resolve target commit {}", target_commit))?;
     let message = commit_message(repo, target_commit)?;
@@ -1312,7 +1323,10 @@ fn missing_referenced_dependencies(repo: &Path, target_commit: &str) -> Result<V
         let Some(commit) = resolve_commit(repo, &id)? else {
             continue;
         };
-        if commit == target || out.iter().any(|seen| seen == &commit) {
+        if commit == target
+            || series_commits.contains(&commit)
+            || out.iter().any(|seen| seen == &commit)
+        {
             continue;
         }
         if is_ancestor(repo, &commit, "HEAD")? {
@@ -3905,6 +3919,36 @@ See also commit ABCDEF1234567890.
 (backported from commit 2222222333333344444445555555666666677777)
 ";
         assert_eq!(referenced_commit_ids(msg), vec!["abcdef1234567890"]);
+    }
+
+    #[test]
+    fn selected_series_commits_are_not_applied_as_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        run_git_test(dir.path(), &["init"]).unwrap();
+        run_git_test(dir.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        run_git_test(dir.path(), &["config", "user.name", "Test User"]).unwrap();
+        run_git_test(dir.path(), &["commit", "--allow-empty", "-m", "base"]).unwrap();
+        run_git_test(dir.path(), &["tag", "target-base"]).unwrap();
+        run_git_test(
+            dir.path(),
+            &["commit", "--allow-empty", "-m", "series dependency"],
+        )
+        .unwrap();
+        let dependency = git::rev_parse_commit(dir.path(), "HEAD").unwrap();
+        let message = format!("series target\n\nDepends-on: {}", &dependency[..12]);
+        run_git_test(dir.path(), &["commit", "--allow-empty", "-m", &message]).unwrap();
+        let target = git::rev_parse_commit(dir.path(), "HEAD").unwrap();
+        run_git_test(dir.path(), &["checkout", "--detach", "target-base"]).unwrap();
+
+        assert_eq!(
+            missing_referenced_dependencies(dir.path(), &target, &[]).unwrap(),
+            vec![dependency.clone()]
+        );
+        assert!(
+            missing_referenced_dependencies(dir.path(), &target, &[dependency])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

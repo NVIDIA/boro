@@ -16,6 +16,7 @@ mod model_timeout;
 mod opencode;
 mod output;
 mod prefetch;
+mod process;
 mod progress;
 mod prompts;
 mod snapshot;
@@ -205,7 +206,7 @@ struct GlobalOpts {
 enum Command {
     /// LLM code review of each commit in COMMIT_RANGE (multi-stage agentic pipeline).
     Review(ReviewArgs),
-    /// Apply COMMIT_ID with git cherry-pick -x -s; on conflicts, auto-resolve validated hunks.
+    /// Apply commits from COMMIT_RANGE or --message-id; auto-resolve validated conflicts.
     Apply(ApplyArgs),
     /// Build each commit with `vng -b`; the model reviews the build log.
     #[command(name = "build")]
@@ -259,10 +260,20 @@ struct ReviewArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+#[command(group(
+    clap::ArgGroup::new("apply_source")
+        .required(true)
+        .multiple(false)
+        .args(["range", "message_id"])
+))]
 struct ApplyArgs {
-    /// Commit to apply with git cherry-pick -x -s
-    #[arg(value_name = "COMMIT_ID")]
-    commit_id: String,
+    /// Git revision range, e.g. HEAD~4..HEAD. A single commit is also accepted.
+    #[arg(value_name = "COMMIT_RANGE")]
+    range: Option<String>,
+
+    /// Fetch and apply a posted patch series by Message-ID using `b4`.
+    #[arg(long, value_name = "MESSAGE_ID")]
+    message_id: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -2097,34 +2108,17 @@ async fn run_quick_summary(
     });
 }
 
-async fn run_apply_command(
+async fn run_apply_commit(
     global: &GlobalOpts,
-    args: &ApplyArgs,
+    repo: &Path,
+    commit_id: &str,
+    series_commits: &[String],
     run_start: Instant,
-) -> Result<()> {
+) -> Result<(Value, i32)> {
     let vdest = VerboseDest::new(global.verbose);
     v(
         &vdest,
-        format!("starting (subcommand=apply, commit={:?})", args.commit_id),
-    );
-
-    let repo = match global.source.clone() {
-        Some(p) => p,
-        None => std::env::current_dir().context("default source: current working directory")?,
-    };
-    v(
-        &vdest,
-        format!("working directory / source hint: {}", repo.display()),
-    );
-
-    let repo = git::repo_root(&repo).context("resolve git root")?;
-    v(&vdest, format!("git repository root: {}", repo.display()));
-
-    std::env::set_current_dir(&repo)
-        .with_context(|| format!("set cwd to repository root {}", repo.display()))?;
-    v(
-        &vdest,
-        format!("process working directory: {}", repo.display()),
+        format!("starting (subcommand=apply, commit={commit_id:?})"),
     );
 
     let backend = global.backend.to_config();
@@ -2174,7 +2168,7 @@ async fn run_apply_command(
         );
     }
 
-    let apply_subject = git::commit_subject(&repo, &args.commit_id)
+    let apply_subject = git::commit_subject(repo, commit_id)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -2189,12 +2183,13 @@ async fn run_apply_command(
     let apply_worker = apply_ui.as_ref().map(|ui| ui.worker_ctx(0));
 
     let outcome_result = if global.dry_run {
-        Ok(apply::dry_run(&args.commit_id))
+        Ok(apply::dry_run(commit_id))
     } else {
         let client = http::build_http_client().context("HTTP client")?;
         apply::run(apply::ApplyRequest {
-            repo: repo.as_path(),
-            commit_id: &args.commit_id,
+            repo,
+            commit_id,
+            series_commits,
             client: &client,
             model: &model,
             validation_model: &validation,
@@ -2220,9 +2215,7 @@ async fn run_apply_command(
     }
 
     let outcome_json = outcome.json(&model, &validation);
-    if global.json {
-        output::print_report_json(&outcome_json);
-    } else {
+    if !global.json {
         output::eprint_apply_stats(&outcome_json);
         outcome.print_human();
     }
@@ -2240,9 +2233,135 @@ async fn run_apply_command(
         )
     );
 
-    let code = outcome.exit_code();
-    if code != 0 {
-        std::process::exit(code);
+    Ok((outcome_json, outcome.exit_code()))
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+}
+
+async fn run_apply_command(
+    global: &GlobalOpts,
+    args: &ApplyArgs,
+    run_start: Instant,
+) -> Result<()> {
+    let vdest = VerboseDest::new(global.verbose);
+    let source = global
+        .source
+        .clone()
+        .unwrap_or(std::env::current_dir().context("default source: current directory")?);
+    let repo = git::repo_root(&source).context("resolve git root")?;
+    std::env::set_current_dir(&repo)
+        .with_context(|| format!("set cwd to repository root {}", repo.display()))?;
+    let target_base = git::rev_parse_commit(&repo, "HEAD").context("resolve apply start HEAD")?;
+    let mut interrupt = match args.message_id {
+        Some(_) => Some(
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .context("install Ctrl-C handler")?,
+        ),
+        None => None,
+    };
+    let imported_series = match args.message_id.as_deref() {
+        Some(message_id) => Some(
+            worktree::ImportedSeries::prepare(
+                &repo,
+                message_id,
+                &vdest,
+                interrupt
+                    .as_mut()
+                    .expect("Message-ID installs SIGINT handler"),
+            )
+            .await
+            .with_context(|| format!("import Message-ID {message_id}"))?,
+        ),
+        None => None,
+    };
+    let range = imported_series
+        .as_ref()
+        .map(|series| series.range().to_string())
+        .or_else(|| args.range.clone())
+        .expect("clap requires COMMIT_RANGE or --message-id");
+    let is_range = range.contains("..");
+    let commits = if is_range {
+        let (base, tip) = range
+            .split_once("..")
+            .context("apply range must be BASE..TIP")?;
+        if base.is_empty() || tip.is_empty() || tip.contains("..") {
+            anyhow::bail!("apply range must be BASE..TIP: {range:?}");
+        }
+        let base = git::rev_parse_commit(&repo, base).context("resolve apply range base")?;
+        let tip = git::rev_parse_commit(&repo, tip).context("resolve apply range tip")?;
+        if !base.chars().all(|c| c.is_ascii_hexdigit())
+            || !tip.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            anyhow::bail!("apply range endpoints must resolve to commits");
+        }
+        let commits = git::rev_list(&repo, &format!("{base}..{tip}"))
+            .context("resolve apply commit range")?;
+        if commits.is_empty() {
+            anyhow::bail!("commit range {range:?} selects no commits");
+        }
+        commits
+    } else {
+        vec![range.to_string()]
+    };
+
+    let mut reports = Vec::with_capacity(commits.len());
+    let mut exit_code = 0;
+    for (index, commit) in commits.iter().enumerate() {
+        if commits.len() > 1 && !global.json {
+            println!("\n[PATCH {}/{}] {commit}", index + 1, commits.len());
+        }
+        let result = if let Some(interrupt) = interrupt.as_mut() {
+            tokio::select! {
+                result = run_apply_commit(global, &repo, commit, &commits, run_start) => {
+                    Some(result?)
+                }
+                _ = interrupt.recv() => None,
+            }
+        } else {
+            Some(run_apply_commit(global, &repo, commit, &commits, run_start).await?)
+        };
+        let Some((report, code)) = result else {
+            exit_code = 130;
+            break;
+        };
+        reports.push(report);
+        if code != 0 {
+            exit_code = code;
+            break;
+        }
+    }
+
+    let target_tip = git::rev_parse_commit(&repo, "HEAD").context("resolve apply result HEAD")?;
+    let applied_range = (target_tip != target_base).then(|| format!("{target_base}..{target_tip}"));
+    if global.json {
+        if !is_range {
+            output::print_report_json(&reports[0]);
+        } else {
+            let mut report = json!({
+                "schema_version": 2,
+                "subcommand": "apply",
+                "range": range,
+                "applied_range": applied_range,
+                "commits": reports,
+            });
+            if let Some(message_id) = &args.message_id {
+                report["message_id"] = json!(message_id);
+            }
+            output::print_report_json(&report);
+        }
+    } else if let Some(applied_range) = &applied_range {
+        println!("\nApplied range: {applied_range}");
+        println!(
+            "Review with: boro --source {} review {applied_range}",
+            shell_quote_path(&repo)
+        );
+    }
+    let _ = std::io::stdout().flush();
+    drop(imported_series);
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
     Ok(())
 }
@@ -4756,5 +4875,42 @@ mod fast_cli_tests {
             followup.review_context(true),
             "lore discussion\ndeterministic upstream fix\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn apply_accepts_message_id_without_commit_range() {
+        let parsed = Cli::try_parse_from([
+            "boro",
+            "apply",
+            "--message-id",
+            "20260620192214.923500-1-oliver@liuxiaozhen.dev",
+        ])
+        .unwrap();
+
+        let Command::Apply(args) = parsed.command else {
+            panic!("expected apply command");
+        };
+        assert!(args.range.is_none());
+        assert_eq!(
+            args.message_id.as_deref(),
+            Some("20260620192214.923500-1-oliver@liuxiaozhen.dev")
+        );
+    }
+
+    #[test]
+    fn review_rejects_message_id() {
+        let parsed = Cli::try_parse_from([
+            "boro",
+            "review",
+            "--message-id",
+            "20260620192214.923500-1-oliver@liuxiaozhen.dev",
+        ]);
+
+        assert!(parsed.is_err());
     }
 }

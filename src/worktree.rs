@@ -37,6 +37,164 @@ pub struct Worktree {
     path: PathBuf,
 }
 
+/// A posted patch series applied in a disposable worktree as input to `boro apply`.
+///
+/// The imported commits live in the source repository's object database while this guard keeps
+/// the worktree registered. Dropping the guard removes the worktree without changing the user's
+/// branch or working tree.
+pub struct ImportedSeries {
+    _worktree: Worktree,
+    range: String,
+}
+
+fn stderr_excerpt(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .chars()
+        .take(4096)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+impl ImportedSeries {
+    pub async fn prepare(
+        main_repo: &Path,
+        message_id: &str,
+        dest: &VerboseDest,
+        interrupt: &mut tokio::signal::unix::Signal,
+    ) -> Result<Self> {
+        Self::prepare_with_program(main_repo, message_id, Path::new("b4"), dest, interrupt).await
+    }
+
+    async fn prepare_with_program(
+        main_repo: &Path,
+        message_id: &str,
+        b4_program: &Path,
+        dest: &VerboseDest,
+        interrupt: &mut tokio::signal::unix::Signal,
+    ) -> Result<Self> {
+        let message_id = message_id.trim();
+        if message_id.is_empty()
+            || message_id.len() > 2048
+            || message_id.chars().any(char::is_control)
+        {
+            anyhow::bail!("invalid Message-ID");
+        }
+
+        let base = crate::git::rev_parse_commit(main_repo, "HEAD")
+            .context("resolve source HEAD before importing Message-ID")?;
+        let worktree_dir = tempfile::Builder::new()
+            .prefix("boro-message-id-")
+            .tempdir()
+            .context("create temporary directory for Message-ID import")?;
+        let path = worktree_dir.path().to_path_buf();
+        let cleanup_partial = |dir: tempfile::TempDir| {
+            let _ = Command::new("git")
+                .current_dir(main_repo)
+                .args(["worktree", "remove", "--force"])
+                .arg(&path)
+                .output();
+            drop(dir);
+            let _ = Command::new("git")
+                .current_dir(main_repo)
+                .args(["worktree", "prune", "--expire=now"])
+                .output();
+        };
+
+        let mut add_worktree = tokio::process::Command::new("git");
+        add_worktree
+            .current_dir(main_repo)
+            .args(["worktree", "add", "--detach"])
+            .arg(&path)
+            .arg(&base);
+        let out = match crate::process::cancellable_output(
+            add_worktree,
+            "git worktree add for Message-ID import",
+            interrupt,
+        )
+        .await
+        {
+            Ok(out) => out,
+            Err(error) => {
+                cleanup_partial(worktree_dir);
+                return Err(error);
+            }
+        };
+        if !out.status.success() {
+            let error = anyhow::anyhow!(
+                "git worktree add {} {base}: {}",
+                path.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            cleanup_partial(worktree_dir);
+            return Err(error);
+        }
+
+        // From here on Worktree owns removal. Keeping the directory prevents TempDir from
+        // deleting it behind Git's back if `git worktree remove` ever fails.
+        let path = worktree_dir.keep();
+        let worktree = Worktree {
+            main_repo: main_repo.to_path_buf(),
+            path,
+        };
+        dest.line(format!(
+            "message-id: applying posted series in {}",
+            worktree.path().display()
+        ));
+
+        let scratch_dir = tempfile::Builder::new()
+            .prefix("boro-message-id-data-")
+            .tempdir()
+            .context("create temporary data directory for Message-ID import")?;
+        let mut b4 = tokio::process::Command::new(b4_program);
+        b4.current_dir(worktree.path())
+            .arg("--no-interactive")
+            .arg("shazam")
+            .arg("-H")
+            .arg("--")
+            .arg(message_id)
+            // Avoid recording this temporary import as an applied series in b4's global data.
+            .env("XDG_DATA_HOME", scratch_dir.path().join("xdg-data"));
+        let out = crate::process::cancellable_output(
+            b4,
+            &format!("{} shazam", b4_program.display()),
+            interrupt,
+        )
+        .await?;
+        if !out.status.success() {
+            anyhow::bail!("b4 shazam failed: {}", stderr_excerpt(&out.stderr));
+        }
+        if let Some(line) = String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .find(|line| line.contains("Will use the latest revision"))
+        {
+            eprintln!("[boro] message-id: {}", line.trim());
+        }
+
+        let patch_count = String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Total patches: "))
+            .and_then(|count| count.parse::<usize>().ok())
+            .filter(|count| *count > 0)
+            .context("b4 shazam did not report a positive patch count")?;
+        let tip = crate::git::rev_parse_commit(worktree.path(), "FETCH_HEAD")
+            .context("resolve imported Message-ID tip")?;
+        let base =
+            crate::git::rev_parse_commit(worktree.path(), &format!("FETCH_HEAD~{patch_count}"))
+                .context("resolve imported Message-ID base")?;
+        let range = format!("{base}..{tip}");
+
+        Ok(Self {
+            _worktree: worktree,
+            range,
+        })
+    }
+
+    pub fn range(&self) -> &str {
+        &self.range
+    }
+}
+
 impl Worktree {
     /// Create `<main_repo>/.boro/worktrees/<command_label>/<sha>/` checked out at `sha`.
     /// `command_label` is the boro subcommand name (`"review"` / `"build"` / `"test"`); per-command
@@ -209,5 +367,219 @@ fn ensure_gitignore(main_repo: &Path, dest: &VerboseDest) {
             "worktree: appended `.boro/` to {}",
             exclude_path.display(),
         ));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn init_repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        git(tmp.path(), &["init", "-q"]);
+        git(tmp.path(), &["config", "user.name", "Boro Test"]);
+        git(tmp.path(), &["config", "user.email", "boro@example.com"]);
+        fs::write(tmp.path().join("README"), "base\n").unwrap();
+        git(tmp.path(), &["add", "README"]);
+        git(tmp.path(), &["commit", "-q", "-m", "base"]);
+        let base = git(tmp.path(), &["rev-parse", "HEAD"]);
+        fs::write(tmp.path().join("upstream.txt"), "upstream\n").unwrap();
+        git(tmp.path(), &["add", "upstream.txt"]);
+        git(tmp.path(), &["commit", "-q", "-m", "series base"]);
+        fs::write(tmp.path().join("README"), "posted\n").unwrap();
+        git(tmp.path(), &["add", "README"]);
+        git(tmp.path(), &["commit", "-q", "-m", "imported"]);
+        git(tmp.path(), &["branch", "series-tip"]);
+        git(tmp.path(), &["reset", "--hard", &base]);
+        tmp
+    }
+
+    fn fake_b4(dir: &Path) -> PathBuf {
+        let path = dir.join("b4");
+        fs::write(
+            &path,
+            "#!/bin/sh\n\
+             set -eu\n\
+             test \"$1\" = --no-interactive\n\
+             test \"$2\" = shazam\n\
+             test \"$3\" = -H\n\
+             test \"$4\" = --\n\
+             test \"$5\" = 20260620192214.923500-1-oliver@liuxiaozhen.dev\n\
+             echo 'Total patches: 1' >&2\n\
+             git fetch . series-tip\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    fn failing_b4(dir: &Path) -> PathBuf {
+        let path = dir.join("b4-fail");
+        fs::write(
+            &path,
+            "#!/bin/sh\n\
+             echo 'test download failed' >&2\n\
+             exit 42\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    fn blocking_b4(dir: &Path) -> PathBuf {
+        let path = dir.join("b4-block");
+        fs::write(&path, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    fn worktree_list(repo: &Path) -> String {
+        git(repo, &["worktree", "list", "--porcelain"])
+    }
+
+    fn interrupt_signal() -> tokio::signal::unix::Signal {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn message_id_import_isolated_from_source_checkout() {
+        let repo = init_repo();
+        let tools = tempfile::tempdir().unwrap();
+        let b4 = fake_b4(tools.path());
+        fs::write(repo.path().join("README"), "target\n").unwrap();
+        git(repo.path(), &["add", "README"]);
+        git(repo.path(), &["commit", "-q", "-m", "target"]);
+        let base = git(repo.path(), &["rev-parse", "HEAD"]);
+        let series_base = git(repo.path(), &["rev-parse", "series-tip^"]);
+        fs::write(repo.path().join("README"), "locally modified\n").unwrap();
+        fs::write(repo.path().join("untracked.txt"), "keep me\n").unwrap();
+        let status_before = git(repo.path(), &["status", "--short"]);
+        let worktrees_before = worktree_list(repo.path());
+        let mut interrupt = interrupt_signal();
+
+        let range;
+        {
+            let imported = ImportedSeries::prepare_with_program(
+                repo.path(),
+                "20260620192214.923500-1-oliver@liuxiaozhen.dev",
+                &b4,
+                &VerboseDest::new(false),
+                &mut interrupt,
+            )
+            .await
+            .unwrap();
+            range = imported.range().to_string();
+            assert_ne!(worktree_list(repo.path()), worktrees_before);
+        }
+
+        assert!(range.starts_with(&format!("{series_base}..")));
+        assert_eq!(git(repo.path(), &["rev-list", "--count", &range]), "1");
+        assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), base);
+        assert_eq!(worktree_list(repo.path()), worktrees_before);
+        assert_eq!(git(repo.path(), &["status", "--short"]), status_before);
+        assert_eq!(
+            fs::read_to_string(repo.path().join("README")).unwrap(),
+            "locally modified\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("untracked.txt")).unwrap(),
+            "keep me\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_message_id_import_cleans_up_temporary_worktree() {
+        let repo = init_repo();
+        let tools = tempfile::tempdir().unwrap();
+        let b4 = failing_b4(tools.path());
+        let base = git(repo.path(), &["rev-parse", "HEAD"]);
+        let worktrees_before = worktree_list(repo.path());
+        let mut interrupt = interrupt_signal();
+
+        let error = match ImportedSeries::prepare_with_program(
+            repo.path(),
+            "20260620192214.923500-1-oliver@liuxiaozhen.dev",
+            &b4,
+            &VerboseDest::new(false),
+            &mut interrupt,
+        )
+        .await
+        {
+            Ok(_) => panic!("failing b4 unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert!(format!("{error:#}").contains("test download failed"));
+        assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), base);
+        assert_eq!(worktree_list(repo.path()), worktrees_before);
+        assert!(git(repo.path(), &["status", "--short"]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_message_id_import_cleans_up_temporary_worktree() {
+        let repo = init_repo();
+        let tools = tempfile::tempdir().unwrap();
+        let b4 = blocking_b4(tools.path());
+        let base = git(repo.path(), &["rev-parse", "HEAD"]);
+        let worktrees_before = worktree_list(repo.path());
+        let mut interrupt = interrupt_signal();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            ImportedSeries::prepare_with_program(
+                repo.path(),
+                "20260620192214.923500-1-oliver@liuxiaozhen.dev",
+                &b4,
+                &VerboseDest::new(false),
+                &mut interrupt,
+            ),
+        )
+        .await;
+
+        assert!(result.is_err(), "blocking import was not cancelled");
+        assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), base);
+        assert_eq!(worktree_list(repo.path()), worktrees_before);
+        assert!(git(repo.path(), &["status", "--short"]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_message_id_creates_no_worktree() {
+        let repo = init_repo();
+        let worktrees_before = worktree_list(repo.path());
+        let mut interrupt = interrupt_signal();
+
+        let result = ImportedSeries::prepare_with_program(
+            repo.path(),
+            "invalid\nmessage-id",
+            Path::new("b4"),
+            &VerboseDest::new(false),
+            &mut interrupt,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(worktree_list(repo.path()), worktrees_before);
     }
 }

@@ -40,6 +40,20 @@ boro review origin/master..HEAD
 
 Passing a single commit ID is interpreted as `abc123^..abc123`.
 
+Apply a series posted to lore, then review the commits created locally:
+
+```bash
+boro --source /path/to/linux apply \
+  --message-id 20260620192214.923500-1-oliver@liuxiaozhen.dev
+boro --source /path/to/linux review BASE..HEAD
+```
+
+This requires `b4`. Boro imports the posted series in a disposable worktree,
+applies each commit through the normal `boro apply` workflow, removes the
+worktree, and prints the exact `BASE..HEAD` range for `boro review`. `b4`
+reconstructs the series at its declared or inferred base before boro applies it
+to the selected source `HEAD`.
+
 ## Demo
 
 https://github.com/user-attachments/assets/d4dc2533-9928-48b0-aca4-dbd9197398cb
@@ -107,12 +121,19 @@ cleanly, automatically attempting to resolve conflicts.
 
 Subcommands:
 
-- `boro apply COMMIT_ID` - runs `git cherry-pick -x -s COMMIT_ID`. If Git
-  reports a failed or empty cherry-pick, boro first checks whether the commit
-  subject is already present in path-limited history and skips it when found.
+- `boro apply COMMIT_RANGE` - applies a single commit or each commit in a range
+  such as `BASE..TIP`, oldest first. Boro stops at the first failure and leaves
+  earlier commits applied. Each commit runs through the existing
+  `git cherry-pick -x -s` workflow below; `--dry-run` only lists the series.
+  If Git reports a failed or empty cherry-pick, boro first checks whether the
+  commit subject is already present in path-limited history and skips it when
+  found.
   Otherwise, boro looks for explicit commit references in the target commit
   message; any referenced commits that are not already in `HEAD` are tried
   first with `git cherry-pick -x -s`, then the target commit is retried.
+- `boro apply --message-id MESSAGE_ID` - fetches a posted series with `b4` and
+  applies it through the same oldest-first workflow. On success, boro prints
+  the resulting local commit range and a copyable `boro review` command.
 
   For remaining diff3 conflicts, `BORO_MODEL` proposes per-conflict resolutions
   and `BORO_VALIDATION_MODEL` gates them. Validator rejections are sent back to
@@ -128,6 +149,8 @@ Subcommands:
 
 ## Requirements
 
+- For `apply --message-id`: install
+  [`b4`](https://b4.docs.kernel.org/) and make sure it is on `$PATH`.
 - For `build` / `test`: install
 [virtme-ng](https://github.com/arighi/virtme-ng) (`vng`) and make sure it's
 on your `PATH`.
