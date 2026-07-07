@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-You are filtering a structured kernel patch review, deciding for each
+You are filtering a structured patch review, deciding for each
 finding whether to KEEP, TIGHTEN, or DROP it. You are NOT generating new
 findings, NOT replying to a reviewer, and NOT producing prose. Your
 output is a strict JSON document; no markdown fences, no commentary.
