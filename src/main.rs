@@ -4329,6 +4329,47 @@ diff --git a/foo.c b/foo.c
  last
 ";
 
+    const RENAME_DIFF: &str = "\
+diff --git a/app/main.rs b/app/main_renamed.rs
+similarity index 89%
+rename from app/main.rs
+rename to app/main_renamed.rs
+--- a/app/main.rs
++++ b/app/main_renamed.rs
+@@ -10,4 +10,4 @@ main flow
+ trace!(\"before\");
+-println!(\"old behavior\");
++println!(\"new behavior\");
+ trace!(\"after\");
+";
+
+    const DELETE_DIFF: &str = "\
+diff --git a/app/removed.rs b/app/removed.rs
+deleted file mode 100644
+index 8f3..000
+--- a/app/removed.rs
++++ /dev/null
+@@ -5,2 +0,0 @@
+-remove_me();
+-cleanup();
+";
+
+    const HEADER_LIKE_BODY_DIFF: &str = "\
+diff --git a/scripts/example.txt b/scripts/example.txt
+index 123..456 100644
+--- a/scripts/example.txt
++++ b/scripts/example.txt
+@@ -1,3 +1,4 @@
+ alpha
+--- looks like a header but is body
++++ still body, not a header
++tail line that must stay in the hunk
+ omega
+@@ -10,1 +11,1 @@
+-old second line
++new second line
+";
+
     fn vd() -> VerboseDest {
         VerboseDest::new(false)
     }
@@ -4643,6 +4684,45 @@ diff --git a/foo.c b/foo.c
         });
         drop_unanchored_locations(&mut findings, &idx, &vd());
         assert!(findings["findings"][0].get("location").is_none());
+    }
+
+    #[test]
+    fn keeps_left_location_for_renamed_file_old_path() {
+        let idx = diff_index::DiffIndex::from_unified_diff(RENAME_DIFF);
+        let mut findings = json!({
+            "findings": [
+                {"problem": "x", "severity": "Low", "severity_explanation": "y",
+                 "location": {"file": "app/main.rs", "line": 11, "side": "LEFT"}}
+            ]
+        });
+        drop_unanchored_locations(&mut findings, &idx, &vd());
+        assert!(findings["findings"][0].get("location").is_some());
+    }
+
+    #[test]
+    fn keeps_left_location_for_deleted_file() {
+        let idx = diff_index::DiffIndex::from_unified_diff(DELETE_DIFF);
+        let mut findings = json!({
+            "findings": [
+                {"problem": "x", "severity": "Low", "severity_explanation": "y",
+                 "location": {"file": "app/removed.rs", "line": 5, "side": "LEFT"}}
+            ]
+        });
+        drop_unanchored_locations(&mut findings, &idx, &vd());
+        assert!(findings["findings"][0].get("location").is_some());
+    }
+
+    #[test]
+    fn keeps_later_hunk_after_header_like_body_lines() {
+        let idx = diff_index::DiffIndex::from_unified_diff(HEADER_LIKE_BODY_DIFF);
+        let mut findings = json!({
+            "findings": [
+                {"problem": "x", "severity": "Low", "severity_explanation": "y",
+                 "location": {"file": "scripts/example.txt", "line": 11, "side": "RIGHT"}}
+            ]
+        });
+        drop_unanchored_locations(&mut findings, &idx, &vd());
+        assert!(findings["findings"][0].get("location").is_some());
     }
 
     #[test]

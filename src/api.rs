@@ -4257,7 +4257,11 @@ mention each finding with severity, keep a professional tone, no markdown headin
 #[derive(Debug, Clone)]
 pub struct DiffHunk {
     /// New-file path (`+++ b/<path>` minus the `b/` prefix when present).
+    /// This is also used as the primary path for context lines and RIGHT-side anchoring.
     pub file: String,
+    /// Left-file path (`--- a/<path>` minus the `a/` prefix when present).
+    /// LEFT-side anchoring uses this when present.
+    pub old_file: Option<String>,
     /// Header line, e.g. `@@ -100,7 +100,7 @@ static void foo(...)`.
     pub header: String,
     /// Inclusive 1-based old-file start and length (0 length = pure insertion).
@@ -4276,44 +4280,56 @@ pub struct DiffHunk {
 /// body lines were captured.
 pub fn collect_diff_hunks(patch: &str) -> Vec<DiffHunk> {
     let mut hunks: Vec<DiffHunk> = Vec::new();
-    let mut current_file: Option<String> = None;
+    let mut current_old_file: Option<String> = None;
+    let mut current_new_file: Option<String> = None;
     let mut iter = patch.lines().peekable();
     while let Some(line) = iter.next() {
+        if line.starts_with("diff --git ") {
+            current_old_file = None;
+            current_new_file = None;
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("+++ ") {
-            // `+++ b/path/to/file` or `+++ path/to/file` or `+++ /dev/null`
-            let path = rest.split_whitespace().next().unwrap_or("");
-            let path = path.strip_prefix("b/").unwrap_or(path);
-            current_file = if path == "/dev/null" {
-                None
-            } else {
-                Some(path.to_string())
-            };
+            current_new_file = parse_diff_path(rest);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("--- ") {
+            current_old_file = parse_diff_path(rest);
             continue;
         }
         if let Some(parsed) = parse_hunk_header(line) {
-            let Some(file) = current_file.clone() else {
+            let Some(file) = current_new_file.clone().or(current_old_file.clone()) else {
                 continue;
             };
             let (old_start, old_len, new_start, new_len) = parsed;
             let mut text = String::from(line);
             text.push('\n');
-            // Consume hunk body until the next non-body line (peek so we don't swallow it).
+            let mut old_remaining = old_len;
+            let mut new_remaining = new_len;
             while let Some(peek) = iter.peek() {
-                let first = peek.as_bytes().first().copied();
-                let is_body = matches!(first, Some(b' ') | Some(b'+') | Some(b'-') | Some(b'\\'));
-                if !is_body {
+                let Some(kind) = classify_hunk_body_line(peek, old_remaining, new_remaining) else {
                     break;
-                }
-                // A `+++ ` or `--- ` file header starts with `+`/`-` too - stop in that case.
-                if peek.starts_with("+++ ") || peek.starts_with("--- ") {
-                    break;
-                }
+                };
                 let body = iter.next().unwrap();
                 text.push_str(body);
                 text.push('\n');
+                match kind {
+                    HunkBodyLine::Addition => {
+                        new_remaining -= 1;
+                    }
+                    HunkBodyLine::Deletion => {
+                        old_remaining -= 1;
+                    }
+                    HunkBodyLine::Context => {
+                        old_remaining -= 1;
+                        new_remaining -= 1;
+                    }
+                    HunkBodyLine::NoNewline => {}
+                }
             }
             hunks.push(DiffHunk {
                 file,
+                old_file: current_old_file.clone(),
                 header: line.to_string(),
                 old_start,
                 old_len,
@@ -4324,6 +4340,29 @@ pub fn collect_diff_hunks(patch: &str) -> Vec<DiffHunk> {
         }
     }
     hunks
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HunkBodyLine {
+    Addition,
+    Deletion,
+    Context,
+    NoNewline,
+}
+
+fn classify_hunk_body_line(
+    line: &str,
+    old_remaining: u32,
+    new_remaining: u32,
+) -> Option<HunkBodyLine> {
+    match line.as_bytes().first().copied() {
+        Some(b'+') if new_remaining > 0 => Some(HunkBodyLine::Addition),
+        Some(b'-') if old_remaining > 0 => Some(HunkBodyLine::Deletion),
+        Some(b' ') if old_remaining > 0 && new_remaining > 0 => Some(HunkBodyLine::Context),
+        None if old_remaining > 0 && new_remaining > 0 => Some(HunkBodyLine::Context),
+        Some(b'\\') => Some(HunkBodyLine::NoNewline),
+        _ => None,
+    }
 }
 
 /// Parse `@@ -A[,B] +C[,D] @@ ...` into `(A, B, C, D)`. B and D default to 1 when omitted.
@@ -4349,6 +4388,19 @@ fn parse_range(s: &str) -> Option<(u32, u32)> {
     Some((start, len))
 }
 
+fn parse_diff_path(rest: &str) -> Option<String> {
+    let path = rest.split_whitespace().next().unwrap_or("");
+    let path = path
+        .strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path);
+    if path.is_empty() || path == "/dev/null" {
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
 /// Find the hunk that owns `(file, line)` on `side` (`"LEFT"` = old file, anything else = new
 /// file). Empty ranges (pure insertions / deletions) match the line where they were inserted.
 pub fn find_hunk_for_location<'a>(
@@ -4359,7 +4411,12 @@ pub fn find_hunk_for_location<'a>(
 ) -> Option<&'a DiffHunk> {
     let want_left = side.eq_ignore_ascii_case("LEFT");
     hunks.iter().find(|h| {
-        if h.file != file {
+        let hunk_file = if want_left {
+            h.old_file.as_deref().unwrap_or(&h.file)
+        } else {
+            &h.file
+        };
+        if hunk_file != file {
             return false;
         }
         let (start, len) = if want_left {
@@ -5769,11 +5826,66 @@ index 111..222 100644
  \treturn;
 ";
 
+    const RENAME_PATCH: &str = "\
+diff --git a/app/main.rs b/app/main_renamed.rs
+similarity index 89%
+rename from app/main.rs
+rename to app/main_renamed.rs
+--- a/app/main.rs
++++ b/app/main_renamed.rs
+@@ -10,4 +10,4 @@ main flow
+ \ttrace!(\"before\");
+-\tprintln!(\"old behavior\");
++\tprintln!(\"new behavior\");
+ \ttrace!(\"after\");
+";
+
+    const DELETE_PATCH: &str = "\
+diff --git a/app/removed.rs b/app/removed.rs
+deleted file mode 100644
+index 8f3..000
+--- a/app/removed.rs
++++ /dev/null
+@@ -5,2 +0,0 @@
+-\tconsole!(\"remove me\");
+-\tcleanup();
+";
+
+    const HEADER_LIKE_BODY_PATCH: &str = "\
+diff --git a/scripts/example.txt b/scripts/example.txt
+index 123..456 100644
+--- a/scripts/example.txt
++++ b/scripts/example.txt
+@@ -1,3 +1,4 @@
+ alpha
+--- looks like a header but is body
++++ still body, not a header
++tail line that must stay in the hunk
+ omega
+@@ -10,1 +11,1 @@
+-old second line
++new second line
+";
+
+    const MULTI_FILE_UNIFIED_PATCH: &str = "\
+--- a/foo.c
++++ b/foo.c
+@@ -1,1 +1,1 @@
+-old
++new
+--- a/bar.c
++++ b/bar.c
+@@ -10,1 +10,1 @@
+-old_bar
++new_bar
+";
+
     #[test]
     fn collect_diff_hunks_parses_two_files() {
         let hunks = collect_diff_hunks(SAMPLE_PATCH);
         assert_eq!(hunks.len(), 2);
         assert_eq!(hunks[0].file, "foo.c");
+        assert_eq!(hunks[0].old_file.as_deref(), Some("foo.c"));
         assert_eq!(hunks[0].old_start, 100);
         assert_eq!(hunks[0].new_start, 100);
         assert_eq!(hunks[0].old_len, 5);
@@ -5781,6 +5893,7 @@ index 111..222 100644
         assert!(hunks[0].text.starts_with("@@ -100,5 +100,5 @@"));
         assert!(hunks[0].text.contains("+\tint new = 0;"));
         assert_eq!(hunks[1].file, "bar.c");
+        assert_eq!(hunks[1].old_file.as_deref(), Some("bar.c"));
         assert_eq!(hunks[1].new_start, 10);
     }
 
@@ -5797,6 +5910,55 @@ index 111..222 100644
         assert!(find_hunk_for_location(&hunks, "baz.c", 100, "RIGHT").is_none());
         // Line outside range - no match.
         assert!(find_hunk_for_location(&hunks, "foo.c", 200, "RIGHT").is_none());
+    }
+
+    #[test]
+    fn collect_diff_hunks_tracks_pre_and_post_paths_for_rename() {
+        let hunks = collect_diff_hunks(RENAME_PATCH);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].file, "app/main_renamed.rs");
+        assert_eq!(hunks[0].old_file.as_deref(), Some("app/main.rs"));
+        let left = find_hunk_for_location(&hunks, "app/main.rs", 10, "LEFT").unwrap();
+        assert!(left.header.contains("-10,4"));
+        let right = find_hunk_for_location(&hunks, "app/main_renamed.rs", 10, "RIGHT").unwrap();
+        assert!(right.header.contains("+10,4"));
+    }
+
+    #[test]
+    fn collect_diff_hunks_tracks_deleted_file_left_path() {
+        let hunks = collect_diff_hunks(DELETE_PATCH);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].file, "app/removed.rs");
+        assert_eq!(hunks[0].old_file.as_deref(), Some("app/removed.rs"));
+        let left = find_hunk_for_location(&hunks, "app/removed.rs", 5, "LEFT").unwrap();
+        assert!(left.header.contains("-5,2"));
+        assert!(find_hunk_for_location(&hunks, "app/removed.rs", 5, "RIGHT").is_none());
+    }
+
+    #[test]
+    fn collect_diff_hunks_keeps_header_like_body_lines_inside_hunk_text() {
+        let hunks = collect_diff_hunks(HEADER_LIKE_BODY_PATCH);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].file, "scripts/example.txt");
+        assert_eq!(hunks[1].file, "scripts/example.txt");
+        assert!(hunks[0]
+            .text
+            .contains("--- looks like a header but is body"));
+        assert!(hunks[0].text.contains("+++ still body, not a header"));
+        assert!(hunks[0]
+            .text
+            .contains("+tail line that must stay in the hunk"));
+        assert!(hunks[1].text.contains("+new second line"));
+    }
+
+    #[test]
+    fn collect_diff_hunks_respects_declared_ranges_without_diff_git_headers() {
+        let hunks = collect_diff_hunks(MULTI_FILE_UNIFIED_PATCH);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].file, "foo.c");
+        assert_eq!(hunks[1].file, "bar.c");
+        assert!(!hunks[0].text.contains("--- a/bar.c"));
+        assert!(hunks[1].text.contains("+new_bar"));
     }
 
     #[test]
@@ -5824,6 +5986,24 @@ index 111..222 100644
         // Second attachment covers finding 3.
         assert_eq!(atts[1].finding_indices, vec![3]);
         assert_eq!(atts[1].hunk.file, "bar.c");
+    }
+
+    #[test]
+    fn collect_finding_hunks_keeps_later_file_context_after_header_like_body_lines() {
+        let findings = json!({"findings":[
+            {"problem":"x","severity":"Low","severity_explanation":"y",
+             "location":{"file":"scripts/example.txt","line":11,"side":"RIGHT"}},
+        ]});
+        let atts = collect_finding_hunks(&findings, HEADER_LIKE_BODY_PATCH);
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].finding_indices, vec![1]);
+        assert_eq!(atts[0].hunk.file, "scripts/example.txt");
+        assert_eq!(
+            atts[0].hunk.old_file.as_deref(),
+            Some("scripts/example.txt")
+        );
+        assert!(atts[0].hunk.header.contains("+11,1"));
+        assert!(atts[0].hunk.text.contains("+new second line"));
     }
 
     #[test]

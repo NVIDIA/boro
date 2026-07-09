@@ -43,77 +43,73 @@ impl DiffIndex {
     /// Parse a unified diff (output of `git show --no-color` or `git diff`) and index every
     /// hunk line. Robust against:
     /// - extended header lines (`diff --git`, `index ...`, `similarity index ...`, etc.)
-    /// - `--- a/<path>` / `+++ b/<path>` path lines (the `b/` path wins, since findings
-    ///   reference the post-image file)
-    /// - new files (`+++ /dev/null` is ignored; only the live side gets indexed)
-    /// - multiple files in one diff
-    /// - lines that do not match `+`, `-`, ` ` (treated as out-of-hunk and ignored)
+    /// - separate `--- old/path` / `+++ new/path` names for renames and deleted files
+    /// - header-like payload lines (`--- body`, `+++ body`) by consuming the exact `@@` ranges
+    /// - new files or deleted files where only one side has a live path
+    /// - multiple files in one diff, including traditional unified diffs without `diff --git`
     pub fn from_unified_diff(diff: &str) -> Self {
         let mut idx = Self::new();
-        let mut path: Option<String> = None;
-        let mut old_line: u64 = 0;
-        let mut new_line: u64 = 0;
-        let mut in_hunk = false;
+        let mut old_path: Option<String> = None;
+        let mut new_path: Option<String> = None;
+        let mut iter = diff.lines().peekable();
 
-        for line in diff.lines() {
-            if let Some(rest) = line.strip_prefix("+++ ") {
-                // +++ b/path  OR  +++ /dev/null
-                path = parse_diff_path(rest);
-                in_hunk = false;
-                continue;
-            }
-            if line.starts_with("--- ") {
-                // Ignore - +++ wins. Reset hunk state.
-                in_hunk = false;
-                continue;
-            }
+        while let Some(line) = iter.next() {
             if line.starts_with("diff --git ") {
-                // New file boundary. Path will be set by the upcoming `+++` line.
-                path = None;
-                in_hunk = false;
+                old_path = None;
+                new_path = None;
                 continue;
             }
-            if let Some(rest) = line.strip_prefix("@@ ") {
-                if let Some((o, n)) = parse_hunk_header(rest) {
-                    old_line = o;
-                    new_line = n;
-                    in_hunk = true;
-                } else {
-                    in_hunk = false;
-                }
+            if let Some(rest) = line.strip_prefix("--- ") {
+                old_path = parse_diff_path(rest);
                 continue;
             }
-            if !in_hunk {
+            if let Some(rest) = line.strip_prefix("+++ ") {
+                new_path = parse_diff_path(rest);
                 continue;
             }
-            let Some(path_str) = path.as_deref() else {
+            let Some((mut old_line, mut old_remaining, mut new_line, mut new_remaining)) =
+                parse_hunk_header(line)
+            else {
                 continue;
             };
-            let first = line.chars().next();
-            match first {
-                Some('+') => {
-                    idx.insert(path_str, new_line, Side::Right, &line[1..]);
-                    new_line += 1;
-                }
-                Some('-') => {
-                    idx.insert(path_str, old_line, Side::Left, &line[1..]);
-                    old_line += 1;
-                }
-                Some(' ') | None => {
-                    // Context (a leading space) or a bare empty line, which `git diff` emits for
-                    // an entirely blank context line. Index under both sides.
-                    let text = line.strip_prefix(' ').unwrap_or(line);
-                    idx.insert(path_str, new_line, Side::Right, text);
-                    idx.insert(path_str, old_line, Side::Left, text);
-                    old_line += 1;
-                    new_line += 1;
-                }
-                Some('\\') => {
-                    // "\ No newline at end of file" - no counter update.
-                }
-                _ => {
-                    // Anything else terminates the current hunk; wait for the next `@@`.
-                    in_hunk = false;
+
+            while let Some(peek) = iter.peek() {
+                let Some(kind) = classify_hunk_body_line(peek, old_remaining, new_remaining) else {
+                    break;
+                };
+                let body = iter.next().unwrap();
+                match kind {
+                    HunkBodyLine::Addition => {
+                        if let Some(path) = new_path.as_deref() {
+                            idx.insert(path, new_line, Side::Right, &body[1..]);
+                        }
+                        new_line += 1;
+                        new_remaining -= 1;
+                    }
+                    HunkBodyLine::Deletion => {
+                        if let Some(path) = old_path.as_deref() {
+                            idx.insert(path, old_line, Side::Left, &body[1..]);
+                        }
+                        old_line += 1;
+                        old_remaining -= 1;
+                    }
+                    HunkBodyLine::Context => {
+                        let text = body.strip_prefix(' ').unwrap_or(body);
+                        if let Some(path) = new_path.as_deref() {
+                            idx.insert(path, new_line, Side::Right, text);
+                        }
+                        if let Some(path) = old_path.as_deref() {
+                            idx.insert(path, old_line, Side::Left, text);
+                        }
+                        old_line += 1;
+                        new_line += 1;
+                        old_remaining -= 1;
+                        new_remaining -= 1;
+                    }
+                    HunkBodyLine::NoNewline => {
+                        // "\ No newline at end of file" belongs to the current hunk but does
+                        // not consume an old/new line number.
+                    }
                 }
             }
         }
@@ -157,27 +153,61 @@ fn contains_c_identifier(text: &str, ident: &str) -> bool {
     })
 }
 
-/// Parse a unified-diff hunk header tail after `@@ `: `-OLD[,OCNT] +NEW[,NCNT] @@ context`.
-/// Returns `(old_start, new_start)` or `None` if the header is malformed.
-fn parse_hunk_header(rest: &str) -> Option<(u64, u64)> {
-    // Format: "-O[,C] +N[,C] @@ ..."
-    let mut parts = rest.split_whitespace();
-    let old_tok = parts.next()?;
-    let new_tok = parts.next()?;
-    let old_num = old_tok.strip_prefix('-')?.split(',').next()?;
-    let new_num = new_tok.strip_prefix('+')?.split(',').next()?;
-    Some((old_num.parse().ok()?, new_num.parse().ok()?))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HunkBodyLine {
+    Addition,
+    Deletion,
+    Context,
+    NoNewline,
 }
 
-/// Extract the post-image path from a `+++ b/<path>` line. Returns `None` for `/dev/null`
-/// (file deleted) so we don't index against a sentinel name. Tolerates the absence of the
-/// `b/` prefix (some diff producers omit it).
+fn classify_hunk_body_line(
+    line: &str,
+    old_remaining: u64,
+    new_remaining: u64,
+) -> Option<HunkBodyLine> {
+    match line.as_bytes().first().copied() {
+        Some(b'+') if new_remaining > 0 => Some(HunkBodyLine::Addition),
+        Some(b'-') if old_remaining > 0 => Some(HunkBodyLine::Deletion),
+        Some(b' ') if old_remaining > 0 && new_remaining > 0 => Some(HunkBodyLine::Context),
+        None if old_remaining > 0 && new_remaining > 0 => Some(HunkBodyLine::Context),
+        Some(b'\\') => Some(HunkBodyLine::NoNewline),
+        _ => None,
+    }
+}
+
+/// Parse `@@ -A[,B] +C[,D] @@ ...` into `(A, B, C, D)`. B and D default to 1 when omitted.
+fn parse_hunk_header(line: &str) -> Option<(u64, u64, u64, u64)> {
+    let rest = line.strip_prefix("@@ ")?;
+    let mut parts = rest.splitn(3, ' ');
+    let old = parts.next()?.strip_prefix('-')?;
+    let new = parts.next()?.strip_prefix('+')?;
+    parts.next()?;
+    let (old_start, old_len) = parse_range(old)?;
+    let (new_start, new_len) = parse_range(new)?;
+    Some((old_start, old_len, new_start, new_len))
+}
+
+fn parse_range(s: &str) -> Option<(u64, u64)> {
+    let mut it = s.splitn(2, ',');
+    let start = it.next()?.parse().ok()?;
+    let len = match it.next() {
+        Some(n) => n.parse().ok()?,
+        None => 1,
+    };
+    Some((start, len))
+}
+
+/// Extract the live path from a `---` or `+++` header. Returns `None` for `/dev/null`.
 fn parse_diff_path(rest: &str) -> Option<String> {
     let raw = rest.trim().split('\t').next()?.trim();
     if raw == "/dev/null" {
         return None;
     }
-    let cleaned = raw.strip_prefix("b/").unwrap_or(raw);
+    let cleaned = raw
+        .strip_prefix("a/")
+        .or_else(|| raw.strip_prefix("b/"))
+        .unwrap_or(raw);
     if cleaned.is_empty() {
         None
     } else {
@@ -202,6 +232,60 @@ index 1111111..2222222 100644
 +added_two
  ctx3
  ctx4
+";
+
+    const RENAME_DIFF: &str = "\
+diff --git a/app/main.rs b/app/main_renamed.rs
+similarity index 89%
+rename from app/main.rs
+rename to app/main_renamed.rs
+--- a/app/main.rs
++++ b/app/main_renamed.rs
+@@ -10,4 +10,4 @@ main flow
+ trace!(\"before\");
+-println!(\"old behavior\");
++println!(\"new behavior\");
+ trace!(\"after\");
+";
+
+    const DELETE_DIFF: &str = "\
+diff --git a/app/removed.rs b/app/removed.rs
+deleted file mode 100644
+index 8f3..000
+--- a/app/removed.rs
++++ /dev/null
+@@ -5,2 +0,0 @@
+-console!(\"remove me\");
+-cleanup();
+";
+
+    const HEADER_LIKE_BODY_DIFF: &str = "\
+diff --git a/scripts/example.txt b/scripts/example.txt
+index 123..456 100644
+--- a/scripts/example.txt
++++ b/scripts/example.txt
+@@ -1,3 +1,4 @@
+ alpha
+--- looks like a header but is body
++++ still body, not a header
++tail line that must stay in the hunk
+ omega
+@@ -10,1 +11,1 @@
+-old second line
++new second line
+";
+
+    const MULTI_FILE_UNIFIED_DIFF: &str = "\
+--- a/foo.c
++++ b/foo.c
+@@ -1,1 +1,1 @@
+-old
++new
+--- a/bar.c
++++ b/bar.c
+@@ -10,1 +10,1 @@
+-old_bar
++new_bar
 ";
 
     #[test]
@@ -282,21 +366,32 @@ new file mode 100644
     }
 
     #[test]
-    fn deleted_file_dev_null_right_drops_path() {
-        let diff = "\
-diff --git a/gone.c b/gone.c
-deleted file mode 100644
---- a/gone.c
-+++ /dev/null
-@@ -1,2 +0,0 @@
--line1
--line2
-";
-        let idx = DiffIndex::from_unified_diff(diff);
-        // We don't index the deletion side (the post-image path is /dev/null).
-        // The viewer's b-side path defaulting means findings on a deleted file are
-        // commit-level anyway, so this is fine.
-        assert!(!idx.contains("gone.c", 1, Side::Left));
+    fn rename_indexes_left_and_right_paths_separately() {
+        let idx = DiffIndex::from_unified_diff(RENAME_DIFF);
+        assert!(idx.contains("app/main.rs", 11, Side::Left));
+        assert!(idx.contains("app/main_renamed.rs", 11, Side::Right));
+    }
+
+    #[test]
+    fn deleted_file_indexes_left_side_under_old_path() {
+        let idx = DiffIndex::from_unified_diff(DELETE_DIFF);
+        assert!(idx.contains("app/removed.rs", 5, Side::Left));
+        assert!(!idx.contains("app/removed.rs", 5, Side::Right));
+    }
+
+    #[test]
+    fn header_like_hunk_body_lines_do_not_break_later_hunks() {
+        let idx = DiffIndex::from_unified_diff(HEADER_LIKE_BODY_DIFF);
+        assert!(idx.contains("scripts/example.txt", 11, Side::Right));
+        assert!(idx.contains("scripts/example.txt", 10, Side::Left));
+    }
+
+    #[test]
+    fn declared_hunk_counts_keep_traditional_multifile_diffs_separate() {
+        let idx = DiffIndex::from_unified_diff(MULTI_FILE_UNIFIED_DIFF);
+        assert!(idx.contains("foo.c", 1, Side::Left));
+        assert!(idx.contains("bar.c", 10, Side::Right));
+        assert!(!idx.contains("bar.c", 1, Side::Right));
     }
 
     #[test]
