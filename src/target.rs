@@ -41,6 +41,14 @@ pub trait TargetSpec: Sync {
     fn stage_instructions(&self, _stage: u8) -> Option<&'static str> {
         None
     }
+
+    /// Target-specific addendum appended to the shared, domain-neutral
+    /// findings-validation system prompt. `None` keeps the neutral prompt as-is;
+    /// a target returns `Some` to add domain-specific linkage/build rules (e.g.
+    /// the kernel's Kbuild ownership and loadable-module `EXPORT_SYMBOL` rules).
+    fn validation_findings_addendum(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 pub fn spec(target: ReviewTarget) -> &'static dyn TargetSpec {
@@ -125,6 +133,17 @@ pub fn stage_instructions(target: ReviewTarget, stage: u8) -> Option<&'static st
     spec(target).stage_instructions(stage)
 }
 
+/// Findings-validation system prompt for `target`: the shared domain-neutral
+/// base ([`crate::api::SYSTEM_REVIEW_VALIDATION_FINDINGS`]) plus any
+/// target-specific linkage/build addendum.
+pub fn review_validation_findings(target: ReviewTarget) -> String {
+    let base = crate::api::SYSTEM_REVIEW_VALIDATION_FINDINGS;
+    match spec(target).validation_findings_addendum() {
+        Some(addendum) => format!("{}\n\n{}", base.trim_end(), addendum.trim()),
+        None => base.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +162,33 @@ mod tests {
         assert!(quick_summary_system_prompt(ReviewTarget::Kernel).contains("Linux kernel"));
         assert!(quick_summary_system_prompt(ReviewTarget::Qemu).contains("QEMU"));
         assert!(quick_summary_system_prompt(ReviewTarget::Libvirt).contains("libvirt"));
+    }
+
+    #[test]
+    fn findings_validator_is_domain_neutral_except_kernel() {
+        // The shared base must not carry kernel-only linkage jargon; those
+        // concepts now live in the kernel-specific addendum.
+        let base = crate::api::SYSTEM_REVIEW_VALIDATION_FINDINGS;
+        for tok in ["Kbuild", "EXPORT_SYMBOL", "loadable-module"] {
+            assert!(
+                !base.contains(tok),
+                "shared findings validator leaked kernel token: {tok}"
+            );
+        }
+
+        // A kernel review re-attaches the kernel linkage rules via its addendum.
+        let kernel = review_validation_findings(ReviewTarget::Kernel);
+        assert!(kernel.contains("Kbuild"));
+        assert!(kernel.contains("EXPORT_SYMBOL"));
+        assert!(kernel.contains("loadable-module"));
+
+        // Non-kernel targets get exactly the domain-neutral base, no kernel rules.
+        for t in [ReviewTarget::Qemu, ReviewTarget::Libvirt] {
+            let prompt = review_validation_findings(t);
+            assert_eq!(
+                prompt, base,
+                "non-kernel findings validator must equal the shared base"
+            );
+        }
     }
 }
