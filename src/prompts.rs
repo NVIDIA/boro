@@ -70,8 +70,8 @@ pub fn build_reference_context(
     let mut used = 0usize;
     let mut loaded_subsystem: HashSet<String> = HashSet::new();
 
-    let single_pass = include_str!("../resources/fast-review.md");
-    parts.push(format!("# boro instructions\n{single_pass}\n"));
+    let one_shot = crate::target::one_shot_review(target);
+    parts.push(format!("# boro instructions\n{one_shot}\n"));
     used += parts.last().map(|s| s.len()).unwrap_or(0);
 
     let local_reference = target::local_reference(target);
@@ -209,8 +209,10 @@ pub fn load_consolidation_extras(target: ReviewTarget, max_each: usize) -> Resul
 /// Short distilled false-positive guide for specialist stages. Embedded at build time
 /// (not read from `third_party/`) so it is reviewable and deterministic; the consolidator
 /// continues to receive the full upstream guide via [`load_consolidation_extras`].
-pub fn load_false_positive_digest() -> String {
-    include_str!("../resources/false-positive-digest.md").to_string()
+/// Target-aware: non-kernel targets get a domain-specific digest so the
+/// specialist stages are not seeded with kernel-only false-positive examples.
+pub fn load_false_positive_digest(target: ReviewTarget) -> String {
+    crate::target::false_positive_digest(target).to_string()
 }
 
 /// `subsystem/subsystem.md` index for Phase 0 (capped).
@@ -239,7 +241,7 @@ mod tests {
 
     #[test]
     fn false_positive_digest_requires_complete_macro_expansion() {
-        let digest = load_false_positive_digest();
+        let digest = load_false_positive_digest(ReviewTarget::Kernel);
         let normalized = digest.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(normalized.contains("complete invocation chain token by token"));
         assert!(normalized.contains(
@@ -330,6 +332,108 @@ mod tests {
                 "{want} not embedded"
             );
         }
+    }
+
+    #[test]
+    fn embedded_libvirt_prompts_are_present() {
+        for rel in [
+            "technical-patterns.md",
+            "callstack.md",
+            "false-positive-guide.md",
+            "severity.md",
+            "inline-template.md",
+            "coding-style.md",
+            "subsystem/subsystem.md",
+            "subsystem/locking.md",
+        ] {
+            let t = read_prompt_rel(ReviewTarget::Libvirt, rel, 50_000).expect("read");
+            assert!(
+                t.map(|s| s.len() > 200).unwrap_or(false),
+                "libvirt prompt {rel} must be embedded and non-trivial (resources/prompts/libvirt/)"
+            );
+        }
+    }
+
+    #[test]
+    fn libvirt_subsystem_mapping_selects_expected_guides() {
+        let picked = pick_subsystem_files(
+            ReviewTarget::Libvirt,
+            &[
+                "src/qemu/qemu_driver.c".to_string(),
+                "src/conf/domain_conf.c".to_string(),
+                "src/security/security_selinux.c".to_string(),
+            ],
+        );
+        for want in [
+            "subsystem/qemu-driver.md",
+            "subsystem/domain-conf.md",
+            "subsystem/security.md",
+        ] {
+            assert!(picked.contains(&want.to_string()), "missing {want}");
+            assert!(
+                prompt_exists(ReviewTarget::Libvirt, want),
+                "{want} not embedded"
+            );
+        }
+    }
+
+    #[test]
+    fn libvirt_assembled_payload_has_no_kernel_mandates() {
+        // The full libvirt discovery/validation payload — fast-mode one-shot,
+        // every specialist stage body, the FP digest, and the assembled
+        // reference context (core + subsystem guides) — must not carry
+        // kernel-only requirements that contradict libvirt.
+        let mut payload = String::new();
+        payload.push_str(crate::target::one_shot_review(ReviewTarget::Libvirt));
+        payload.push('\n');
+        payload.push_str(&load_false_positive_digest(ReviewTarget::Libvirt));
+        payload.push('\n');
+        for st in 3u8..=8u8 {
+            let body = crate::target::stage_instructions(ReviewTarget::Libvirt, st)
+                .expect("libvirt overrides every specialist stage 3-8");
+            payload.push_str(body);
+            payload.push('\n');
+        }
+        payload.push_str(
+            &build_reference_context(
+                ReviewTarget::Libvirt,
+                &["src/qemu/qemu_driver.c".to_string()],
+                300_000,
+                None,
+                None,
+            )
+            .expect("ctx"),
+        );
+
+        for tok in [
+            "Kconfig",
+            "Kbuild",
+            "CONFIG_",
+            "GFP_",
+            "copy_to_user",
+            "copy_from_user",
+            "kmalloc",
+            "kzalloc",
+            "rcu_read_lock",
+            "qemuDomainObjBeginJob",
+            "QEMU_JOB_MODIFY",
+            "virStrToUll",
+        ] {
+            assert!(
+                !payload.contains(tok),
+                "libvirt assembled payload leaked kernel/stale token: {tok}"
+            );
+        }
+
+        // Positive signals that the libvirt-specific content is actually wired.
+        assert!(
+            payload.contains("virDomainObjBeginJob"),
+            "current job API missing"
+        );
+        assert!(
+            payload.contains("WITH_"),
+            "libvirt build-portability guidance missing"
+        );
     }
 
     #[test]

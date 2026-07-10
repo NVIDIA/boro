@@ -82,6 +82,8 @@ enum TargetArg {
     Kernel,
     /// QEMU.
     Qemu,
+    /// libvirt.
+    Libvirt,
 }
 
 impl TargetArg {
@@ -89,6 +91,7 @@ impl TargetArg {
         match self {
             TargetArg::Kernel => config::ReviewTarget::Kernel,
             TargetArg::Qemu => config::ReviewTarget::Qemu,
+            TargetArg::Libvirt => config::ReviewTarget::Libvirt,
         }
     }
 }
@@ -536,11 +539,25 @@ async fn commit_review_inner(
             }
         };
         let lore_cfg = lore::LoreConfig::from_env();
-        let lore_active = lore_cfg.enabled && lore::lei_available();
-        if lore_cfg.enabled && !lore_active {
+        // Gate the lore.kernel.org query to targets whose lists live there (mirrors
+        // run_two_pass): the kernel lists and qemu-devel are both on lore.kernel.org,
+        // but libvirt/virt-manager are not, so those subjects must not pull unrelated
+        // list traffic into the review. The upstream-branch (master repo) lookup below
+        // is a local git query and stays enabled for every target.
+        let lore_supported = matches!(
+            target,
+            config::ReviewTarget::Kernel | config::ReviewTarget::Qemu
+        );
+        let lore_active = lore_supported && lore_cfg.enabled && lore::lei_available();
+        if lore_supported && lore_cfg.enabled && !lore::lei_available() {
             v(
                 vd,
                 "upstream-followup stage: `lei` not found on $PATH; continuing with the upstream branch lookup only",
+            );
+        } else if !lore_supported && lore_cfg.enabled {
+            v(
+                vd,
+                "upstream-followup (lore.kernel.org) stage skipped: only supported for --target kernel/qemu",
             );
         }
         let followup = if lore_active || master_repo.is_some() {
@@ -3636,12 +3653,34 @@ async fn run_two_pass(
 
     let subsystem_index = prompts::load_subsystem_index(target, 120_000)?;
     let lore_cfg = lore::LoreConfig::from_env();
-    let lore_active = lore_cfg.enabled && lore::lei_available();
-    if lore_cfg.enabled && !lore_active {
+    // The upstream-followup stage queries lore.kernel.org via `lei` (see
+    // resources/stage-00b-upstream-followup.md). Both the kernel lists and
+    // qemu-devel are archived there (https://lore.kernel.org/qemu-devel/), so the
+    // stage is meaningful for kernel and QEMU; gate it to those targets so a
+    // libvirt/virt-manager subject can't pull unrelated list traffic into the
+    // review context.
+    //
+    // libvirt and virt-manager are intentionally NOT wired here: `lei` needs a
+    // public-inbox index, but libvirt development (devel@lists.libvirt.org) is
+    // archived on HyperKitty/Mailman3 (https://lists.libvirt.org/archives/) with
+    // no public-inbox endpoint, and virt-manager has no mailing-list archive at
+    // all. Either would need its own fetcher, follow-up prompt, and citation
+    // URLs. Tracked as a follow-up; for now those targets skip the stage.
+    let lore_supported = matches!(
+        target,
+        config::ReviewTarget::Kernel | config::ReviewTarget::Qemu
+    );
+    let lore_active = lore_supported && lore_cfg.enabled && lore::lei_available();
+    if lore_supported && lore_cfg.enabled && !lore::lei_available() {
         v(
             vd,
             "upstream-followup stage skipped for this run: `lei` not found on $PATH \
              (install public-inbox to enable lore.kernel.org retrieval)",
+        );
+    } else if !lore_supported && lore_cfg.enabled {
+        v(
+            vd,
+            "upstream-followup (lore.kernel.org) stage skipped: only supported for --target kernel/qemu",
         );
     }
     // Display total = highest per-commit table index. Run-wide validation and LKML rendering use
@@ -3901,7 +3940,7 @@ async fn run_two_pass(
             ),
         );
     }
-    let fp_digest = prompts::load_false_positive_digest();
+    let fp_digest = prompts::load_false_positive_digest(target);
     v(
         vd,
         format!(
@@ -3912,8 +3951,13 @@ async fn run_two_pass(
     let mut baseline_challenges: Vec<Value> = Vec::new();
 
     for st in 3u8..=8u8 {
-        let Some(instr) = stages::instruction_body(st) else {
-            continue;
+        // Prefer a target-specific stage body; fall back to the shared kernel
+        // stage prompt when the target does not override it.
+        let instr = match crate::target::stage_instructions(target, st)
+            .or_else(|| stages::instruction_body(st))
+        {
+            Some(instr) => instr,
+            None => continue,
         };
         // Stage 8 (comment / code consistency) is comment-vs-code only - if the
         // diff added or removed no comment lines there is nothing to audit and

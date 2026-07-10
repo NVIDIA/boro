@@ -6,6 +6,7 @@ use rust_embed::EmbeddedFile;
 use crate::config::ReviewTarget;
 
 pub mod kernel;
+pub mod libvirt;
 pub mod qemu;
 
 pub trait TargetSpec: Sync {
@@ -19,12 +20,34 @@ pub trait TargetSpec: Sync {
     fn phase0_system_prompt(&self) -> &'static str;
     fn lkml_system_prompt(&self) -> &'static str;
     fn quick_summary_system_prompt(&self) -> &'static str;
+
+    /// Single-pass ("fast" mode) review instructions. Defaults to the kernel
+    /// corpus; non-kernel targets override with a domain-appropriate variant so
+    /// the model is not handed kernel-only mandates (Kconfig/Kbuild, GFP,
+    /// RCU, copy_to_user, DMA).
+    fn one_shot_review(&self) -> &'static str {
+        include_str!("../resources/fast-review.md")
+    }
+
+    /// Distilled false-positive digest injected into the specialist stages.
+    /// Defaults to the kernel corpus; non-kernel targets override.
+    fn false_positive_digest(&self) -> &'static str {
+        include_str!("../resources/false-positive-digest.md")
+    }
+
+    /// Per-stage specialist instruction body (stages 3-8). `None` means "use the
+    /// shared kernel stage prompt"; a target returns `Some` to supply its own
+    /// domain-specific variant.
+    fn stage_instructions(&self, _stage: u8) -> Option<&'static str> {
+        None
+    }
 }
 
 pub fn spec(target: ReviewTarget) -> &'static dyn TargetSpec {
     match target {
         ReviewTarget::Kernel => &kernel::TARGET,
         ReviewTarget::Qemu => &qemu::TARGET,
+        ReviewTarget::Libvirt => &libvirt::TARGET,
     }
 }
 
@@ -88,6 +111,20 @@ pub fn quick_summary_system_prompt(target: ReviewTarget) -> &'static str {
     spec(target).quick_summary_system_prompt()
 }
 
+pub fn one_shot_review(target: ReviewTarget) -> &'static str {
+    spec(target).one_shot_review()
+}
+
+pub fn false_positive_digest(target: ReviewTarget) -> &'static str {
+    spec(target).false_positive_digest()
+}
+
+/// Target-specific specialist stage body, or `None` to fall back to the shared
+/// kernel stage prompt in [`crate::stages::instruction_body`].
+pub fn stage_instructions(target: ReviewTarget, stage: u8) -> Option<&'static str> {
+    spec(target).stage_instructions(stage)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,11 +133,15 @@ mod tests {
     fn target_system_prompts_are_target_specific() {
         assert!(reviewer_system_prompt(ReviewTarget::Kernel).contains("Linux kernel"));
         assert!(reviewer_system_prompt(ReviewTarget::Qemu).contains("QEMU"));
+        assert!(reviewer_system_prompt(ReviewTarget::Libvirt).contains("libvirt"));
         assert!(phase0_system_prompt(ReviewTarget::Kernel).contains("Linux kernel"));
         assert!(phase0_system_prompt(ReviewTarget::Qemu).contains("QEMU"));
+        assert!(phase0_system_prompt(ReviewTarget::Libvirt).contains("libvirt"));
         assert!(lkml_system_prompt(ReviewTarget::Kernel).contains("LKML"));
         assert!(lkml_system_prompt(ReviewTarget::Qemu).contains("qemu-devel"));
+        assert!(lkml_system_prompt(ReviewTarget::Libvirt).contains("devel@lists.libvirt.org"));
         assert!(quick_summary_system_prompt(ReviewTarget::Kernel).contains("Linux kernel"));
         assert!(quick_summary_system_prompt(ReviewTarget::Qemu).contains("QEMU"));
+        assert!(quick_summary_system_prompt(ReviewTarget::Libvirt).contains("libvirt"));
     }
 }

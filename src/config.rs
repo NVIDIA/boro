@@ -44,6 +44,8 @@ pub enum ReviewTarget {
     Kernel,
     /// QEMU (boro-authored prompts under `resources/prompts/qemu/`).
     Qemu,
+    /// libvirt (boro-authored prompts under `resources/prompts/libvirt/`).
+    Libvirt,
 }
 
 impl ReviewTarget {
@@ -51,21 +53,26 @@ impl ReviewTarget {
         match self {
             ReviewTarget::Kernel => "kernel",
             ReviewTarget::Qemu => "qemu",
+            ReviewTarget::Libvirt => "libvirt",
         }
     }
 }
 
-/// Best-effort classification of a source tree as a Linux kernel or QEMU
-/// checkout from unambiguous signature files. Returns `None` when the tree
-/// matches neither (or, defensively, both) — callers should stay silent in that
-/// case rather than guess. Used only to warn on a likely `--target` mismatch.
+/// Best-effort classification of a source tree as a Linux kernel, QEMU or
+/// libvirt checkout from unambiguous signature files. Returns `None` when the
+/// tree matches none (or, defensively, more than one) — callers should stay
+/// silent in that case rather than guess. Used only to warn on a likely
+/// `--target` mismatch.
 pub fn detect_tree_kind(repo: &std::path::Path) -> Option<ReviewTarget> {
     let has = |rel: &str| repo.join(rel).exists();
     let qemu = has("qapi") && has("qemu-options.hx") && has("include/qemu/osdep.h");
     let kernel = has("Kbuild") && has("mm") && has("kernel/sched") && has("include/linux/kernel.h");
-    match (kernel, qemu) {
-        (true, false) => Some(ReviewTarget::Kernel),
-        (false, true) => Some(ReviewTarget::Qemu),
+    let libvirt =
+        has("include/libvirt/libvirt.h") && has("libvirt.spec.in") && has("src/libvirt.c");
+    match (kernel, qemu, libvirt) {
+        (true, false, false) => Some(ReviewTarget::Kernel),
+        (false, true, false) => Some(ReviewTarget::Qemu),
+        (false, false, true) => Some(ReviewTarget::Libvirt),
         _ => None,
     }
 }
@@ -343,6 +350,20 @@ mod tests {
             &["qapi", "qemu-options.hx", "include/qemu/osdep.h"],
         );
         assert_eq!(detect_tree_kind(tmp.path()), Some(ReviewTarget::Qemu));
+    }
+
+    #[test]
+    fn detects_libvirt_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch_all(
+            tmp.path(),
+            &[
+                "include/libvirt/libvirt.h",
+                "libvirt.spec.in",
+                "src/libvirt.c",
+            ],
+        );
+        assert_eq!(detect_tree_kind(tmp.path()), Some(ReviewTarget::Libvirt));
     }
 
     #[test]
