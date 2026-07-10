@@ -213,8 +213,6 @@ backends via `--backend claude|opencode|codex`.
 
 In this mode, boro relies on the agent CLI for credentials, tooling, and
 permissions.
-The Codex backend uses `codex exec --json` with approval prompts disabled
-(`--ask-for-approval never` and `--dangerously-bypass-approvals-and-sandbox`).
 
 ## Use with local Ollama
 
