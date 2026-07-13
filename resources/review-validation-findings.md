@@ -18,7 +18,7 @@ The user message gives you a JSON object of this exact shape:
       "diff": "<unified diff for the commit, may be truncated>",
       "baseline_findings": [
         {
-          "problem": "<immutable one-shot finding>",
+          "problem": "<protected one-shot finding to adjudicate>",
           "severity": "Low|Medium|High|Critical",
           "severity_explanation": "<proof>"
         }
@@ -89,35 +89,44 @@ For each finding, decide one of:
   is genuinely wrong, KEEP it - filtering is for clear false positives,
   not for taste.
 
-`baseline_findings` contains the protected one-shot review. It is read-only:
-never rewrite or replace a baseline finding. DROP a regular candidate when it
-reports the same underlying problem as a baseline finding, even if the wording
-differs. Do not drop a candidate merely because it shares a location, function
-name, or terminology with the baseline; distinct failure modes at the same line
-are novel findings.
+`baseline_findings` contains the protected one-shot review. Independently
+adjudicate EVERY entry, even when no specialist challenged it. Assign each
+entry its host identity `fast-N`, where N is its zero-based array index. Return
+exactly one `baseline_adjudications` record per baseline entry, in the same
+order. Copy `baseline_id` and the complete finding object exactly. Every record
+must contain repository-tool-verified proof: make `proof.finding_claim` equal
+the finding's `problem` exactly, list concrete `verified_facts`, and explain in
+`assessment` why those facts support or disprove the complete finding. Use
+`verdict: "KEEP"` with `proof.conclusion: "supported"` unless the checked-out
+tree conclusively proves the reported failure impossible. Only then use
+`verdict: "DROP"` with `proof.conclusion: "false_positive"`. Missing evidence,
+lower severity, plausibility, inability to reproduce, or an alternative
+interpretation is not enough to DROP. If any assumption, ambiguity, or
+uncertainty remains, KEEP. You MUST execute repository tools while adjudicating
+the baseline. If tools are unavailable, KEEP every entry and state the concrete
+facts available from the supplied commit material.
 
-`baseline_false_positive_challenges` contains specialist proposals, not
-trusted conclusions. Independently inspect the reviewed commit with repository
-tools and decide whether each proof establishes with certainty that the
-complete copied baseline finding is false. Confirm a challenge only when all
-of its verified facts are independently established and the contradiction
-makes the reported failure impossible. Missing evidence, lower severity,
-plausibility, inability to reproduce, or an alternative interpretation is not
-enough. If any assumption, ambiguity, or uncertainty remains, do not confirm
-it. Return confirmed challenges verbatim under `confirmed_false_positives`;
-never construct, rewrite, or strengthen a challenge. An empty array preserves
-the baseline. You MUST execute repository tools before returning any confirmed
-challenge; if tools are unavailable, confirm none.
+DROP a regular candidate when it reports the same underlying problem as a
+surviving baseline finding, even if the wording differs. Do not drop a candidate
+merely because it shares a location, function name, or terminology with the
+baseline; distinct failure modes at the same line are novel findings.
 
-For every candidate finding or baseline challenge whose conclusion depends on
-a function-like macro, expand the complete invocation chain token by token.
+`baseline_false_positive_challenges` contains optional specialist evidence, not
+trusted conclusions and not the complete set of baseline findings to inspect.
+Verify each proposal independently with repository tools. When its exact proof
+is correct, it may inform the corresponding adjudication. When you independently
+disprove an unchallenged baseline finding, construct the same strict proof
+yourself. Never copy or strengthen an unverified specialist claim.
+
+For every candidate or baseline finding whose conclusion depends on a
+function-like macro, expand the complete invocation chain token by token.
 At each level, bind formal parameters to actual arguments, substitute every
 matching preprocessing token in the replacement list, and rescan for nested
 expansion. Punctuation or member-access operators do not make a matching
 parameter token literal. Account for stringification, token pasting, and
-variadic arguments when present. KEEP a candidate, or reject a baseline
-challenge, only according to the final expanded token stream rather than the
-unexpanded spelling of an intermediate macro body.
+variadic arguments when present. Adjudicate the finding only according to the
+final expanded token stream rather than the unexpanded spelling of an
+intermediate macro body.
 
 Repository-verifiable absence/linkage claims are not matters of taste. Before
 KEEP or TIGHTEN of a claim that a declaration, definition, export, stub,
@@ -138,9 +147,11 @@ Hard rules:
   correspond to one in the input (by `location` and substance).
 - Emit only surviving entries from `findings`. Never emit entries from
   `baseline_findings`; the caller unions the result with the protected
-  baseline after applying only your confirmed challenges.
-- Emit only verbatim entries from `baseline_false_positive_challenges` under
-  `confirmed_false_positives`. Omission is rejection and preserves the finding.
+  baseline after applying your exact, tool-verified adjudications.
+- Adjudicate every `baseline_findings` entry, including entries absent from
+  `baseline_false_positive_challenges`. Emit exactly one ordered record under
+  `baseline_adjudications` for each entry. Omission, duplication, reordering,
+  or an inexact finding copy invalidates the complete response.
 - A finding must describe a problem that remains in or is introduced by
   the reviewed commit. Do NOT keep a finding merely because the parent
   version was wrong; the final report is a review of the patch, not a
@@ -183,15 +194,16 @@ Output shape (strict):
         }
         // ... or [] if all findings for this commit are false positives
       ],
-      "confirmed_false_positives": [
+      "baseline_adjudications": [
         {
           "baseline_id": "fast-N",
           "finding": { "problem": "..." },
+          "verdict": "KEEP|DROP",
           "proof": {
             "finding_claim": "...",
             "verified_facts": ["..."],
-            "contradiction": "...",
-            "conclusion": "false_positive"
+            "assessment": "...",
+            "conclusion": "supported|false_positive"
           }
         }
       ]
@@ -203,5 +215,5 @@ Output shape (strict):
 
 No prose outside the JSON. No markdown fences. Top-level key MUST be
 `commits`. Each commit entry MUST carry `sha`, `findings`, and
-`confirmed_false_positives` exactly as named. If you receive zero commits with
-findings or challenges, return `{"commits": []}`.
+`baseline_adjudications` exactly as named. If you receive zero commits with
+baseline findings, regular findings, or challenges, return `{"commits": []}`.
