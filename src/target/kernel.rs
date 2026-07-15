@@ -155,4 +155,10 @@ impl TargetSpec for KernelTarget {
     fn quick_summary_system_prompt(&self) -> &'static str {
         QUICK_SUMMARY_SYSTEM_PROMPT
     }
+
+    fn validation_findings_addendum(&self) -> Option<&'static str> {
+        Some(include_str!(
+            "../../resources/review-validation-findings-kernel.md"
+        ))
+    }
 }

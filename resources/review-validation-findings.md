@@ -122,10 +122,10 @@ unexpanded spelling of an intermediate macro body.
 Repository-verifiable absence/linkage claims are not matters of taste. Before
 KEEP or TIGHTEN of a claim that a declaration, definition, export, stub,
 symbol, or caller is missing, you MUST use repository tools to inspect the
-reviewed commit. Check Kbuild/Makefile ownership and aggregator `#include
-"*.c"` files for linkage claims. `EXPORT_SYMBOL*()` is only required across a
-loadable-module boundary, not between built-in objects or within one textual
-translation unit. If the claim cannot be verified, DROP it. The runtime will
+reviewed commit. Verify the claim against the project's build system and any
+aggregator sources that textually include one translation unit into another
+before treating a symbol as unlinked, unexported, or unreferenced. If the claim
+cannot be verified, DROP it. The runtime will
 reject a sensitive non-empty result when no repository tool was executed.
 Validation may cover multiple commits while repository search tools see the
 main worktree's current HEAD. For commit-specific evidence, use `git_show` with

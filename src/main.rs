@@ -1344,6 +1344,7 @@ async fn run_findings_validation(
     validation_cfg: &config::ResolvedModel,
     main_model: &config::ResolvedModel,
     mode: ValidationMode,
+    target: config::ReviewTarget,
     out: &mut Value,
     totals: &mut RunTotals,
     vdest: &VerboseDest,
@@ -1351,6 +1352,9 @@ async fn run_findings_validation(
     no_tools: bool,
     progress_ui: Option<&MultiPatchSpinner>,
 ) {
+    // Domain-neutral findings validator, plus the target's linkage/build
+    // addendum (kernel adds Kbuild/EXPORT_SYMBOL rules; other targets none).
+    let validation_system = crate::target::review_validation_findings(target);
     // Snapshot regular-stage candidates and specialist proof challenges.
     // `findings[]` remains the protected baseline unless the strong validator
     // explicitly confirms one of the challenges.
@@ -1498,7 +1502,7 @@ async fn run_findings_validation(
             api::chat_completion_with_retry_stage_timeout_preserve_input(
                 client,
                 validation_cfg,
-                api::SYSTEM_REVIEW_VALIDATION_FINDINGS,
+                &validation_system,
                 &user_msg,
                 validation_cfg.temperature,
                 Some(&label),
@@ -2893,6 +2897,7 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
             validation_cfg,
             &model,
             validation_mode,
+            review_target,
             &mut out,
             &mut totals,
             &vdest,
