@@ -250,7 +250,7 @@ context locally, then runs the ordered stages below.
 | 8 | Hardware & portability | Drivers/HW: DMA, IRQ, barriers, endianness |
 | 9 | Comment / code consistency | Audit comments touched by the patch against the actual code |
 | 10 | Consolidation pass | Turns regular concerns into candidate additions |
-| 11 | Strong adjudication and addition validation | Independently confirms specialist challenges and filters regular additions |
+| 11 | Strong adjudication and addition validation | Independently adjudicates every baseline finding and filters regular additions |
 | 12 | Additive merge and LKML report | Union survivors into the baseline and render the report |
 
 `BORO_MODEL` is used for regular discovery and consolidation. In normal
@@ -265,21 +265,24 @@ message, and diff. In a normal review it uses `BORO_VALIDATION_MODEL`;
 under `--fast` it uses `BORO_MODEL`. Regular discovery is independent
 and can only contribute novel findings; it cannot rewrite or replace baseline
 findings or their lore provenance. A specialist may separately challenge a
-fast finding, but this is only a proposal. The baseline stays read-only while
-all specialists run. The strong validation model then independently inspects
-the repository and may confirm a proposal only by returning its complete,
-exact-target, unhedged proof verbatim. The host applies only those confirmations;
-validation failure, ambiguity, missing tool inspection, malformed output, or
-`--validation-mode=off` preserves the baseline. Deterministic upstream-fix
-findings are not challengeable. The validator also drops regular candidates
-that clearly report the same underlying problem. Local merging removes exact
-identities only, so distinct findings at the same location are retained.
+fast finding, but this is only optional evidence and the baseline stays
+read-only while all specialists run. The strong validation model then
+independently adjudicates every baseline finding against the repository,
+including findings no specialist challenged. It may DROP one only by returning
+the complete exact finding with an unhedged structured contradiction proof
+after repository-tool inspection. The host applies only exact, tool-verified
+DROP decisions; validation failure, ambiguity, missing tool inspection,
+malformed output, or `--validation-mode=off` preserves the finding.
+Deterministic upstream-fix findings must receive `KEEP` and cannot be dropped.
+The validator also drops regular candidates that clearly report the same underlying problem.
+Local merging removes exact identities only, so distinct findings at the same
+location are retained.
 
 `--validation-mode` changes only the post-discovery stages:
 
-- `filter` (default): adjudicate specialist challenges, validate regular
-  additions, union survivors into the fast baseline, then render LKML prose.
-- `findings`: perform the same adjudication and additive merge while skipping
+- `filter` (default): adjudicate every baseline finding, validate regular
+  additions, union survivors, then render LKML prose.
+- `findings`: perform the same baseline adjudication and additive merge while skipping
   LKML rendering.
 - `off`: preserve every fast finding and add raw regular candidates without
   validation.
@@ -378,11 +381,15 @@ The option `--validation-mode` selects whether (and how) regular-stage
 candidate additions are validated:
 
 - `filter` (default): validates regular additions, independently adjudicates
-  specialist baseline challenges, unions survivors with the protected fast
-  baseline, then renders per-commit LKML prose. The viewer / human
+  every protected baseline finding with one structured, repository-tool-backed
+  `KEEP` or `DROP` proof per finding, unions survivors with validated regular
+  additions, then renders per-commit LKML prose. Incomplete, reordered, or
+  inexact baseline adjudication is rejected and retried; a `DROP` is applied
+  only when its exact proof passes host validation. The viewer / human
   report's Findings section shows `validated_findings`; the LKML section
-  shows prose built from those survivors.
-- `findings`: performs the same challenge adjudication, additive validation,
+  shows prose built from those survivors. Commits with no survivors have no
+  LKML report body; the renderer does not independently add or remove findings.
+- `findings`: performs the same baseline adjudication, additive validation,
   and merge, **skips** the per-commit LKML
   pass entirely (saves one LLM call per commit; the human report's LKML
   section is empty in this mode). `scripts/boro-json-view` auto-detects
@@ -397,8 +404,8 @@ stdout instead of the human report - the same shape consumed internally,
 with per-commit `findings[]`, `lkml_report` (filter/off modes only),
 `validated_findings[]` (filter/findings modes when validation
 succeeded), and a `usage_summary`. In filter/findings modes,
-`findings[]` is the protected fast baseline after any specialist challenges
-independently confirmed by the strong validator, and
+`findings[]` is the protected fast baseline after exact, tool-verified DROP
+decisions from the strong validator, and
 `validated_findings[]` is the baseline plus accepted regular additions.
 Each finding may carry optional `location` and `references` fields:
 

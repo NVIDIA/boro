@@ -1334,9 +1334,77 @@ fn without_unverified_sensitive_findings(findings: &Value) -> (Vec<Value>, usize
     (retained, withheld)
 }
 
-/// Validate regular-pipeline additions and independently adjudicate specialist
-/// challenges to the protected fast-review baseline. A fast finding is removed
-/// only when the strong validator returns the exact proposed challenge after
+fn commit_needs_findings_validation(baseline: &Value, additions: &[Value]) -> bool {
+    !additions.is_empty()
+        || baseline
+            .as_array()
+            .is_some_and(|findings| !findings.is_empty())
+}
+
+fn validate_baseline_adjudication_coverage(
+    parsed: &Value,
+    expected: &[api::ValidationFindingsCommit<'_>],
+) -> anyhow::Result<()> {
+    let commits = parsed
+        .get("commits")
+        .and_then(Value::as_array)
+        .context("validation output must contain a commits array")?;
+    if commits.len() != expected.len() {
+        anyhow::bail!("validation output must contain exactly one entry per input commit");
+    }
+
+    for (entry, input) in commits.iter().zip(expected) {
+        if entry.get("sha").and_then(Value::as_str) != Some(input.sha) {
+            anyhow::bail!("validation commits must preserve input order and exact sha");
+        }
+        let baseline = input
+            .baseline_findings
+            .as_array()
+            .context("baseline_findings must be an array")?;
+        let adjudications = entry
+            .get("baseline_adjudications")
+            .and_then(Value::as_array)
+            .context("validation commit must contain baseline_adjudications")?;
+        if adjudications.len() != baseline.len() {
+            anyhow::bail!(
+                "validation commit {} must adjudicate every baseline finding exactly once",
+                input.sha
+            );
+        }
+        for (index, (adjudication, finding)) in adjudications.iter().zip(baseline).enumerate() {
+            let expected_id = format!("fast-{index}");
+            if adjudication.get("baseline_id").and_then(Value::as_str) != Some(expected_id.as_str())
+            {
+                anyhow::bail!("baseline adjudications must use exact fast-N IDs in order");
+            }
+            if adjudication.get("finding") != Some(finding) {
+                anyhow::bail!("baseline adjudication must copy the exact finding object");
+            }
+            let problem = finding
+                .get("problem")
+                .and_then(Value::as_str)
+                .context("baseline finding must have a string problem")?;
+            if adjudication
+                .get("proof")
+                .and_then(|proof| proof.get("finding_claim"))
+                .and_then(Value::as_str)
+                != Some(problem)
+            {
+                anyhow::bail!("baseline proof must copy the exact finding claim");
+            }
+            if finding.get("source").and_then(Value::as_str) == Some("upstream-fixes")
+                && adjudication.get("verdict").and_then(Value::as_str) != Some("KEEP")
+            {
+                anyhow::bail!("deterministic upstream-fix findings must be kept");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Independently adjudicate every protected fast-review baseline finding and
+/// validate regular-pipeline additions. A fast finding is removed only when
+/// the strong validator returns an exact structured false-positive proof after
 /// repository-tool verification; every failure mode preserves the baseline.
 #[allow(clippy::too_many_arguments)]
 async fn run_findings_validation(
@@ -1355,9 +1423,10 @@ async fn run_findings_validation(
     // Domain-neutral findings validator, plus the target's linkage/build
     // addendum (kernel adds Kbuild/EXPORT_SYMBOL rules; other targets none).
     let validation_system = crate::target::review_validation_findings(target);
-    // Snapshot regular-stage candidates and specialist proof challenges.
-    // `findings[]` remains the protected baseline unless the strong validator
-    // explicitly confirms one of the challenges.
+    // Snapshot the protected baseline, regular-stage candidates, and specialist
+    // proof challenges. Every commit with a baseline or regular candidate must
+    // reach the strong adjudicator; specialist challenges are optional evidence,
+    // not a prerequisite for independently disproving a baseline finding.
     let mut payload_owned: Vec<ValidationPayloadOwned> = Vec::new();
     if let Some(commits) = out["commits"].as_array() {
         for c in commits {
@@ -1371,7 +1440,8 @@ async fn run_findings_validation(
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            if findings.is_empty() && baseline_challenges.is_empty() {
+            let baseline_findings = c.get("findings").cloned().unwrap_or_else(|| json!([]));
+            if !commit_needs_findings_validation(&baseline_findings, &findings) {
                 continue;
             }
             let sha_full = c.get("sha").and_then(|s| s.as_str()).unwrap_or("");
@@ -1395,7 +1465,6 @@ async fn run_findings_validation(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let baseline_findings = c.get("findings").cloned().unwrap_or_else(|| json!([]));
             payload_owned.push(ValidationPayloadOwned {
                 sha: sha12,
                 subject,
@@ -1411,7 +1480,7 @@ async fn run_findings_validation(
     if payload_owned.is_empty() {
         v(
             vdest,
-            "validation skipped (no regular-stage additions or baseline challenges to validate)",
+            "validation skipped (no baseline or regular-stage findings to adjudicate)",
         );
         if let Some(commits) = out["commits"].as_array_mut() {
             for commit in commits {
@@ -1458,7 +1527,7 @@ async fn run_findings_validation(
     let mut stage_tot = api::CumulativeTokenUsage::default();
     let tool_cfg = (!no_tools).then(|| {
         api::ToolLoopConfig::new(repo)
-            .requiring(api::ToolVerification::ValidationFindingsAndBaselineChallenges)
+            .requiring(api::ToolVerification::ValidationFindingsAndBaselineAdjudications)
     });
     let mut by_sha: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
     let mut verification_failed_shas: std::collections::HashSet<String> =
@@ -1511,7 +1580,11 @@ async fn run_findings_validation(
                 tool_cfg.as_ref(),
                 progress_line.as_ref(),
                 repo,
-                api::parse_validation_findings,
+                |raw| {
+                    let parsed = api::parse_validation_findings(raw)?;
+                    validate_baseline_adjudication_coverage(&parsed, &payload_refs)?;
+                    Ok(parsed)
+                },
                 api::RETRY_REMINDER_FINDINGS_VALIDATION,
                 api::STAGE_RETRY_MAX_ATTEMPTS,
             )
@@ -1631,25 +1704,19 @@ async fn run_findings_validation(
                     .cloned()
                     .unwrap_or_else(|| json!([]))
             };
-            let proposed_challenges = c
-                .get("_baseline_challenges")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let confirmed_challenges = if no_tools {
+            let baseline_adjudications = if no_tools {
                 Vec::new()
             } else {
                 validated_entry
                     .as_ref()
-                    .and_then(|entry| entry.get("confirmed_false_positives"))
+                    .and_then(|entry| entry.get("baseline_adjudications"))
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default()
             };
-            let removed = apply_confirmed_fast_false_positives(
+            let removed = apply_adjudicated_fast_false_positives(
                 &mut c["findings"],
-                &proposed_challenges,
-                &confirmed_challenges,
+                &baseline_adjudications,
                 vdest,
             );
             if removed > 0 {
@@ -1679,8 +1746,7 @@ async fn run_findings_validation(
 /// section) or `--dry-run`/Ctrl-C. For each commit:
 ///   - prefer `validated_findings[]` when present (filter mode), else fall
 ///     back to `findings[]` (off mode or validation failed);
-///   - if the array is empty, set `lkml_report = "No issues found."`
-///     without an LLM call;
+///   - if the array is empty, omit `lkml_report` without an LLM call;
 ///   - else call `api::chat_completion` with the target LKML prompt to render prose
 ///     from the chosen finding set;
 ///   - record the LKML render under validation-model usage and add the
@@ -1698,6 +1764,22 @@ async fn run_findings_validation(
 /// keep/drop/tighten on the structured findings. When the validation
 /// model is distinct from the main model (e.g. a stronger validator), the
 /// prose is rendered by that stronger model.
+fn lkml_input_has_no_findings(chosen: &Value, fast_review: Option<&str>) -> bool {
+    let chosen_is_empty = chosen
+        .as_array()
+        .is_some_and(|findings| findings.is_empty());
+    if !chosen_is_empty {
+        return false;
+    }
+    let Some(review) = fast_review else {
+        return true;
+    };
+    api::parse_findings_json(review)
+        .ok()
+        .and_then(|parsed| parsed.get("findings").and_then(Value::as_array).cloned())
+        .is_some_and(|findings| findings.is_empty())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn render_commit_lkml_phase(
     client: &reqwest::Client,
@@ -1744,10 +1826,11 @@ async fn render_commit_lkml_phase(
             .and_then(|value| value.as_str())
             .filter(|text| !text.trim().is_empty())
             .map(str::to_owned);
-        let arr_empty = fast_review.is_none()
-            && chosen
-                .as_array()
-                .is_some_and(|findings| findings.is_empty());
+        // Normal reviews have no `_fast_review`, so an empty chosen array is
+        // authoritative. Fast reviews retain their raw structured response;
+        // parse it here so `{"findings":[]}` is also suppressed without
+        // accidentally hiding a non-empty or malformed fast response.
+        let arr_empty = lkml_input_has_no_findings(&chosen, fast_review.as_deref());
         let patch = c
             .get("patch")
             .and_then(|s| s.as_str())
@@ -1766,12 +1849,7 @@ async fn render_commit_lkml_phase(
         join_set.spawn(async move {
             let _permit = sem.acquire_owned().await.expect("semaphore closed");
             if arr_empty {
-                return (
-                    idx,
-                    sha_for_task,
-                    Some("No issues found.".to_string()),
-                    None,
-                );
+                return (idx, sha_for_task, None, None);
             }
             let commit_headers =
                 git::show_commit_headers(repo.as_path(), &sha_for_task).unwrap_or_default();
@@ -1812,7 +1890,14 @@ async fn render_commit_lkml_phase(
             )
             .await
             {
-                Ok((raw, u)) => (Some(api::strip_json_fences(&raw)), u, None),
+                Ok((raw, u)) => {
+                    let body = if fast_review.is_some() {
+                        api::normalize_lkml_report_response(&raw)
+                    } else {
+                        Some(api::strip_json_fences(&raw))
+                    };
+                    (body, u, None)
+                }
                 Err(e) => {
                     v(&vd, format!("LKML render failed for {sha_for_task}: {e:#}"));
                     (
@@ -3513,22 +3598,23 @@ fn merge_novel_findings(base: &[Value], additions: &[Value]) -> Vec<Value> {
     merged
 }
 
-fn apply_confirmed_fast_false_positives(
+fn apply_adjudicated_fast_false_positives(
     baseline_findings: &mut Value,
-    proposed: &[Value],
-    confirmed: &[Value],
+    adjudications: &[Value],
     vd: &VerboseDest,
 ) -> usize {
     let mut disproved = std::collections::HashSet::new();
-    for challenge in confirmed {
-        if !proposed.contains(challenge) {
-            v(
-                vd,
-                "strong-validator baseline confirmation rejected: it was not returned verbatim from the specialist proposals",
-            );
+    for adjudication in adjudications {
+        if adjudication.get("verdict").and_then(Value::as_str) != Some("DROP")
+            || adjudication
+                .get("proof")
+                .and_then(|proof| proof.get("conclusion"))
+                .and_then(Value::as_str)
+                != Some("false_positive")
+        {
             continue;
         }
-        let Some(id) = challenge.get("baseline_id").and_then(Value::as_str) else {
+        let Some(id) = adjudication.get("baseline_id").and_then(Value::as_str) else {
             continue;
         };
         let Some(index_text) = id.strip_prefix("fast-") else {
@@ -3550,12 +3636,21 @@ fn apply_confirmed_fast_false_positives(
         let Some(problem) = original.get("problem").and_then(Value::as_str) else {
             continue;
         };
-        let challenge_finding = challenge.get("finding");
-        let proof_claim = challenge
+        if original.get("source").and_then(Value::as_str) == Some("upstream-fixes") {
+            v(
+                vd,
+                format!(
+                    "strong-validator baseline confirmation {id} rejected: deterministic upstream-fix findings are not adjudicable"
+                ),
+            );
+            continue;
+        }
+        let adjudicated_finding = adjudication.get("finding");
+        let proof_claim = adjudication
             .get("proof")
             .and_then(|proof| proof.get("finding_claim"))
             .and_then(Value::as_str);
-        if challenge_finding != Some(original) || proof_claim != Some(problem) {
+        if adjudicated_finding != Some(original) || proof_claim != Some(problem) {
             v(
                 vd,
                 format!(
@@ -3579,8 +3674,6 @@ fn apply_confirmed_fast_false_positives(
         return 0;
     };
     let before = findings.len();
-    // Fast findings occupy the protected prefix. Deterministic upstream findings
-    // appended later are outside the challenge channel and can never be removed.
     let mut index = 0usize;
     findings.retain(|_| {
         let keep = !disproved.contains(&index);
@@ -4855,6 +4948,35 @@ mod fast_cli_tests {
     }
 
     #[test]
+    fn lkml_skips_empty_normal_and_fast_review_inputs() {
+        let empty = json!([]);
+        assert!(lkml_input_has_no_findings(&empty, None));
+        assert!(lkml_input_has_no_findings(
+            &empty,
+            Some(r#"{"findings":[]}"#)
+        ));
+    }
+
+    #[test]
+    fn lkml_keeps_nonempty_or_unstructured_fast_review_inputs() {
+        let empty = json!([]);
+        assert!(!lkml_input_has_no_findings(
+            &empty,
+            Some(
+                r#"{"findings":[{"problem":"bug","severity":"High","severity_explanation":"proof"}]}"#
+            )
+        ));
+        assert!(!lkml_input_has_no_findings(
+            &empty,
+            Some("unstructured review text")
+        ));
+        assert!(!lkml_input_has_no_findings(
+            &json!([{"problem": "bug"}]),
+            None
+        ));
+    }
+
+    #[test]
     fn exact_regular_duplicate_cannot_replace_fast_provenance() {
         let baseline = vec![json!({
             "problem": "is_core_idle is called unnecessarily when has_idle_core is false",
@@ -4916,17 +5038,17 @@ mod fast_cli_tests {
         let challenge = json!({
             "baseline_id": "fast-0",
             "finding": fast[0].clone(),
+            "verdict": "DROP",
             "proof": {
                 "finding_claim": "foo dereferences NULL",
                 "verified_facts": ["every caller passes a static object"],
-                "contradiction": "the argument cannot be NULL",
+                "assessment": "the argument cannot be NULL",
                 "conclusion": "false_positive"
             }
         });
 
-        let removed = apply_confirmed_fast_false_positives(
+        let removed = apply_adjudicated_fast_false_positives(
             &mut baseline,
-            std::slice::from_ref(&challenge),
             std::slice::from_ref(&challenge),
             &VerboseDest::new(false),
         );
@@ -4936,24 +5058,127 @@ mod fast_cli_tests {
     }
 
     #[test]
-    fn baseline_challenge_cannot_remove_a_finding_without_exact_text_match() {
+    fn baseline_only_commit_still_reaches_strong_adjudication() {
+        assert!(commit_needs_findings_validation(
+            &json!([{"problem": "baseline finding"}]),
+            &[],
+        ));
+        assert!(commit_needs_findings_validation(
+            &json!([]),
+            &[json!({"problem": "regular addition"})],
+        ));
+        assert!(!commit_needs_findings_validation(&json!([]), &[]));
+    }
+
+    #[test]
+    fn baseline_coverage_requires_one_exact_ordered_adjudication_per_finding() {
+        let baseline = json!([
+            {"problem": "first issue", "severity": "High"},
+            {"problem": "second issue", "severity": "Low"}
+        ]);
+        let empty = json!([]);
+        let inputs = [api::ValidationFindingsCommit {
+            sha: "abc123def456",
+            subject: "subject",
+            commit_message: "message",
+            reference_context: "context",
+            diff: "diff",
+            baseline_findings: &baseline,
+            baseline_challenges: &empty,
+            findings: &empty,
+        }];
+        let parsed = json!({"commits": [{
+            "sha": "abc123def456",
+            "findings": [],
+            "baseline_adjudications": [
+                {
+                    "baseline_id": "fast-0",
+                    "finding": baseline[0].clone(),
+                    "verdict": "KEEP",
+                    "proof": {
+                        "finding_claim": "first issue",
+                        "verified_facts": ["fact"],
+                        "assessment": "supported",
+                        "conclusion": "supported"
+                    }
+                },
+                {
+                    "baseline_id": "fast-1",
+                    "finding": baseline[1].clone(),
+                    "verdict": "DROP",
+                    "proof": {
+                        "finding_claim": "second issue",
+                        "verified_facts": ["fact"],
+                        "assessment": "disproved",
+                        "conclusion": "false_positive"
+                    }
+                }
+            ]
+        }]});
+
+        validate_baseline_adjudication_coverage(&parsed, &inputs).unwrap();
+
+        let mut missing = parsed.clone();
+        missing["commits"][0]["baseline_adjudications"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(validate_baseline_adjudication_coverage(&missing, &inputs).is_err());
+
+        let mut reordered = parsed;
+        reordered["commits"][0]["baseline_adjudications"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        assert!(validate_baseline_adjudication_coverage(&reordered, &inputs).is_err());
+    }
+
+    #[test]
+    fn keep_adjudication_never_removes_a_baseline_finding() {
+        let finding = json!({"problem": "foo dereferences NULL", "severity": "High"});
+        let mut baseline = json!([finding.clone()]);
+        let keep = json!({
+            "baseline_id": "fast-0",
+            "finding": finding,
+            "verdict": "KEEP",
+            "proof": {
+                "finding_claim": "foo dereferences NULL",
+                "verified_facts": ["NULL remains reachable"],
+                "assessment": "the finding is supported",
+                "conclusion": "supported"
+            }
+        });
+
+        assert_eq!(
+            apply_adjudicated_fast_false_positives(
+                &mut baseline,
+                &[keep],
+                &VerboseDest::new(false),
+            ),
+            0
+        );
+        assert_eq!(baseline.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn baseline_adjudication_cannot_remove_a_finding_without_exact_text_match() {
         let fast = vec![json!({"problem": "foo dereferences NULL", "severity": "High"})];
         let mut baseline = Value::Array(fast.clone());
         let challenge = json!({
             "baseline_id": "fast-0",
             "finding": {"problem": "foo is probably safe", "severity": "High"},
+            "verdict": "DROP",
             "proof": {
                 "finding_claim": "foo is probably safe",
                 "verified_facts": ["fact"],
-                "contradiction": "contradiction",
+                "assessment": "contradiction",
                 "conclusion": "false_positive"
             }
         });
 
         assert_eq!(
-            apply_confirmed_fast_false_positives(
+            apply_adjudicated_fast_false_positives(
                 &mut baseline,
-                std::slice::from_ref(&challenge),
                 std::slice::from_ref(&challenge),
                 &VerboseDest::new(false),
             ),
@@ -4963,30 +5188,61 @@ mod fast_cli_tests {
     }
 
     #[test]
-    fn strong_validator_cannot_invent_an_unproposed_baseline_removal() {
+    fn strong_validator_can_independently_remove_an_unchallenged_baseline_finding() {
         let fast = vec![json!({"problem": "foo dereferences NULL", "severity": "High"})];
         let mut baseline = Value::Array(fast.clone());
-        let invented = json!({
+        let adjudicated = json!({
             "baseline_id": "fast-0",
             "finding": fast[0].clone(),
+            "verdict": "DROP",
             "proof": {
                 "finding_claim": "foo dereferences NULL",
                 "verified_facts": ["every caller passes a static object"],
-                "contradiction": "the argument cannot be NULL",
+                "assessment": "the argument cannot be NULL",
                 "conclusion": "false_positive"
             }
         });
 
         assert_eq!(
-            apply_confirmed_fast_false_positives(
+            apply_adjudicated_fast_false_positives(
                 &mut baseline,
-                &[],
-                &[invented],
+                &[adjudicated],
+                &VerboseDest::new(false),
+            ),
+            1
+        );
+        assert_eq!(baseline, json!([]));
+    }
+
+    #[test]
+    fn strong_validator_cannot_remove_deterministic_upstream_fix() {
+        let upstream = json!({
+            "problem": "upstream fixed a regression",
+            "severity": "High",
+            "source": "upstream-fixes"
+        });
+        let mut baseline = json!([upstream.clone()]);
+        let adjudicated = json!({
+            "baseline_id": "fast-0",
+            "finding": upstream.clone(),
+            "verdict": "DROP",
+            "proof": {
+                "finding_claim": "upstream fixed a regression",
+                "verified_facts": ["the patch exists"],
+                "assessment": "the patch is unnecessary",
+                "conclusion": "false_positive"
+            }
+        });
+
+        assert_eq!(
+            apply_adjudicated_fast_false_positives(
+                &mut baseline,
+                &[adjudicated],
                 &VerboseDest::new(false),
             ),
             0
         );
-        assert_eq!(baseline, Value::Array(fast));
+        assert_eq!(baseline, json!([upstream]));
     }
 
     #[test]

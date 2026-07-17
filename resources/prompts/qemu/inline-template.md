@@ -59,5 +59,5 @@ text code snippet or call chain when it helps.
 - Order findings from most to least serious.
 - Keep the tone the kind of reply a regular qemu-devel reviewer would send.
 
-If no issues remain after filtering, the report should simply state that nothing
-of concern was found.
+The caller skips this formatter when the validated findings set is empty. Format
+every supplied finding; do not independently add or remove findings.

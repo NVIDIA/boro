@@ -149,7 +149,7 @@ pub enum ToolVerification {
     SensitiveFindings,
     BaselineFalsePositiveProof,
     Stage7LinkageAndBaselineFalsePositiveProof,
-    ValidationFindingsAndBaselineChallenges,
+    ValidationFindingsAndBaselineAdjudications,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +258,12 @@ conclusive checked-out-tree evidence, not reasoning from the diff or prompt alon
 definitions, callers, configuration, or history needed to prove the finding impossible. If the evidence \
 does not contradict the complete finding with certainty, return an empty baseline_false_positives array.";
 
+const REQUIRED_VALIDATION_BASELINE_TOOL_REMINDER: &str = "You returned baseline adjudications \
+without executing any repository tool. Independently inspect the exact definitions, callers, configuration, \
+or history needed to decide every protected baseline finding. Then return one exact KEEP or DROP record \
+per baseline entry under baseline_adjudications, with concrete verified_facts and an assessment. If a \
+finding cannot be conclusively disproved, return KEEP; never omit its adjudication record.";
+
 #[derive(Debug)]
 struct RequiredToolVerificationError;
 
@@ -313,7 +319,7 @@ fn output_requires_tool_verification(policy: ToolVerification, raw: &str) -> boo
         ToolVerification::Stage7LinkageAndBaselineFalsePositiveProof => {
             parse_model_json_with_key(raw, "concerns")
         }
-        ToolVerification::ValidationFindingsAndBaselineChallenges => {
+        ToolVerification::ValidationFindingsAndBaselineAdjudications => {
             parse_model_json_with_key(raw, "commits")
         }
         ToolVerification::Optional => return false,
@@ -335,7 +341,7 @@ fn output_requires_tool_verification(policy: ToolVerification, raw: &str) -> boo
                 })
             }),
         ToolVerification::SensitiveFindings
-        | ToolVerification::ValidationFindingsAndBaselineChallenges => {
+        | ToolVerification::ValidationFindingsAndBaselineAdjudications => {
             value
                 .get("findings")
                 .and_then(Value::as_array)
@@ -357,11 +363,11 @@ fn output_requires_tool_verification(policy: ToolVerification, raw: &str) -> boo
                                         .iter()
                                         .any(finding_requires_repository_verification)
                                 });
-                            let baseline_confirmation = commit
-                                .get("confirmed_false_positives")
+                            let baseline_adjudication = commit
+                                .get("baseline_adjudications")
                                 .and_then(Value::as_array)
-                                .is_some_and(|challenges| !challenges.is_empty());
-                            sensitive_finding || baseline_confirmation
+                                .is_some_and(|adjudications| !adjudications.is_empty());
+                            sensitive_finding || baseline_adjudication
                         })
                     })
         }
@@ -1248,7 +1254,11 @@ No markdown fences, no prose outside the JSON.";
 pub const RETRY_REMINDER_FINDINGS_VALIDATION: &str =
     "Your previous response was rejected because it did not match the required JSON shape. \
 Return ONLY a JSON object with a top-level 'commits' array. Each commit entry must have \
-'sha' (string) and 'findings' (array; possibly empty). Each finding must have 'problem', \
+'sha' (string), 'findings' (array; possibly empty), and 'baseline_adjudications' \
+(array). Return exactly one adjudication per input baseline finding, in order, copying its \
+fast-N baseline_id and finding exactly. Each adjudication must have verdict KEEP or DROP and \
+proof with finding_claim, non-empty verified_facts, assessment, and conclusion. KEEP requires \
+conclusion='supported'; DROP requires conclusion='false_positive'. Each finding must have 'problem', \
 'severity' (Low|Medium|High|Critical), 'severity_explanation', and 'location' \
 (verbatim copy of the input finding's location). \
 No markdown fences, no prose outside the JSON.";
@@ -2301,15 +2311,15 @@ async fn chat_completion_inner(
                     "required-tool verification: rejecting non-empty unverified output and asking the model to inspect the repository",
                 );
                 messages.push(message);
-                let reminder = if matches!(
-                    cfg.verification,
+                let reminder = match cfg.verification {
+                    ToolVerification::ValidationFindingsAndBaselineAdjudications => {
+                        REQUIRED_VALIDATION_BASELINE_TOOL_REMINDER
+                    }
                     ToolVerification::BaselineFalsePositiveProof
-                        | ToolVerification::Stage7LinkageAndBaselineFalsePositiveProof
-                        | ToolVerification::ValidationFindingsAndBaselineChallenges
-                ) {
-                    REQUIRED_BASELINE_PROOF_TOOL_REMINDER
-                } else {
-                    REQUIRED_TOOL_REMINDER
+                    | ToolVerification::Stage7LinkageAndBaselineFalsePositiveProof => {
+                        REQUIRED_BASELINE_PROOF_TOOL_REMINDER
+                    }
+                    _ => REQUIRED_TOOL_REMINDER,
                 };
                 messages.push(json!({"role": "user", "content": reminder}));
                 continue;
@@ -3260,7 +3270,8 @@ pub fn parse_findings_json(raw: &str) -> Result<Value> {
 
 /// Parse the response from the `--validation-mode=findings` stage.
 ///
-/// Expected shape: `{"commits": [{"sha": "...", "findings": [...]}, ...]}`.
+/// Expected shape: `{"commits": [{"sha": "...", "findings": [...],
+/// "baseline_adjudications": [...]}, ...]}`.
 /// Each finding inside is normalized through [`sanitize_finding_location`]
 /// so the same lenient anchor rules as [`parse_findings_json`] apply.
 pub fn parse_validation_findings(raw: &str) -> Result<Value> {
@@ -3283,16 +3294,121 @@ pub fn parse_validation_findings(raw: &str) -> Result<Value> {
         for f in findings.iter_mut() {
             sanitize_finding_location(f);
         }
-        if let Some(confirmed) = obj.get("confirmed_false_positives") {
-            let wrapper = json!({
-                "concerns": [],
-                "baseline_false_positives": confirmed,
-            });
-            parse_specialist_concerns_strict(&wrapper.to_string())
-                .context("invalid confirmed baseline false-positive proof")?;
-        }
+        let adjudications = obj
+            .get("baseline_adjudications")
+            .and_then(Value::as_array)
+            .context("each 'commits' entry must have a 'baseline_adjudications' array")?;
+        parse_baseline_adjudications_strict(adjudications)
+            .context("invalid baseline adjudication")?;
     }
     Ok(v)
+}
+
+fn parse_baseline_adjudications_strict(adjudications: &[Value]) -> Result<()> {
+    const HEDGES: &[&str] = &[
+        "may",
+        "might",
+        "could",
+        "likely",
+        "possibly",
+        "perhaps",
+        "appears",
+        "seems",
+        "uncertain",
+        "unclear",
+    ];
+    let mut ids = std::collections::HashSet::new();
+    for adjudication in adjudications {
+        let obj = adjudication
+            .as_object()
+            .context("each baseline adjudication must be an object")?;
+        const FIELDS: &[&str] = &["baseline_id", "finding", "verdict", "proof"];
+        if obj.len() != FIELDS.len() || FIELDS.iter().any(|field| !obj.contains_key(*field)) {
+            anyhow::bail!(
+                "baseline adjudication must contain exactly baseline_id, finding, verdict, and proof"
+            );
+        }
+        let id = obj["baseline_id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .context("baseline adjudication baseline_id must be a non-empty string")?;
+        if !ids.insert(id) {
+            anyhow::bail!("baseline adjudication baseline_id must be unique");
+        }
+        obj["finding"]
+            .as_object()
+            .context("baseline adjudication finding must be the exact finding object")?;
+        let verdict = obj["verdict"]
+            .as_str()
+            .context("baseline adjudication verdict must be KEEP or DROP")?;
+        if !matches!(verdict, "KEEP" | "DROP") {
+            anyhow::bail!("baseline adjudication verdict must be KEEP or DROP");
+        }
+        let proof = obj["proof"]
+            .as_object()
+            .context("baseline adjudication proof must be an object")?;
+        const PROOF_FIELDS: &[&str] = &[
+            "finding_claim",
+            "verified_facts",
+            "assessment",
+            "conclusion",
+        ];
+        if proof.len() != PROOF_FIELDS.len()
+            || PROOF_FIELDS.iter().any(|field| !proof.contains_key(*field))
+        {
+            anyhow::bail!(
+                "baseline adjudication proof must contain exactly finding_claim, verified_facts, assessment, and conclusion"
+            );
+        }
+        for field in ["finding_claim", "assessment"] {
+            proof[field]
+                .as_str()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .with_context(|| {
+                    format!("baseline adjudication proof.{field} must be non-empty")
+                })?;
+        }
+        let facts = proof["verified_facts"]
+            .as_array()
+            .filter(|facts| !facts.is_empty())
+            .context("baseline adjudication verified_facts must be a non-empty array")?;
+        for fact in facts {
+            fact.as_str()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .context("every baseline adjudication verified fact must be a non-empty string")?;
+        }
+        let conclusion = proof["conclusion"].as_str().context(
+            "baseline adjudication proof.conclusion must be supported or false_positive",
+        )?;
+        let expected = if verdict == "KEEP" {
+            "supported"
+        } else {
+            "false_positive"
+        };
+        if conclusion != expected {
+            anyhow::bail!(
+                "baseline adjudication verdict and proof.conclusion must agree (KEEP=supported, DROP=false_positive)"
+            );
+        }
+        if verdict == "DROP" {
+            let mut proof_text = proof["assessment"].as_str().unwrap_or("").to_string();
+            for fact in facts {
+                proof_text.push(' ');
+                proof_text.push_str(fact.as_str().unwrap_or(""));
+            }
+            let lower = proof_text.to_ascii_lowercase();
+            if lower
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|word| HEDGES.contains(&word))
+            {
+                anyhow::bail!("baseline DROP proof contains uncertainty or hedging");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Normalize the optional `location` object on a finding (or concern) in place.
@@ -3915,8 +4031,12 @@ pub fn fast_lkml_report_user_payload(
 Turn the fast review result into the final LKML-ready email body per the rules above. \
 Preserve every concrete finding, but do not invent new findings. When quoting the patch, copy \
 lines verbatim. Preserve every URL from the fast review verbatim in the corresponding comment. \
+If repository inspection proves a supplied finding is a false positive, silently discard it. \
+If no valid findings remain, return exactly `{sentinel}` and nothing else. Never describe a \
+discarded finding, the proof that disproved it, or the absence of findings. \
 Return only the email body text, with no JSON and no markdown code fence wrapping \
-the entire message."
+the entire message.",
+        sentinel = LKML_NO_FINDINGS_SENTINEL,
     )
 }
 
@@ -3928,11 +4048,11 @@ pub struct ValidationFindingsCommit<'a> {
     pub commit_message: &'a str,
     pub reference_context: &'a str,
     pub diff: &'a str,
-    /// Protected one-shot findings. Validation uses these for semantic duplicate
-    /// detection and as the immutable target of specialist proof challenges.
+    /// Protected one-shot findings. Validation independently adjudicates every
+    /// entry and also uses survivors for semantic duplicate detection.
     pub baseline_findings: &'a Value,
-    /// Specialist-proposed removals. The strong validator may confirm an entry
-    /// verbatim, but omission or any validation failure preserves the baseline.
+    /// Optional specialist-proposed removals supplied as evidence. The strong
+    /// validator also adjudicates baseline findings absent from this array.
     pub baseline_challenges: &'a Value,
     /// Regular-stage candidate additions. Only these may appear in the output.
     pub findings: &'a Value,
@@ -4000,8 +4120,8 @@ fn validation_findings_user_payload_scaled(
         .unwrap_or_else(|_| "{\"commits\":[]}".to_string());
     format!(
         "Per-commit findings under review (validate per the system prompt):\n\n```json\n{body}\n```\n\n\
-Return ONLY a JSON object: {{\"commits\":[{{\"sha\":\"<sha12>\",\"findings\":[...],\"confirmed_false_positives\":[...]}}]}}. \
-Treat \"baseline_findings\" as immutable comparison context. Return only surviving entries from \"findings\"; never copy baseline entries into the output. Independently validate every entry in \"baseline_false_positive_challenges\" against the repository and return only conclusively proven entries, verbatim, under each commit's \"confirmed_false_positives\" array. An empty or omitted confirmation array preserves every baseline finding. \
+Return ONLY a JSON object: {{\"commits\":[{{\"sha\":\"<sha12>\",\"findings\":[...],\"baseline_adjudications\":[...]}}]}}. \
+Independently adjudicate every entry in \"baseline_findings\", assigning zero-based IDs fast-N in array order. Return exactly one structured, repository-tool-verified KEEP or DROP record per baseline finding, in the same order, copying its baseline_id and complete finding exactly. Set proof.conclusion to \"supported\" for KEEP and \"false_positive\" for DROP. Treat \"baseline_false_positive_challenges\" only as optional evidence. Return only surviving entries from \"findings\"; never copy baseline entries into that array. \
 Preserve every kept finding's \"location\" object byte-for-byte from the input. \
 When \"context_status\" reports a truncated field, do not treat absence from that field as evidence; use repository tools when the claim requires the omitted context. \
 No markdown fences, no prose outside the JSON."
@@ -4249,9 +4369,22 @@ Do not return markdown, severity counts, severities, locations, links, or separa
     )
 }
 
+/// Private protocol token used by the LKML renderer to say that repository
+/// verification eliminated every supplied finding. It is consumed before
+/// report data is published and must never be shown to the user.
+pub const LKML_NO_FINDINGS_SENTINEL: &str = "BORO_NO_FINDINGS";
+
 pub const LKML_FALLBACK_TEMPLATE: &str =
     "Write a polite LKML inline-style reply: quote relevant context lines with `>`, \
 mention each finding with severity, keep a professional tone, no markdown headings or ALL CAPS.";
+
+/// Normalize an LKML renderer response and consume its no-findings protocol
+/// token. Empty model responses are treated the same way, so neither can
+/// create an empty/false-positive report block in human or JSON output.
+pub fn normalize_lkml_report_response(raw: &str) -> Option<String> {
+    let body = strip_json_fences(raw);
+    (!body.is_empty() && body != LKML_NO_FINDINGS_SENTINEL).then_some(body)
+}
 
 /// One hunk pulled verbatim from a unified diff.
 #[derive(Debug, Clone)]
@@ -4594,6 +4727,29 @@ mod tests {
         assert!(payload.contains("diff --git a/foo.c b/foo.c"));
         assert!(payload.contains("final LKML-ready email body"));
         assert!(payload.contains("Preserve every URL"));
+        assert!(payload.contains(LKML_NO_FINDINGS_SENTINEL));
+        assert!(payload.contains("Never describe a discarded finding"));
+    }
+
+    #[test]
+    fn lkml_no_findings_response_is_consumed() {
+        assert_eq!(
+            normalize_lkml_report_response(LKML_NO_FINDINGS_SENTINEL),
+            None
+        );
+        assert_eq!(
+            normalize_lkml_report_response(&format!("```\n{LKML_NO_FINDINGS_SENTINEL}\n```")),
+            None
+        );
+        assert_eq!(normalize_lkml_report_response("  \n"), None);
+    }
+
+    #[test]
+    fn lkml_real_report_response_is_preserved() {
+        assert_eq!(
+            normalize_lkml_report_response("```\nCan this leak foo?\n```"),
+            Some("Can this leak foo?".to_string())
+        );
     }
 
     #[test]
@@ -4618,6 +4774,8 @@ mod tests {
             "location",
             "references",
             "baseline_findings",
+            "adjudicate EVERY entry",
+            "including entries absent from",
             "distinct failure modes at the same line",
             "\"commits\"",
         ] {
@@ -4999,7 +5157,8 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
                             "references": [{"kind": "lore", "url": "https://lore.kernel.org/all/example/", "claim": "reported upstream"}],
                             "location": {"file": "x.c", "line": 42, "side": "RIGHT"}
                         }
-                    ]
+                    ],
+                    "baseline_adjudications": []
                 }
             ]
         }"#;
@@ -5022,14 +5181,15 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
         let raw = r#"{"commits":[{"sha":"abc123","findings":[
             {"problem":"x","severity":"Low","severity_explanation":"y",
              "location":{"file":"x.c","line":0,"side":"RIGHT"}}
-        ]}]}"#;
+        ],"baseline_adjudications":[]}]}"#;
         let v = parse_validation_findings(raw).unwrap();
         assert!(v["commits"][0]["findings"][0].get("location").is_none());
     }
 
     #[test]
     fn parse_validation_findings_empty_commit_findings_array_ok() {
-        let raw = r#"{"commits":[{"sha":"deadbeef0000","findings":[]}]}"#;
+        let raw =
+            r#"{"commits":[{"sha":"deadbeef0000","findings":[],"baseline_adjudications":[]}]}"#;
         let v = parse_validation_findings(raw).unwrap();
         assert_eq!(v["commits"][0]["findings"], json!([]));
     }
@@ -5043,7 +5203,7 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
 
     #[test]
     fn parse_validation_findings_tolerates_markdown_fence() {
-        let raw = "```json\n{\"commits\":[{\"sha\":\"abc\",\"findings\":[]}]}\n```";
+        let raw = "```json\n{\"commits\":[{\"sha\":\"abc\",\"findings\":[],\"baseline_adjudications\":[]}]}\n```";
         let v = parse_validation_findings(raw).unwrap();
         assert_eq!(v["commits"][0]["sha"], "abc");
     }
@@ -5063,6 +5223,12 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
     #[test]
     fn parse_validation_findings_rejects_non_array_findings() {
         let raw = r#"{"commits":[{"sha":"abc","findings":"oops"}]}"#;
+        assert!(parse_validation_findings(raw).is_err());
+    }
+
+    #[test]
+    fn parse_validation_findings_requires_confirmation_array() {
+        let raw = r#"{"commits":[{"sha":"abc","findings":[]}]}"#;
         assert!(parse_validation_findings(raw).is_err());
     }
 
@@ -5100,6 +5266,8 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
         assert!(s.contains("\"problem\": \"off-by-one\""));
         // The closing instruction mentioning the strict output shape must be present.
         assert!(s.contains("Return ONLY a JSON object"));
+        assert!(s.contains("Independently adjudicate every entry"));
+        assert!(s.contains("one structured, repository-tool-verified KEEP or DROP record"));
     }
 
     #[test]
@@ -5804,6 +5972,8 @@ diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
         assert!(s.contains("# Patch"));
         assert!(s.contains("# Commit (headers)"));
         assert!(s.contains("include every referenced URL verbatim"));
+        assert!(!s.contains(LKML_NO_FINDINGS_SENTINEL));
+        assert!(!s.contains("discarded finding"));
     }
 
     const SAMPLE_PATCH: &str = "\
@@ -6668,24 +6838,25 @@ index 123..456 100644
             "commits": [{
                 "sha": "abc",
                 "findings": [],
-                "confirmed_false_positives": [{"baseline_id":"fast-0"}]
+                "baseline_adjudications": [{"baseline_id":"fast-0"}]
             }]
         }"#;
         assert!(output_requires_tool_verification(
-            ToolVerification::SensitiveFindings,
+            ToolVerification::ValidationFindingsAndBaselineAdjudications,
             raw
         ));
     }
 
     #[test]
-    fn validation_parser_accepts_only_structured_baseline_confirmations() {
-        let challenge = json!({
+    fn validation_parser_accepts_only_structured_baseline_adjudications() {
+        let drop_adjudication = json!({
             "baseline_id": "fast-0",
             "finding": {"problem": "foo dereferences NULL", "severity": "High"},
+            "verdict": "DROP",
             "proof": {
                 "finding_claim": "foo dereferences NULL",
                 "verified_facts": ["every reachable caller passes a static object"],
-                "contradiction": "the argument is non-NULL on every reachable call",
+                "assessment": "the argument is non-NULL on every reachable call",
                 "conclusion": "false_positive"
             }
         });
@@ -6693,7 +6864,7 @@ index 123..456 100644
             "commits": [{
                 "sha": "abc",
                 "findings": [],
-                "confirmed_false_positives": [challenge]
+                "baseline_adjudications": [drop_adjudication]
             }]
         });
         assert!(parse_validation_findings(&valid.to_string()).is_ok());
@@ -6702,10 +6873,29 @@ index 123..456 100644
             "commits": [{
                 "sha": "abc",
                 "findings": [],
-                "confirmed_false_positives": [{"baseline_id": "fast-0"}]
+                "baseline_adjudications": [{"baseline_id": "fast-0"}]
             }]
         });
         assert!(parse_validation_findings(&malformed.to_string()).is_err());
+
+        let keep = json!({
+            "commits": [{
+                "sha": "abc",
+                "findings": [],
+                "baseline_adjudications": [{
+                    "baseline_id": "fast-0",
+                    "finding": {"problem": "foo dereferences NULL"},
+                    "verdict": "KEEP",
+                    "proof": {
+                        "finding_claim": "foo dereferences NULL",
+                        "verified_facts": ["foo accepts pointers from external callers"],
+                        "assessment": "the reachable NULL case remains supported",
+                        "conclusion": "supported"
+                    }
+                }]
+            }]
+        });
+        assert!(parse_validation_findings(&keep.to_string()).is_ok());
     }
 
     #[test]
