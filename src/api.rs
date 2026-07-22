@@ -1255,9 +1255,9 @@ pub const RETRY_REMINDER_FINDINGS_VALIDATION: &str =
     "Your previous response was rejected because it did not match the required JSON shape. \
 Return ONLY a JSON object with a top-level 'commits' array. Each commit entry must have \
 'sha' (string), 'findings' (array; possibly empty), and 'baseline_adjudications' \
-(array). Return exactly one adjudication per input baseline finding, in order, copying its \
-fast-N baseline_id and finding exactly. Each adjudication must have verdict KEEP or DROP and \
-proof with finding_claim, non-empty verified_facts, assessment, and conclusion. KEEP requires \
+(array). Return exactly one adjudication per input baseline finding, in order, using its \
+fast-N baseline_id. Do not copy the finding object; the host owns it. Each adjudication must \
+have verdict KEEP or DROP and proof with non-empty verified_facts, assessment, and conclusion. KEEP requires \
 conclusion='supported'; DROP requires conclusion='false_positive'. Each finding must have 'problem', \
 'severity' (Low|Medium|High|Critical), 'severity_explanation', and 'location' \
 (verbatim copy of the input finding's location). \
@@ -3304,6 +3304,38 @@ pub fn parse_validation_findings(raw: &str) -> Result<Value> {
     Ok(v)
 }
 
+/// Salvage the independently filtered regular-candidate decision when a response cannot satisfy
+/// the stricter baseline-adjudication contract. Only an empty `findings` array is safe to salvage:
+/// it cannot introduce or rewrite a finding, and prevents an unrelated malformed baseline proof
+/// from resurrecting regular candidates which the validator conclusively dropped.
+pub fn parse_empty_validation_candidate_decisions(raw: &str) -> Result<Value> {
+    let v = parse_model_json_with_key(raw, "commits")?;
+    let commits = v
+        .get("commits")
+        .and_then(Value::as_array)
+        .context("expected top-level 'commits' array in validation output")?;
+    let mut salvaged = Vec::with_capacity(commits.len());
+    for entry in commits {
+        let sha = entry
+            .get("sha")
+            .and_then(Value::as_str)
+            .context("each validation commit must have a string sha")?;
+        let findings = entry
+            .get("findings")
+            .and_then(Value::as_array)
+            .context("each validation commit must have a findings array")?;
+        if !findings.is_empty() {
+            anyhow::bail!("only empty regular-candidate decisions are safe to salvage");
+        }
+        salvaged.push(json!({
+            "sha": sha,
+            "findings": [],
+            "baseline_adjudications": [],
+        }));
+    }
+    Ok(json!({"commits": salvaged}))
+}
+
 fn parse_baseline_adjudications_strict(adjudications: &[Value]) -> Result<()> {
     const HEDGES: &[&str] = &[
         "may",
@@ -3322,10 +3354,10 @@ fn parse_baseline_adjudications_strict(adjudications: &[Value]) -> Result<()> {
         let obj = adjudication
             .as_object()
             .context("each baseline adjudication must be an object")?;
-        const FIELDS: &[&str] = &["baseline_id", "finding", "verdict", "proof"];
+        const FIELDS: &[&str] = &["baseline_id", "verdict", "proof"];
         if obj.len() != FIELDS.len() || FIELDS.iter().any(|field| !obj.contains_key(*field)) {
             anyhow::bail!(
-                "baseline adjudication must contain exactly baseline_id, finding, verdict, and proof"
+                "baseline adjudication must contain exactly baseline_id, verdict, and proof"
             );
         }
         let id = obj["baseline_id"]
@@ -3336,9 +3368,6 @@ fn parse_baseline_adjudications_strict(adjudications: &[Value]) -> Result<()> {
         if !ids.insert(id) {
             anyhow::bail!("baseline adjudication baseline_id must be unique");
         }
-        obj["finding"]
-            .as_object()
-            .context("baseline adjudication finding must be the exact finding object")?;
         let verdict = obj["verdict"]
             .as_str()
             .context("baseline adjudication verdict must be KEEP or DROP")?;
@@ -3348,28 +3377,19 @@ fn parse_baseline_adjudications_strict(adjudications: &[Value]) -> Result<()> {
         let proof = obj["proof"]
             .as_object()
             .context("baseline adjudication proof must be an object")?;
-        const PROOF_FIELDS: &[&str] = &[
-            "finding_claim",
-            "verified_facts",
-            "assessment",
-            "conclusion",
-        ];
+        const PROOF_FIELDS: &[&str] = &["verified_facts", "assessment", "conclusion"];
         if proof.len() != PROOF_FIELDS.len()
             || PROOF_FIELDS.iter().any(|field| !proof.contains_key(*field))
         {
             anyhow::bail!(
-                "baseline adjudication proof must contain exactly finding_claim, verified_facts, assessment, and conclusion"
+                "baseline adjudication proof must contain exactly verified_facts, assessment, and conclusion"
             );
         }
-        for field in ["finding_claim", "assessment"] {
-            proof[field]
-                .as_str()
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .with_context(|| {
-                    format!("baseline adjudication proof.{field} must be non-empty")
-                })?;
-        }
+        proof["assessment"]
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .context("baseline adjudication proof.assessment must be non-empty")?;
         let facts = proof["verified_facts"]
             .as_array()
             .filter(|facts| !facts.is_empty())
@@ -3517,13 +3537,9 @@ pub fn parse_specialist_concerns_strict(raw: &str) -> Result<Value> {
         let obj = challenge
             .as_object()
             .context("each baseline false-positive challenge must be an object")?;
-        if obj.len() != 3
-            || !obj.contains_key("baseline_id")
-            || !obj.contains_key("finding")
-            || !obj.contains_key("proof")
-        {
+        if obj.len() != 2 || !obj.contains_key("baseline_id") || !obj.contains_key("proof") {
             anyhow::bail!(
-                "baseline false-positive challenge must contain exactly baseline_id, finding, and proof"
+                "baseline false-positive challenge must contain exactly baseline_id and proof"
             );
         }
         obj["baseline_id"]
@@ -3531,23 +3547,15 @@ pub fn parse_specialist_concerns_strict(raw: &str) -> Result<Value> {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .context("baseline challenge baseline_id must be a non-empty string")?;
-        obj["finding"]
-            .as_object()
-            .context("baseline challenge finding must be the exact finding object")?;
         let proof = obj["proof"]
             .as_object()
             .context("baseline challenge proof must be an object")?;
-        const PROOF_FIELDS: &[&str] = &[
-            "finding_claim",
-            "verified_facts",
-            "contradiction",
-            "conclusion",
-        ];
+        const PROOF_FIELDS: &[&str] = &["verified_facts", "contradiction", "conclusion"];
         if proof.len() != PROOF_FIELDS.len()
             || PROOF_FIELDS.iter().any(|field| !proof.contains_key(*field))
         {
             anyhow::bail!(
-                "baseline challenge proof must contain exactly finding_claim, verified_facts, contradiction, and conclusion"
+                "baseline challenge proof must contain exactly verified_facts, contradiction, and conclusion"
             );
         }
         if proof["conclusion"].as_str() != Some("false_positive") {
@@ -3558,7 +3566,7 @@ pub fn parse_specialist_concerns_strict(raw: &str) -> Result<Value> {
             .filter(|facts| !facts.is_empty())
             .context("baseline challenge verified_facts must be a non-empty array")?;
         let mut proof_text = String::new();
-        for field in ["finding_claim", "contradiction"] {
+        for field in ["contradiction"] {
             let text = proof[field]
                 .as_str()
                 .map(str::trim)
@@ -3778,7 +3786,7 @@ pub fn specialist_stage_user_payload_with_baseline(
 # boro specialist stage {stage}\n\n{instruction_body}\n\n\
 # Reference excerpts for this stage\n\n{reference_addon_md}\n\n\
 Return ONLY JSON (no markdown fences): \
-{{\"concerns\":[{concern_schema}],\"baseline_false_positives\":[{{\"baseline_id\":\"fast-N\",\"finding\":{{\"exact\":\"finding object copied from the protected input\"}},\"proof\":{{\"finding_claim\":\"exact problem text\",\"verified_facts\":[\"fact established with repository tools\"],\"contradiction\":\"why those facts make the complete finding impossible\",\"conclusion\":\"false_positive\"}}}}]}}. \
+{{\"concerns\":[{concern_schema}],\"baseline_false_positives\":[{{\"baseline_id\":\"fast-N\",\"proof\":{{\"verified_facts\":[\"fact established with repository tools\"],\"contradiction\":\"why those facts make the complete finding impossible\",\"conclusion\":\"false_positive\"}}}}]}}. \
 Top-level key must be \"concerns\" (not \"findings\"). \
 Use a short \"type\" label prefixed with \"s{stage}:\" (e.g. \"s{stage}:uaf\"). \
 {proof_contract}\
@@ -3787,7 +3795,7 @@ Do not emit a concern merely because the old/removed code was buggy when the new
 The \"location\" field is OPTIONAL - include it only when you can anchor the concern to a specific hunk in the diff: \
 \"file\" must match the diff path exactly (post-image for RIGHT, pre-image for LEFT), \"line\" is 1-based, \"line_end\" optional for a range, \"side\" is \"RIGHT\" for added/modified lines or \"LEFT\" for removed/context lines in the old file. \
 Do NOT invent locations - omit when unsure. \
-The protected fast-review findings are immutable input. Never rewrite, replace, deduplicate, or return them as concerns. You may challenge one only when repository-tool evidence proves the complete finding false with no assumptions or uncertainty. A challenge must copy its baseline_id and entire finding object exactly, proof.finding_claim must equal that finding's problem text exactly, verified_facts must state the concrete facts established by repository inspection, and contradiction must demonstrate that the complete reported failure is impossible. Plausibility, missing evidence for the finding, a different interpretation, lower severity, or inability to reproduce is not proof. When any doubt remains, do not challenge it. If repository tools are unavailable, baseline_false_positives MUST be empty. \
+The protected fast-review findings are immutable host-owned input. Never rewrite, replace, deduplicate, echo, or return them as concerns. You may challenge one only when repository-tool evidence proves the complete finding false with no assumptions or uncertainty. A challenge identifies its target only by the exact baseline_id; do not copy the finding object or its problem text. verified_facts must state the concrete facts established by repository inspection, and contradiction must demonstrate that the complete reported failure is impossible. Plausibility, missing evidence for the finding, a different interpretation, lower severity, or inability to reproduce is not proof. When any doubt remains, do not challenge it. If repository tools are unavailable, baseline_false_positives MUST be empty. \
 Use an empty concerns array if nothing applies to this lens and an empty baseline_false_positives array unless a fast finding is conclusively disproved."
     )
 }
@@ -4121,7 +4129,7 @@ fn validation_findings_user_payload_scaled(
     format!(
         "Per-commit findings under review (validate per the system prompt):\n\n```json\n{body}\n```\n\n\
 Return ONLY a JSON object: {{\"commits\":[{{\"sha\":\"<sha12>\",\"findings\":[...],\"baseline_adjudications\":[...]}}]}}. \
-Independently adjudicate every entry in \"baseline_findings\", assigning zero-based IDs fast-N in array order. Return exactly one structured, repository-tool-verified KEEP or DROP record per baseline finding, in the same order, copying its baseline_id and complete finding exactly. Set proof.conclusion to \"supported\" for KEEP and \"false_positive\" for DROP. Treat \"baseline_false_positive_challenges\" only as optional evidence. Return only surviving entries from \"findings\"; never copy baseline entries into that array. \
+Independently adjudicate every entry in \"baseline_findings\", assigning zero-based IDs fast-N in array order. Return exactly one structured, repository-tool-verified KEEP or DROP record per baseline finding, in the same order, using only its baseline_id to identify it. The host owns the complete finding object: do not echo the finding or its problem text. Set proof.conclusion to \"supported\" for KEEP and \"false_positive\" for DROP. Treat \"baseline_false_positive_challenges\" only as optional evidence. Return only surviving entries from \"findings\"; never copy baseline entries into that array. \
 Preserve every kept finding's \"location\" object byte-for-byte from the input. \
 When \"context_status\" reports a truncated field, do not treat absence from that field as evidence; use repository tools when the claim requires the omitted context. \
 No markdown fences, no prose outside the JSON."
@@ -6794,9 +6802,7 @@ index 123..456 100644
             "concerns": [],
             "baseline_false_positives": [{
                 "baseline_id": "fast-0",
-                "finding": {"problem": "foo dereferences NULL", "severity": "High"},
                 "proof": {
-                    "finding_claim": "foo dereferences NULL",
                     "verified_facts": ["read_symbol shows every caller passes &static_foo"],
                     "contradiction": "&static_foo is non-NULL on every reachable call",
                     "conclusion": "false_positive"
@@ -6851,10 +6857,8 @@ index 123..456 100644
     fn validation_parser_accepts_only_structured_baseline_adjudications() {
         let drop_adjudication = json!({
             "baseline_id": "fast-0",
-            "finding": {"problem": "foo dereferences NULL", "severity": "High"},
             "verdict": "DROP",
             "proof": {
-                "finding_claim": "foo dereferences NULL",
                 "verified_facts": ["every reachable caller passes a static object"],
                 "assessment": "the argument is non-NULL on every reachable call",
                 "conclusion": "false_positive"
@@ -6884,10 +6888,8 @@ index 123..456 100644
                 "findings": [],
                 "baseline_adjudications": [{
                     "baseline_id": "fast-0",
-                    "finding": {"problem": "foo dereferences NULL"},
                     "verdict": "KEEP",
                     "proof": {
-                        "finding_claim": "foo dereferences NULL",
                         "verified_facts": ["foo accepts pointers from external callers"],
                         "assessment": "the reachable NULL case remains supported",
                         "conclusion": "supported"
@@ -6896,6 +6898,59 @@ index 123..456 100644
             }]
         });
         assert!(parse_validation_findings(&keep.to_string()).is_ok());
+    }
+
+    #[test]
+    fn validation_parser_rejects_obsolete_finding_echo() {
+        let obsolete = json!({
+            "commits": [{
+                "sha": "328cfa18fdcf",
+                "findings": [],
+                "baseline_adjudications": [{
+                    "baseline_id": "fast-0",
+                    "finding": {
+                        "problem": "scx_idle_notify can observe unpublished tables",
+                        "severity": "Medium"
+                    },
+                    "verdict": "DROP",
+                    "proof": {
+                        "verified_facts": [
+                            "scx_update_idle is gated on scx_enabled",
+                            "__scx_enabled is set after table publication"
+                        ],
+                        "assessment": "the named reader cannot reach the pre-publication window",
+                        "conclusion": "false_positive"
+                    }
+                }]
+            }]
+        });
+
+        assert!(parse_validation_findings(&obsolete.to_string()).is_err());
+    }
+
+    #[test]
+    fn empty_candidate_decision_survives_malformed_baseline_envelope() {
+        let raw = json!({
+            "commits": [{
+                "sha": "328cfa18fdcf",
+                "findings": [],
+                "baseline_adjudications": [{"baseline_id": "fast-0"}]
+            }]
+        });
+
+        assert!(parse_validation_findings(&raw.to_string()).is_err());
+        let salvaged = parse_empty_validation_candidate_decisions(&raw.to_string()).unwrap();
+        assert_eq!(salvaged["commits"][0]["findings"], json!([]));
+        assert_eq!(salvaged["commits"][0]["baseline_adjudications"], json!([]));
+
+        let unsafe_nonempty = json!({
+            "commits": [{
+                "sha": "328cfa18fdcf",
+                "findings": [{"problem": "rewritten candidate"}],
+                "baseline_adjudications": []
+            }]
+        });
+        assert!(parse_empty_validation_candidate_decisions(&unsafe_nonempty.to_string()).is_err());
     }
 
     #[test]

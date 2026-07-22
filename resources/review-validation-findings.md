@@ -26,9 +26,7 @@ The user message gives you a JSON object of this exact shape:
       "baseline_false_positive_challenges": [
         {
           "baseline_id": "fast-N",
-          "finding": { "problem": "<exact baseline finding>", "severity": "..." },
           "proof": {
-            "finding_claim": "<exact problem text>",
             "verified_facts": ["<specialist-verified fact>"],
             "contradiction": "<why the complete finding is impossible>",
             "conclusion": "false_positive"
@@ -93,9 +91,9 @@ For each finding, decide one of:
 adjudicate EVERY entry, even when no specialist challenged it. Assign each
 entry its host identity `fast-N`, where N is its zero-based array index. Return
 exactly one `baseline_adjudications` record per baseline entry, in the same
-order. Copy `baseline_id` and the complete finding object exactly. Every record
-must contain repository-tool-verified proof: make `proof.finding_claim` equal
-the finding's `problem` exactly, list concrete `verified_facts`, and explain in
+order. Use the exact `baseline_id` as the sole identity. The host owns the
+original finding object, so never echo or rewrite it. Every record must contain
+repository-tool-verified proof: list concrete `verified_facts`, and explain in
 `assessment` why those facts support or disprove the complete finding. Use
 `verdict: "KEEP"` with `proof.conclusion: "supported"` unless the checked-out
 tree conclusively proves the reported failure impossible. Only then use
@@ -105,6 +103,23 @@ interpretation is not enough to DROP. If any assumption, ambiguity, or
 uncertainty remains, KEEP. You MUST execute repository tools while adjudicating
 the baseline. If tools are unavailable, KEEP every entry and state the concrete
 facts available from the supplied commit material.
+
+For NULL-dereference, publication, initialization, teardown, and lifetime
+findings, validation is caller-first and lifecycle-complete. Before KEEP or DROP:
+
+1. Enumerate every actual entry path to the named reader, including inline
+   wrappers and static-branch gates in unchanged files.
+2. Locate when each gate becomes true and false relative to pointer/table
+   publication, enable failure, reader draining, and retirement.
+3. Check both forward enable ordering and reverse disable/error ordering.
+4. If the finding cites a similar caller with an explicit NULL check, compare
+   the two callers' execution phases and gates; do not assume the check proves
+   identical reachability.
+
+A local unguarded dereference is not sufficient proof of reachability. A KEEP
+assessment must name the concrete caller that crosses the unsafe lifecycle
+window. A DROP assessment must name the gate or ordering that makes every named
+path impossible.
 
 DROP a regular candidate when it reports the same underlying problem as a
 surviving baseline finding, even if the wording differs. Do not drop a candidate
@@ -151,7 +166,8 @@ Hard rules:
 - Adjudicate every `baseline_findings` entry, including entries absent from
   `baseline_false_positive_challenges`. Emit exactly one ordered record under
   `baseline_adjudications` for each entry. Omission, duplication, reordering,
-  or an inexact finding copy invalidates the complete response.
+  or an inexact baseline ID invalidates the complete response. Do not echo the
+  host-owned finding object.
 - A finding must describe a problem that remains in or is introduced by
   the reviewed commit. Do NOT keep a finding merely because the parent
   version was wrong; the final report is a review of the patch, not a
@@ -197,10 +213,8 @@ Output shape (strict):
       "baseline_adjudications": [
         {
           "baseline_id": "fast-N",
-          "finding": { "problem": "..." },
           "verdict": "KEEP|DROP",
           "proof": {
-            "finding_claim": "...",
             "verified_facts": ["..."],
             "assessment": "...",
             "conclusion": "supported|false_positive"
