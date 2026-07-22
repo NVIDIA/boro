@@ -1377,21 +1377,6 @@ fn validate_baseline_adjudication_coverage(
             {
                 anyhow::bail!("baseline adjudications must use exact fast-N IDs in order");
             }
-            if adjudication.get("finding") != Some(finding) {
-                anyhow::bail!("baseline adjudication must copy the exact finding object");
-            }
-            let problem = finding
-                .get("problem")
-                .and_then(Value::as_str)
-                .context("baseline finding must have a string problem")?;
-            if adjudication
-                .get("proof")
-                .and_then(|proof| proof.get("finding_claim"))
-                .and_then(Value::as_str)
-                != Some(problem)
-            {
-                anyhow::bail!("baseline proof must copy the exact finding claim");
-            }
             if finding.get("source").and_then(Value::as_str) == Some("upstream-fixes")
                 && adjudication.get("verdict").and_then(Value::as_str) != Some("KEEP")
             {
@@ -1567,7 +1552,7 @@ async fn run_findings_validation(
         );
         let progress_line = progress_ui.map(|ui| ui.stage_ctx(label.clone()));
         let t_val = Instant::now();
-        let (parsed_opt, _last_raw, summed, last_err, _attempts) =
+        let (parsed_opt, last_raw, summed, last_err, _attempts) =
             api::chat_completion_with_retry_stage_timeout_preserve_input(
                 client,
                 validation_cfg,
@@ -1612,6 +1597,38 @@ async fn run_findings_validation(
             if mandatory_verification_failed {
                 for &idx in indices {
                     verification_failed_shas.insert(payload_owned[idx].sha.clone());
+                }
+            }
+            // Baseline proof and regular-candidate filtering are independent decisions. If the
+            // response only failed the baseline envelope but returned no surviving regular
+            // candidates, preserve that safe negative decision instead of reviving raw additions.
+            if !mandatory_verification_failed {
+                if let Ok(salvaged) = api::parse_empty_validation_candidate_decisions(&last_raw) {
+                    let commits = salvaged
+                        .get("commits")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let exact_batch = commits.len() == indices.len()
+                        && commits.iter().zip(indices).all(|(entry, idx)| {
+                            entry.get("sha").and_then(Value::as_str)
+                                == Some(payload_owned[*idx].sha.as_str())
+                        });
+                    if exact_batch {
+                        for entry in commits {
+                            if let Some(sha) = entry.get("sha").and_then(Value::as_str) {
+                                by_sha.insert(sha.to_string(), entry.clone());
+                            }
+                        }
+                        v(
+                            vdest,
+                            format!(
+                                "validation batch {batch_num}/{}: salvaged empty regular-candidate decisions; unresolved baselines remain protected",
+                                batches.len()
+                            ),
+                        );
+                        continue;
+                    }
                 }
             }
             let msg = last_err
@@ -3633,28 +3650,11 @@ fn apply_adjudicated_fast_false_positives(
         else {
             continue;
         };
-        let Some(problem) = original.get("problem").and_then(Value::as_str) else {
-            continue;
-        };
         if original.get("source").and_then(Value::as_str) == Some("upstream-fixes") {
             v(
                 vd,
                 format!(
                     "strong-validator baseline confirmation {id} rejected: deterministic upstream-fix findings are not adjudicable"
-                ),
-            );
-            continue;
-        }
-        let adjudicated_finding = adjudication.get("finding");
-        let proof_claim = adjudication
-            .get("proof")
-            .and_then(|proof| proof.get("finding_claim"))
-            .and_then(Value::as_str);
-        if adjudicated_finding != Some(original) || proof_claim != Some(problem) {
-            v(
-                vd,
-                format!(
-                    "strong-validator baseline confirmation {id} rejected: the complete target finding was not copied exactly"
                 ),
             );
             continue;
@@ -5025,7 +5025,7 @@ mod fast_cli_tests {
     }
 
     #[test]
-    fn strong_validator_confirmation_removes_only_the_exact_fast_finding() {
+    fn strong_validator_confirmation_removes_only_the_host_identified_fast_finding() {
         let fast = [
             json!({"problem": "foo dereferences NULL", "severity": "High"}),
             json!({"problem": "bar leaks memory", "severity": "Medium"}),
@@ -5037,10 +5037,8 @@ mod fast_cli_tests {
         let mut baseline = json!([fast[0].clone(), fast[1].clone(), upstream.clone()]);
         let challenge = json!({
             "baseline_id": "fast-0",
-            "finding": fast[0].clone(),
             "verdict": "DROP",
             "proof": {
-                "finding_claim": "foo dereferences NULL",
                 "verified_facts": ["every caller passes a static object"],
                 "assessment": "the argument cannot be NULL",
                 "conclusion": "false_positive"
@@ -5071,7 +5069,7 @@ mod fast_cli_tests {
     }
 
     #[test]
-    fn baseline_coverage_requires_one_exact_ordered_adjudication_per_finding() {
+    fn baseline_coverage_requires_one_ordered_host_id_per_finding() {
         let baseline = json!([
             {"problem": "first issue", "severity": "High"},
             {"problem": "second issue", "severity": "Low"}
@@ -5093,10 +5091,8 @@ mod fast_cli_tests {
             "baseline_adjudications": [
                 {
                     "baseline_id": "fast-0",
-                    "finding": baseline[0].clone(),
                     "verdict": "KEEP",
                     "proof": {
-                        "finding_claim": "first issue",
                         "verified_facts": ["fact"],
                         "assessment": "supported",
                         "conclusion": "supported"
@@ -5104,10 +5100,8 @@ mod fast_cli_tests {
                 },
                 {
                     "baseline_id": "fast-1",
-                    "finding": baseline[1].clone(),
                     "verdict": "DROP",
                     "proof": {
-                        "finding_claim": "second issue",
                         "verified_facts": ["fact"],
                         "assessment": "disproved",
                         "conclusion": "false_positive"
@@ -5139,10 +5133,8 @@ mod fast_cli_tests {
         let mut baseline = json!([finding.clone()]);
         let keep = json!({
             "baseline_id": "fast-0",
-            "finding": finding,
             "verdict": "KEEP",
             "proof": {
-                "finding_claim": "foo dereferences NULL",
                 "verified_facts": ["NULL remains reachable"],
                 "assessment": "the finding is supported",
                 "conclusion": "supported"
@@ -5161,15 +5153,13 @@ mod fast_cli_tests {
     }
 
     #[test]
-    fn baseline_adjudication_cannot_remove_a_finding_without_exact_text_match() {
+    fn baseline_adjudication_cannot_remove_a_finding_with_an_invalid_host_id() {
         let fast = vec![json!({"problem": "foo dereferences NULL", "severity": "High"})];
         let mut baseline = Value::Array(fast.clone());
         let challenge = json!({
-            "baseline_id": "fast-0",
-            "finding": {"problem": "foo is probably safe", "severity": "High"},
+            "baseline_id": "fast-00",
             "verdict": "DROP",
             "proof": {
-                "finding_claim": "foo is probably safe",
                 "verified_facts": ["fact"],
                 "assessment": "contradiction",
                 "conclusion": "false_positive"
@@ -5193,10 +5183,8 @@ mod fast_cli_tests {
         let mut baseline = Value::Array(fast.clone());
         let adjudicated = json!({
             "baseline_id": "fast-0",
-            "finding": fast[0].clone(),
             "verdict": "DROP",
             "proof": {
-                "finding_claim": "foo dereferences NULL",
                 "verified_facts": ["every caller passes a static object"],
                 "assessment": "the argument cannot be NULL",
                 "conclusion": "false_positive"
@@ -5224,10 +5212,8 @@ mod fast_cli_tests {
         let mut baseline = json!([upstream.clone()]);
         let adjudicated = json!({
             "baseline_id": "fast-0",
-            "finding": upstream.clone(),
             "verdict": "DROP",
             "proof": {
-                "finding_claim": "upstream fixed a regression",
                 "verified_facts": ["the patch exists"],
                 "assessment": "the patch is unnecessary",
                 "conclusion": "false_positive"
