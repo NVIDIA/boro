@@ -28,6 +28,7 @@ and symbols regexes.
 | MM Allocation | `alloc_pages`, `__GFP_*`, `kmalloc`, `kmem_cache_*`, `slub`, `vmalloc`, `zone_watermark`, `mempool`, `memblock`, mm/page_alloc.c, mm/slub.c, mm/vmalloc.c | mm-alloc.md |
 | MM Reclaim/Swap/Migration | `vmscan`, `shrink_*`, `lru_*`, `swap_*`, `shmem_*`, `mem_cgroup_*`, `writeback`, `migrate_*`, mm/vmscan.c, mm/swap_state.c, mm/migrate.c, mm/memcontrol.c | mm-reclaim.md |
 | VFS | inode, dentry, vfs_, fs/*.c | vfs.md |
+| LEDs | drivers/leds/, include/linux/leds.h, led_classdev_register, devm_led_classdev_register | leds.md |
 | Locking | spin_lock*, mutex_*, rwsem*, seqlock*, *seqcount* | locking.md |
 | Scheduler | kernel/sched/, sched_, schedule, *wakeup* | scheduler.md |
 | Timers | timer_list, timer_setup, mod_timer, del_timer, hrtimer, delayed_work | timers.md |
@@ -43,9 +44,11 @@ and symbols regexes.
 | DAX | dax operations | dax.md |
 | Block/NVMe | block layer, nvme | block.md |
 | DRM/GPU | drivers/gpu/drm/, drm_atomic_, drm_crtc_, hwseq, hw_sequencer | drm.md |
+| Media/V4L2 | drivers/media/, include/media/, v4l2_subdev_, V4L2_SUBDEV_, MEDIA_BUS_FMT_ | media.md |
 | NFSD | fs/nfsd/*, fs/lockd/* | nfsd.md |
 | SunRPC | net/sunrpc/* | sunrpc.md |
 | io_uring | io_uring/, io_uring_, io_ring_, io_sq_, io_cq_, io_wq_, IORING_ | io_uring.md |
+| FUSE | fs/fuse/, fuse_uring_, fuse_chan_, fuse_dev_, FUSE_IO_URING, FUSE_OVER_IO_URING | fuse.md |
 | Cleanup API | `__free`, `guard(`, `scoped_guard`, `DEFINE_FREE`, `DEFINE_GUARD`, `no_free_ptr`, `return_ptr` | cleanup.md |
 | RCU lifecycle | `call_rcu(`, `kfree_rcu(`, `synchronize_rcu(`, `rhashtable_*` + `call_rcu`, `hlist_del_rcu` + `call_rcu`, `list_del_rcu` + `call_rcu` | rcu.md |
 | Power Domains | drivers/pmdomain/, pm_genpd_, of_genpd_, exynos_pd_ | pmdomain.md |
@@ -58,6 +61,7 @@ and symbols regexes.
 | SMB/ksmbd | fs/smb/server/, ksmbd_, smb_direct_ | smb-ksmbd.md |
 | Open Firmware (DT) | drivers/of/, of_node, of_find_, of_get_, of_parse_, for_each_child_of_node, for_each_available_child_of_node, of_node_put, of_node_get | of.md |
 | Perf Tools | tools/perf/, openat, fdopendir, closedir | perf.md |
+| Multi-Function Devices (MFD) | drivers/mfd/, include/linux/mfd/, mfd_add_devices, devm_mfd_add_devices, mfd_cell, mfd_remove_devices | mfd.md |
 | MIPS | arch/mips/, tlb_probe, tlb_read, tlb_write_indexed, write_c0_entryhi, read_c0_index, TLBP, TLBR, TLBWI | mips.md |
 | hwmon | drivers/hwmon/, hwmon_*, asus-ec-sensors, ec_board_info | hwmon.md |
 | Wireless/mac80211 | drivers/net/wireless/, net/mac80211/, BSS_CHANGED_, vif_cfg_changed, link_info_changed, bss_info_changed | wireless.md |
@@ -68,6 +72,8 @@ and symbols regexes.
 | I/O Accessors | writesl, readsl, writesw, readsw, writesb, readsb, __raw_writel, __raw_readl, FIFO | io-accessors.md |
 | Kconfig | Kconfig, `config `, `select `, `depends on `, `tristate `, `bool ` | kconfig.md |
 | Build System | Kbuild, Makefile, scripts/, tools/, `gnu11`, `-funsigned-char`, `-fno-strict-aliasing` | build.md |
+| I2C | drivers/i2c/, include/linux/i2c.h, i2c_transfer, i2c_master_send, i2c_master_recv, i2c_smbus_, i2c_get_dma_safe_msg_buf | i2c.md |
+| HID | drivers/hid/, include/linux/hid.h, hid_device, hid_driver, hid_register_driver, hid_hw_start, hid_hw_stop, hid_input_report, hid_safe_input_report | hid.md |
 | Input | drivers/input/, include/linux/input.h, include/linux/input/, input_dev, input_handler, input_register_, input_report_  | input.md |
 | Objtool | tools/objtool/, INSN_BUG, INSN_TRAP, decode.c | objtool.md |
 | KHO (Kexec Handover) | lib/test_kho.c, kho_, kho_is_enabled, kho_retrieve_subtree, kho_preserve_folio, kho_add_subtree, register_kho_notifier | kho.md |
