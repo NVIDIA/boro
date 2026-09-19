@@ -4387,10 +4387,18 @@ pub const LKML_FALLBACK_TEMPLATE: &str =
 mention each finding with severity, keep a professional tone, no markdown headings or ALL CAPS.";
 
 /// Normalize an LKML renderer response and consume its no-findings protocol
-/// token. Empty model responses are treated the same way, so neither can
-/// create an empty/false-positive report block in human or JSON output.
+/// token. Some models retain the older inline-review response shape and wrap
+/// the email body in a JSON `review_inline` field despite being asked for plain
+/// text, so accept that shape here too. Empty model responses are treated the
+/// same way, so neither can create an empty/false-positive report block in
+/// human or JSON output.
 pub fn normalize_lkml_report_response(raw: &str) -> Option<String> {
-    let body = strip_json_fences(raw);
+    let mut body = strip_json_fences(raw);
+    if let Ok(value) = serde_json::from_str::<Value>(&body) {
+        if let Some(review_inline) = value.get("review_inline").and_then(Value::as_str) {
+            body = review_inline.trim().to_string();
+        }
+    }
     (!body.is_empty() && body != LKML_NO_FINDINGS_SENTINEL).then_some(body)
 }
 
@@ -4758,6 +4766,23 @@ mod tests {
             normalize_lkml_report_response("```\nCan this leak foo?\n```"),
             Some("Can this leak foo?".to_string())
         );
+    }
+
+    #[test]
+    fn lkml_json_wrapped_review_inline_is_unwrapped() {
+        let raw = r#"{
+  "review_inline": "commit deadbeef\n\n> changed line\n\nCan this leak foo?\n"
+}"#;
+        assert_eq!(
+            normalize_lkml_report_response(raw),
+            Some("commit deadbeef\n\n> changed line\n\nCan this leak foo?".to_string())
+        );
+    }
+
+    #[test]
+    fn lkml_fenced_json_wrapped_no_findings_is_consumed() {
+        let raw = format!("```json\n{{\"review_inline\":\"{LKML_NO_FINDINGS_SENTINEL}\"}}\n```");
+        assert_eq!(normalize_lkml_report_response(&raw), None);
     }
 
     #[test]

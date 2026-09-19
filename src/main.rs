@@ -1911,11 +1911,7 @@ async fn render_commit_lkml_phase(
             .await
             {
                 Ok((raw, u)) => {
-                    let body = if fast_review.is_some() {
-                        api::normalize_lkml_report_response(&raw)
-                    } else {
-                        Some(api::strip_json_fences(&raw))
-                    };
+                    let body = api::normalize_lkml_report_response(&raw);
                     (body, u, None)
                 }
                 Err(e) => {
