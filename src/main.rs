@@ -112,6 +112,40 @@ enum ValidationMode {
     Findings,
 }
 
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum FailOn {
+    /// Fail when at least one Critical finding survives review.
+    Critical,
+    /// Fail when at least one High or Critical finding survives review.
+    High,
+    /// Fail when at least one Medium, High, or Critical finding survives review.
+    Medium,
+    /// Fail when any finding survives review.
+    Low,
+}
+
+impl FailOn {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Critical => 4,
+            Self::High => 3,
+            Self::Medium => 2,
+            Self::Low => 1,
+        }
+    }
+
+    fn matches(self, severity: &str) -> bool {
+        let rank = match severity {
+            "Critical" => 4,
+            "High" => 3,
+            "Medium" => 2,
+            "Low" => 1,
+            _ => 0,
+        };
+        rank >= self.rank()
+    }
+}
+
 impl ValidationMode {
     fn label(self) -> &'static str {
         match self {
@@ -247,6 +281,10 @@ struct ReviewArgs {
     /// Output of the final review-validation stage.
     #[arg(long = "validation-mode", value_enum, default_value_t = ValidationMode::Filter)]
     validation_mode: ValidationMode,
+
+    /// Exit non-zero when the final findings include this severity or higher.
+    #[arg(long, value_enum)]
+    fail_on: Option<FailOn>,
 
     /// Git URI whose selected branch is checked for follow-up fixes.
     #[arg(
@@ -2492,6 +2530,10 @@ async fn run_apply_command(
 async fn main() -> Result<()> {
     let run_start = Instant::now();
     let cli = Cli::parse();
+    let fail_on = match &cli.command {
+        Command::Review(args) => args.fail_on,
+        _ => None,
+    };
 
     if let Command::Apply(args) = &cli.command {
         return run_apply_command(&cli.global, args, run_start).await;
@@ -3144,10 +3186,33 @@ The review will use {} prompts and persona and may be inaccurate — did you mea
     } else {
         output::print_report_human(&out);
     }
+    if !cli.global.dry_run
+        && !cancelled
+        && fail_on.is_some_and(|threshold| has_finding_at_or_above(&out, threshold))
+    {
+        std::process::exit(1);
+    }
     if cancelled {
         std::process::exit(130);
     }
     Ok(())
+}
+
+fn has_finding_at_or_above(out: &Value, threshold: FailOn) -> bool {
+    out.get("commits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flat_map(|commits| commits.iter())
+        .flat_map(|commit| {
+            commit
+                .get("validated_findings")
+                .or_else(|| commit.get("findings"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flat_map(|findings| findings.iter())
+        })
+        .filter_map(|finding| finding.get("severity").and_then(Value::as_str))
+        .any(|severity| threshold.matches(severity))
 }
 
 async fn prefetch_context_block(
@@ -5280,5 +5345,30 @@ mod cli_tests {
         ]);
 
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn review_accepts_fail_on_threshold() {
+        let parsed =
+            Cli::try_parse_from(["boro", "review", "--fail-on", "high", "HEAD~1..HEAD"]).unwrap();
+
+        let Command::Review(args) = parsed.command else {
+            panic!("expected review command");
+        };
+        assert!(matches!(args.fail_on, Some(FailOn::High)));
+    }
+
+    #[test]
+    fn fail_on_checks_final_findings() {
+        let out = json!({
+            "commits": [{
+                "findings": [{"severity": "Low"}],
+                "validated_findings": [{"severity": "High"}]
+            }]
+        });
+
+        assert!(!has_finding_at_or_above(&out, FailOn::Critical));
+        assert!(has_finding_at_or_above(&out, FailOn::High));
+        assert!(has_finding_at_or_above(&out, FailOn::Low));
     }
 }
