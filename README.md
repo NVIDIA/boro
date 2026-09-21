@@ -431,6 +431,13 @@ isn't in the commit's changed paths). The finding's prose is preserved;
 only the bad anchor is removed, so the viewer falls back to rendering it
 as a commit-level comment.
 
+The JSON document is versioned with a top-level `schema_version` field. The
+current schema version is `1`; additive optional fields do not require a bump,
+while renamed or removed fields do. For CI or pre-send gating, `review` also
+accepts the opt-in `--fail-on=critical|high|medium|low` flag. It exits with
+status `1` when a surviving finding meets or exceeds the selected severity;
+without the flag, the exit status remains unchanged.
+
 ### Structured review highlights
 
 Review JSON keeps `summary.text` and `summary.counts` and adds
