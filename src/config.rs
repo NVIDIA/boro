@@ -132,13 +132,15 @@ pub fn dry_run_placeholder() -> ResolvedModel {
     }
 }
 
-/// Strip trailing slashes and optional `/v1`, then append `/v1` for OpenAI-compatible APIs.
+/// Trim spaces and trailing slashes. Append `/v1` only when the URL has no path.
 fn normalize_boro_base_url(raw: &str) -> String {
-    let mut s = raw.trim().trim_end_matches('/').to_string();
-    if let Some(without) = s.strip_suffix("/v1") {
-        s = without.trim_end_matches('/').to_string();
+    let s = raw.trim().trim_end_matches('/');
+    let after_scheme = s.split_once("://").map(|(_, rest)| rest).unwrap_or(s);
+    if after_scheme.contains('/') {
+        s.to_string()
+    } else {
+        format!("{s}/v1")
     }
-    format!("{}/v1", s.trim_end_matches('/'))
 }
 
 /// Parse an optional `f32` env var. Returns `Ok(None)` for unset or empty-after-trim;
@@ -317,6 +319,10 @@ mod tests {
             (
                 " https://proxy.example.com/openai/v1/ ",
                 "https://proxy.example.com/openai/v1",
+            ),
+            (
+                "https://api.example.com/custom/gateway/",
+                "https://api.example.com/custom/gateway",
             ),
         ] {
             assert_eq!(normalize_boro_base_url(raw), expected);
